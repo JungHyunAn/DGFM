@@ -1,0 +1,4 @@
+Synthetic_data/eval_results/
+Synthetic_data/eval_graphs/
+Synthetic_data/__pycache__/
+.vscode/
