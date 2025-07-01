@@ -5,6 +5,7 @@ import ot
 import time
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
+from scipy.stats import truncnorm
 
 
 class VectorField(nn.Module):
@@ -14,11 +15,11 @@ class VectorField(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim+1, 64), nn.ReLU(),
-            nn.Linear(64, 256), nn.ReLU(),
-            nn.Linear(256, 256), nn.ReLU(),
-            nn.Linear(256, 64), nn.ReLU(),
-            nn.Linear(64, dim)
+            nn.Linear(dim+1, 256), nn.ReLU(),
+            nn.Linear(256, 512), nn.ReLU(),
+            nn.Linear(512, 512), nn.ReLU(),
+            nn.Linear(512, 256), nn.ReLU(),
+            nn.Linear(256, dim)
         )
     def forward(self, x, t):
         return self.net(torch.cat([x, t.unsqueeze(1)], dim=1))
@@ -28,17 +29,19 @@ class MixtureSampler:
     # ----------------------------
     # Intermediate Mixture of Gaussians sampler
     # ----------------------------
-    def __init__(self, mus, covs, weights, clusters, device='cpu'):
+    def __init__(self, mus, covs, weights, clusters, inv_cluster, device='cpu'):
         self.device = device
         self.mus = torch.tensor(mus, dtype=torch.float32, device=device) # (k, d)
         self.covs = torch.tensor(covs, dtype=torch.float32, device=device) # (k, d, d)
         self.weights = torch.tensor(weights/weights.sum(),dtype=torch.float32, device=device)  # normalize weights
         self.clusters = clusters
+        self.inv_cluster = inv_cluster
         self.Ls = torch.linalg.cholesky(self.covs)
         self.k, self.d = self.mus.shape
 
-    def sample(self, M):
-        pis = torch.multinomial(self.weights, M, replacement=True)             # (M,)
+    def sample(self, M, pis=None):
+        if pis is None:
+            pis = torch.multinomial(self.weights, M, replacement=True)             # (M,)
 
         eps = torch.randn(M, self.d, device=self.device)                      # (M, d)
 
@@ -50,48 +53,31 @@ class MixtureSampler:
         x = torch.bmm(L_sel, eps.unsqueeze(-1)).squeeze(-1)  # (M, d)
         return x + mu_sel, pis
     
-    def truncated_sample(self, M, factor=2.0):
+    def truncated_sample(self, M, pis=None):
         """
         Draw ~factor*M samples, keep the first M that lie within ±2σ
         (coordinate-wise), and if there aren’t enough, sample the rest.
         Args:
             M      : number of final samples wanted
             factor : oversampling factor (>1) to reduce loops
+            pis    : (optional) precomputed component indices for sampling
         Returns:
             x      : (M, d) tensor of truncated samples
             pis    : (M,) tensor of component indices
         """
-        # precompute per-component std-dev along each axis (k, d)
-        stds = torch.sqrt(torch.diagonal(self.covs, dim1=1, dim2=2))
 
-        out_x   = []
-        out_pis = []
+        if pis is None:
+            pis = torch.multinomial(self.weights, M, replacement=True).to(self.device)
 
-        remaining = M
-        while remaining > 0:
-            # oversample
-            N = int(remaining * factor)
-            x, pis = self.sample(N)
+        # use truncnorm to sample from truncated normal distribution
+        z = truncnorm.rvs(-1.5, 1.5, size=(M, self.d), random_state=None).astype(np.float32)
+        eps = torch.from_numpy(z).to(self.device)
 
-            # filter valid ones
-            mu_sel   = self.mus[pis]        # (N, d)
-            std_sel  = stds[pis]            # (N, d)
-            mask     = ((x - mu_sel).abs() <= 2 * std_sel).all(dim=1)
+        L_sel  = self.Ls[pis]
+        mu_sel = self.mus[pis]
 
-            x_valid   = x[mask]
-            pis_valid = pis[mask]
-
-            # take up to 'remaining'
-            take = min(x_valid.size(0), remaining)
-            out_x.append(  x_valid[:take]   )
-            out_pis.append(pis_valid[:take])
-
-            remaining -= take
-
-        # concatenate and return exactly M
-        x_final   = torch.cat(out_x,   dim=0)[:M]
-        pis_final = torch.cat(out_pis, dim=0)[:M]
-        return x_final, pis_final
+        x = torch.bmm(L_sel, eps.unsqueeze(-1)).squeeze(-1) + mu_sel
+        return x, pis
     
 
 def train_vanilla_FM(model, optimizer, X_target, dim, device,
@@ -108,6 +94,7 @@ def train_vanilla_FM(model, optimizer, X_target, dim, device,
     stop_criteria = 0
 
     best_w2 = float("inf")
+    best_model = None
     recs = []
 
     for epoch in range(epochs):
@@ -143,7 +130,8 @@ def train_vanilla_FM(model, optimizer, X_target, dim, device,
                 break
         else:
             stop_criteria = 0
-        best_w2 = w2
+            best_w2 = w2
+            best_model = model
 
         # Record results
         recs.append(
@@ -151,7 +139,7 @@ def train_vanilla_FM(model, optimizer, X_target, dim, device,
               "validation_w2": w2, 
               "train_loss": loss.item() }
         )
-    return epoch, best_w2, recs
+    return epoch, best_w2, recs, best_model
 
 def cluster_points(X, m, delta=np.inf):
     # ----------------------------
@@ -162,6 +150,7 @@ def cluster_points(X, m, delta=np.inf):
     N = X.shape[0]
     visited = np.zeros(N, dtype=bool)
     clusters = []
+    inv_cluster = {n : [] for n in range(N)} # maps point index to cluster indices
     neighbors_model = NearestNeighbors(n_neighbors=min(m*5, N)).fit(X)
 
     while not visited.all():
@@ -175,6 +164,7 @@ def cluster_points(X, m, delta=np.inf):
         for idx in neighbors:
             if not visited[idx]:
                 cluster.append(idx)
+                inv_cluster[idx].append(len(clusters))  # map point to current cluster index
             if len(cluster) >= m:
                 break
 
@@ -184,12 +174,13 @@ def cluster_points(X, m, delta=np.inf):
                 d = [np.linalg.norm(X[i] - X[list(c)].mean(axis=0)) for c in clusters]
                 best = np.argmin(d)
                 clusters[best].add(i)
+                inv_cluster[i].append(best) # map point to best cluster index
                 visited[i] = True
 
         clusters.append(set(cluster))
         visited[cluster] = True
 
-    return clusters
+    return clusters, inv_cluster
 
 
 def compute_cluster_pca(X, clusters, d, eps=1e-3):
@@ -228,7 +219,6 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
     
     # 0) Clustering & Form intermediate distribution
     base_sampler = lambda x: torch.randn(x, dim, device=device)
-
     N = X_target.shape[0]
     perm = np.random.permutation(N)
     M = int(0.9*N) # training set size
@@ -239,12 +229,13 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
 
     if mixture_sampler is None:
         t0 = time.thread_time()
-        clusters  = cluster_points(X_train.detach().cpu().numpy(), cluster_size, delta=np.inf)
+        clusters, inv_cluster  = cluster_points(X_train.detach().cpu().numpy(), cluster_size, delta=np.inf)
         mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
-        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, device=device)
+        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
         # print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
 
     best_w2 = float("inf")
+    best_model = None
     recs = []
 
     global_M = M * mf
@@ -261,7 +252,7 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
             x1r = x1_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
             xt  = (1-t.unsqueeze(1))*x0r + t.unsqueeze(1)*x1r
             target_v = 2*(x1r - x0r)
-            pred_v   = model(xt, t)
+            pred_v   = model(xt, 0.5*t)
             loss = ((pred_v - target_v)**2).mean()
             optimizer.zero_grad()
             loss.backward()
@@ -273,18 +264,28 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
         for i in range(0, M, batch_size):
             m = min(batch_size, M-i)
             
-            # Match within clusters
+            
+            # Option1: Match within clusters
+            inv_cluster = mixture_sampler.inv_cluster
+            pis_np = np.array([ np.random.choice(inv_cluster[j]) for j in range(i, i+m) ], dtype=np.int64)
+            pis = torch.tensor(pis_np, device=device)
+
+            x0, _ = mixture_sampler.truncated_sample(m, pis=pis)
+            x1 = X_train[i:i+m]
+            '''
+            # Option2: Match with random samples from the training set
             x0, pis = mixture_sampler.truncated_sample(m)
             idxs = [int(np.random.choice(list(clusters[pi]))) for pi in pis]
             x1 = X_train[idxs]
+            '''
 
             t = torch.rand(m * n_t_local, device=device) # t sampling for local FM
-
+ 
             x0r = x0.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
             x1r = x1.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
             xt = (1 - t.unsqueeze(1)) * x0r + t.unsqueeze(1) * x1r
             target_v = 2*(x1r - x0r)
-            pred_v = model(xt, t)
+            pred_v = model(xt, 0.5*t+0.5)
             loss = ((pred_v - target_v) ** 2).mean()
             optimizer.zero_grad()
             loss.backward()
@@ -305,7 +306,8 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
                 break
         else:
             stop_criteria = 0
-        best_w2 = w2
+            best_w2 = w2
+            best_model = model
 
         # Record results
         recs.append(
@@ -313,7 +315,7 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
               "validation_w2": w2, 
               "train_loss": loss.item() }
         ) 
-    return mixture_sampler, epoch, best_w2, recs
+    return mixture_sampler, epoch, best_w2, recs, best_model
 
 def run_flow(model, x0, device, n_steps=100):
     x = torch.tensor(x0, device=device, dtype=torch.float32)

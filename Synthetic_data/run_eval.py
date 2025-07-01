@@ -40,7 +40,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
 
     # 3) train Vanilla FM
     t0 = time.thread_time()
-    epoch, _, recs_van = train_vanilla_FM(
+    epoch, _, recs_van, best_model_van = train_vanilla_FM(
         model_van, opt_van, X_train,
         ambient_dim, device,
         n_t=total_n_t,
@@ -52,7 +52,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
 
     # eval
     X0   = np.random.randn(test_size, ambient_dim)
-    Xgen = run_flow(model_van, X0, device)
+    Xgen = run_flow(best_model_van, X0, device)
     w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
     geo  = dist.geometric_alignment(Xgen, device)
 
@@ -74,7 +74,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
         mixture_sampler = None
 
         t0 = time.thread_time()
-        mixture_sampler, epoch, _, recs_dg = train_dgfm(
+        mixture_sampler, epoch, _, recs_dg, best_model_dg = train_dgfm(
             model_dg, opt_dg,
             X_train, ambient_dim,
             mf, device,
@@ -91,7 +91,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
 
         # eval
         X0   = np.random.randn(test_size, ambient_dim)
-        Xgen = run_flow(model_dg, X0, device)
+        Xgen = run_flow(best_model_dg, X0, device)
         w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
         geo  = dist.geometric_alignment(Xgen, device)
 
@@ -123,21 +123,22 @@ if (__name__ == "__main__"):
 
     # 1) pick sample size & trials
     sample_sizes = list(map(int,
-                        (input("Enter sample sizes (comma separated, default 1000,2000,4000,8000): ")
-                        .strip() or "1000,2000,4000,8000").split(",")))
+                        (input("Enter sample sizes (comma separated, default 500,1000,2000,4000,8000,16000): ")
+                        .strip() or "500,1000,2000,4000,8000,16000").split(",")))
     repeats  = int(input("Number of trials per config (default 5): ") or 5)
 
     # 2) experiment setup
     ambient_dim   = int(input("Ambient dimension (default 40): ") or 40)
-    latent_dim    = int(input("Latent dimension (default 8): ") or 8)
+    latent_dim    = int(input("Latent dimension (default 10): ") or 10)
     total_epochs  = int(input("Maximum number of epochs (default 100): ") or 100)
-    batch_size    = int(input("Batch size (default 200): ") or 200)
+    batch_size    = int(input("Minimum Batch size (default 100): ") or 100)
+    batch_num     = int(input("Number of batches per epoch (default 10): ") or 10)
     mf_list       = list(map(int,
                         (input("Multiplier for global FM (comma separated, default 2,4): ")
                         .strip() or "2,4").split(",")))
     total_n_t     = int(input("Number of timesteps per sample for vanilla FM (default 4): ") or 4)
     global_n_t     = int(input("Number of timesteps per sample for global FM (default 2): ") or 2)
-    local_n_t     = int(input("Number of timesteps per sample for local FM (default 2): ") or 2)
+    local_n_t     = int(input("Number of timesteps per sample for local FM (default 4): ") or 4)
     early_stopping = input("Use early stopping? (y/n, default y): ").strip().lower() != 'n'
 
     # 3) pick distribution
@@ -170,7 +171,7 @@ if (__name__ == "__main__"):
                     run_one_trial, n, trial, dist_name,
                     ambient_dim, latent_dim,
                     total_n_t, global_n_t, local_n_t,
-                    total_epochs, batch_size, early_stopping,
+                    total_epochs, max(batch_size, int(n/batch_num)), early_stopping,
                     mf_list, test_size, device
                 ): trial
                 for trial in range(repeats)
