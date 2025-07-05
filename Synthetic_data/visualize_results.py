@@ -4,6 +4,7 @@ import json
 from matplotlib import ticker
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.special import beta
 
 
 def list_json_files(input_dir):
@@ -161,6 +162,37 @@ def plot_summary(data, out_dir, dist_name):
     plt.close(fig2)
 
 
+def plot_beta(beta_a, beta_b, out_dir):
+    """
+    Plot the Beta(a, b) probability density function over [0, 1],
+    using scipy.special.beta for normalization, and save the figure.
+    """
+    # Ensure output directory exists
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Domain for plotting
+    x = np.linspace(0, 1, 500)
+    
+    # Compute normalization constant B(a, b)
+    B = beta(beta_a, beta_b)
+    
+    # Evaluate PDF: f(x) = x^(a-1) * (1-x)^(b-1) / B(a, b)
+    pdf = x**(beta_a - 1) * (1 - x)**(beta_b - 1) / B
+    
+    # Create plot
+    plt.figure()
+    plt.plot(x, pdf)
+    plt.title(f"Beta PDF (a={beta_a}, b={beta_b})")
+    plt.xlabel("x")
+    plt.ylabel("Probability Density")
+    plt.tight_layout()
+    
+    # Save figure
+    fig_path = os.path.join(out_dir, f"beta_{beta_a}_{beta_b}.png")
+    plt.savefig(fig_path)
+    plt.close()
+
+
 def main():
     input_dir = os.path.expanduser("~/DGFM/Synthetic_data/eval_results")
 
@@ -180,6 +212,7 @@ def main():
     # plot_trials(data, output_dir, dist_name)
     plot_summary(data, output_dir, dist_name)
     plot_comparison(data, output_dir, dist_name)
+    plot_beta(data["beta_a"], data["beta_b"], output_dir)
 
     print(f"Graphs saved in {output_dir}")
 

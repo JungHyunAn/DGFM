@@ -8,13 +8,22 @@ import concurrent.futures
 import multiprocessing
 from tqdm import tqdm
 from zoneinfo import ZoneInfo
-from Synthetic_data.distributions import *
-from Synthetic_data.FM_utils import *
+from Synthetic_data.distributions import NormalDistribution, \
+                                         Quadratic_Uniform, \
+                                         Quadratic_Unimodal, \
+                                         Quadratic_Multimodal, \
+                                         Linear_Branched, \
+                                         SwissRoll
+from Synthetic_data.FM_utils import VectorField, \
+                                    train_uniform_FM, \
+                                    train_shifted_FM, \
+                                    train_dgfm, \
+                                    run_flow
 
 NUM_WORKERS = 5  # Number of parallel workers for training DGFM
 
 
-def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
+def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
                   total_n_t, global_n_t, local_n_t, max_epochs, batch_size, early_stopping,
                   mf_list, test_size, device):
     """
@@ -25,9 +34,19 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
     # 1) instantiate distribution
     if dist_name == "Normal":
         dist = NormalDistribution(ambient_dim, device)
+    elif dist_name == "Quadratic_Uniform":
+        dist = Quadratic_Uniform(ambient_dim, device, latent_dim)
+    elif dist_name == "Quadratic_Unimodal":
+        dist = Quadratic_Unimodal(ambient_dim, device, latent_dim)
+    elif dist_name == "Quadratic_Multimodal":
+        dist = Quadratic_Multimodal(ambient_dim, device, latent_dim)
+    elif dist_name == "Linear_Branched":
+        dist = Linear_Branched(ambient_dim, device, latent_dim)
+    elif dist_name == "SwissRoll":
+        dist = SwissRoll(ambient_dim, device, latent_dim)
     else:
-        dist = QuadraticManifoldDistribution(ambient_dim, device, latent_dim)
-
+        raise ValueError(f"Unknown distribution: {dist_name}")
+    
     # 2) sample training data
     X_train = dist.sample(n)
 
@@ -38,13 +57,13 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
     opt_van   = optim.Adam(model_van.parameters(), lr=1e-3)
     time_van  = 0.0
 
-    # 3) train Vanilla FM
+    # 3) train FM with uniform t sampling
     t0 = time.thread_time()
-    epoch, _, recs_van, best_model_van = train_vanilla_FM(
+    epoch, _, recs_uniformFM, best_model_van = train_uniform_FM(
         model_van, opt_van, X_train,
         ambient_dim, device,
         n_t=total_n_t,
-        epochs=max_epochs,  # you can pass eval_interval directly if you prefer
+        epochs=max_epochs,
         batch_size=batch_size,
         early_stopping=early_stopping,
     )
@@ -54,16 +73,49 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
     X0   = np.random.randn(test_size, ambient_dim)
     Xgen = run_flow(best_model_van, X0, device)
     w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
-    geo  = dist.geometric_alignment(Xgen, device)
+    geo  = dist.geometric_alignment(Xgen)
 
-    recs_van.append({
+    recs_uniformFM.append({
         "final_epoch": epoch,
         "train_time": time_van,
         "eval_wasserstein2": w2,
         "eval_geometric_alignment": geo
     })
 
-    trial_results["VanillaFM"] = recs_van
+    trial_results["UniformFM"] = recs_uniformFM
+
+    # 4) train FM with shifted t sampling
+    model_shifted = VectorField(ambient_dim).to(device)
+    opt_shifted   = optim.Adam(model_shifted.parameters(), lr=1e-3)
+    time_shifted  = 0.0
+
+    t0 = time.thread_time()
+    epoch, _, recs_shiftedFM, best_model_shifted = train_shifted_FM(
+        model_shifted, opt_shifted, X_train,
+        ambient_dim, device,
+        n_t=total_n_t,
+        epochs=max_epochs,  
+        batch_size=batch_size,
+        early_stopping=early_stopping,
+        beta_a=beta_a, beta_b=beta_b
+    )
+    time_shifted += time.thread_time() - t0
+
+    # eval
+    X0   = np.random.randn(test_size, ambient_dim)
+    Xgen = run_flow(best_model_shifted, X0, device)
+    w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
+    geo  = dist.geometric_alignment(Xgen)
+
+    recs_shiftedFM.append({
+        "final_epoch": epoch,
+        "train_time": time_shifted,
+        "eval_wasserstein2": w2,
+        "eval_geometric_alignment": geo
+    })
+
+    trial_results["ShiftedFM"] = recs_shiftedFM
+
 
     # ----- DGFM (one entry per mf) -----
     for mf in mf_list:
@@ -83,7 +135,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
             n_t_local=local_n_t,
             epochs=max_epochs,
             batch_size=batch_size,
-            cluster_size=50,
+            cluster_size=int(n/20),
             cluster_d=latent_dim,
             early_stopping=early_stopping
         )
@@ -93,7 +145,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim,
         X0   = np.random.randn(test_size, ambient_dim)
         Xgen = run_flow(best_model_dg, X0, device)
         w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
-        geo  = dist.geometric_alignment(Xgen, device)
+        geo  = dist.geometric_alignment(Xgen)
 
         recs_dg.append({
             "final_epoch": epoch,
@@ -112,7 +164,7 @@ if (__name__ == "__main__"):
 
     print("Welcome to the Flow-Matching evaluation script!")
     print("You'll be prompted to select a distribution and experiment parameters.")
-    print("This program trains Vanilla FM and DGFM on your chosen distribution, then measures:")
+    print("This program trains Vanilla FM with uniform/shifted t sampling and DGFM on your chosen distribution, then measures:")
     print("  • Training time")
     print("  • Wasserstein-2 distance (W₂)")
     print("  • Geometric alignment to the support manifold")
@@ -133,23 +185,38 @@ if (__name__ == "__main__"):
     total_epochs  = int(input("Maximum number of epochs (default 100): ") or 100)
     batch_size    = int(input("Minimum Batch size (default 100): ") or 100)
     batch_num     = int(input("Number of batches per epoch (default 10): ") or 10)
+    beta_a, beta_b = list(map(float,
+                        (input("Beta parameters for shifted FM (comma separated, default 0.5,1): ")
+                        .strip() or "0.5,1").split(",")))
     mf_list       = list(map(int,
-                        (input("Multiplier for global FM (comma separated, default 2,4): ")
+                        (input("DGFM multiplier for global FM (comma separated, default 2,4): ")
                         .strip() or "2,4").split(",")))
     total_n_t     = int(input("Number of timesteps per sample for vanilla FM (default 4): ") or 4)
-    global_n_t     = int(input("Number of timesteps per sample for global FM (default 2): ") or 2)
-    local_n_t     = int(input("Number of timesteps per sample for local FM (default 4): ") or 4)
-    early_stopping = input("Use early stopping? (y/n, default y): ").strip().lower() != 'n'
+    global_n_t     = int(input("Number of timesteps per sample for DGFM global FM (default 4): ") or 4)
+    local_n_t     = int(input("Number of timesteps per sample for DGFM local FM (default 4): ") or 4)
+    early_stopping = input("Use early stopping if validation loss doesn't improve for three epochs? (y/n, default y): ").strip().lower() != 'n'
 
     # 3) pick distribution
     print("Choose target distribution:")
     print("  [1] Normal")
-    print("  [2] Quadratic")
+    print("  [2] Quadratic_Uniform")
+    print("  [3] Quadratic_Unimodal")
+    print("  [4] Quadratic_Multimodal")
+    print("  [5] Branched Linear")
+    print("  [6] SwissRoll")
     dkey = input(">>> ").strip()
     if dkey == "1":
         dist_name = "Normal"
     elif dkey == "2":
-        dist_name = "Quadratic"
+        dist_name = "Quadratic_Uniform"
+    elif dkey == "3":
+        dist_name = "Quadratic_Unimodal"
+    elif dkey == "4":
+        dist_name = "Quadratic_Multimodal"
+    elif dkey == "5":
+        dist_name = "Linear_Branched"
+    elif dkey == "6":
+        dist_name = "SwissRoll"
     else:
         print("Invalid choice."); exit(1)
 
@@ -169,7 +236,7 @@ if (__name__ == "__main__"):
             futures = {
                 executor.submit(
                     run_one_trial, n, trial, dist_name,
-                    ambient_dim, latent_dim,
+                    ambient_dim, latent_dim, beta_a, beta_b,
                     total_n_t, global_n_t, local_n_t,
                     total_epochs, max(batch_size, int(n/batch_num)), early_stopping,
                     mf_list, test_size, device
@@ -259,6 +326,8 @@ if (__name__ == "__main__"):
             "ambient_dim": ambient_dim,
             "latent_dim": latent_dim,
             "sample_sizes": sample_sizes,
+            "beta_a" : beta_a,
+            "beta_b" : beta_b,
             "vanilla_n_t": total_n_t,
             "global_n_t": global_n_t,
             "local_n_t": local_n_t,

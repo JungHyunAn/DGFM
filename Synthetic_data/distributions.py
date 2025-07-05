@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import ot  # Optimal Transport library for Wasserstein distance
 import torch.optim as optim
+from scipy.stats import truncnorm
 
 
 class Distribution(ABC):
@@ -30,14 +31,6 @@ class Distribution(ABC):
         # Placeholder for actual Wasserstein-2 distance computation
         return np.sqrt(ot.emd2(np.ones(n_samples)/n_samples, np.ones(n_samples)/n_samples, ot.dist(x1.cpu().numpy(), x)**2))
 
-    def cross_entropy(self, x: torch.Tensor, num_samples: int) -> float:
-        """
-        Computes the cross entropy of the samples `x` under the distribution.
-        Returns the cross entrop value (float).
-        """
-        X = self.sample(num_samples).to(self.device)
-        
-
     @abstractmethod
     def sample(self, n: int) -> torch.Tensor:
         """
@@ -47,7 +40,7 @@ class Distribution(ABC):
         pass
 
     @abstractmethod
-    def geometric_alignment(self, x: torch.Tensor, device) -> float:
+    def geometric_alignment(self, x: torch.Tensor) -> float:
         """
         Calculates the geometric alignment to the support manifold.
         Returns the average distance of the samples to the manifold.
@@ -63,7 +56,6 @@ class Distribution(ABC):
         pass
 
 
-
 class NormalDistribution(Distribution):
     def __init__(self, ambient_dim: int, device):
         eq = f"N(0, I₍{ambient_dim}₎)"
@@ -72,14 +64,15 @@ class NormalDistribution(Distribution):
     def sample(self, n: int) -> torch.Tensor:
         return torch.randn(n, self.ambient_dim, device=self.device)
 
-    def geometric_alignment(self, x: torch.Tensor, device) -> float:
+    def geometric_alignment(self, x: torch.Tensor) -> float:
         # Placeholder implementation
         return (x ** 2).mean(dim=1).float()
     
     def initialize_parameters(self):
         pass  # No parameters to initialize for normal distribution
 
-class QuadraticManifoldDistribution(Distribution):
+
+class Quadratic_Uniform(Distribution):
     def __init__(
         self,
         ambient_dim: int,
@@ -89,7 +82,7 @@ class QuadraticManifoldDistribution(Distribution):
         A: torch.Tensor = None,
         Q: torch.Tensor = None
     ):
-        eq = "x = A·z + zᵀ·Q·z + noise"
+        eq = f"x = A·z + zᵀ·Q·z + noise, z~B_{latent_dim}(0,1) ball"
         super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="QuadraticManifoldDistribution")
         self.latent_dim = latent_dim
         self.noise_std  = noise_std
@@ -104,7 +97,7 @@ class QuadraticManifoldDistribution(Distribution):
         linear = z @ self.A.T
         return linear + quad + self.noise_std * torch.randn_like(linear)
 
-    def geometric_alignment(self, x: torch.Tensor, device) -> float:
+    def geometric_alignment(self, x: torch.Tensor) -> float:
         """
         Projects point(s) x onto the quadratic manifold by solving
             min_z  || x - (A z + zᵀ Q z) ||²
@@ -114,7 +107,7 @@ class QuadraticManifoldDistribution(Distribution):
         lr = 1e-2
 
         # initialize latent estimates
-        z_hat = torch.zeros(x.shape[0], self.latent_dim, device=device, requires_grad=True)
+        z_hat = torch.zeros(x.shape[0], self.latent_dim, device=self.device, requires_grad=True)
         optimizer = optim.Adam([z_hat], lr=lr)
 
         # gradient descent to find z_hat that minimizes the error
@@ -145,3 +138,347 @@ class QuadraticManifoldDistribution(Distribution):
         """
         self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
         self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device)
+
+
+class Quadratic_Unimodal(Distribution):
+    def __init__(
+        self,
+        ambient_dim: int,
+        device: torch.device,
+        latent_dim: int,
+        noise_std: float = 1e-4,
+        A: torch.Tensor = None,
+        Q: torch.Tensor = None
+    ):
+        eq = f"x = A·z + zᵀ·Q·z + noise, z~N(0, I_{latent_dim})"
+        super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Quadratic_Unimodal")
+        self.noise_std = noise_std
+        self.A = A or torch.randn(ambient_dim, latent_dim, device=device)
+        self.Q = Q or torch.randn(ambient_dim, latent_dim, latent_dim, device=device)
+
+    def sample(self, n: int) -> torch.Tensor:
+        # Sample n latent vectors from truncated normal
+        z = torch.randn(n, self.latent_dim, device=self.device)
+        r_np = truncnorm.rvs(0, 1, size=(n, 1))
+        r = torch.from_numpy(r_np.astype(np.float32)).to(self.device)
+        z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * r
+
+        # Map onto quadratic manifold
+        quad = torch.einsum('ni,kij,nj->nk', z, self.Q, z)
+        linear = z @ self.A.T
+        return linear + quad + self.noise_std * torch.randn_like(linear)
+
+    def geometric_alignment(self, x: torch.Tensor) -> float:
+        """
+        Projects point(s) x onto the quadratic manifold by solving
+            min_z  || x - (A z + zᵀ Q z) ||²
+        via gradient descent. Returns the mean squared error.
+        """
+        num_steps = 100
+        lr = 1e-2
+
+        # initialize latent estimates
+        z_hat = torch.zeros(x.shape[0], self.latent_dim, device=self.device, requires_grad=True)
+        optimizer = optim.Adam([z_hat], lr=lr)
+
+        # gradient descent to find z_hat that minimizes the error
+        for _ in range(num_steps):
+            optimizer.zero_grad()
+            # linear term
+            lin = z_hat @ self.A.T 
+            # quadratic term
+            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            # prediction
+            x_hat = lin + quad
+            loss = ((x_hat - x) ** 2).mean()
+            loss.backward()
+            optimizer.step()
+
+        # compute final error
+        with torch.no_grad():
+            lin  = z_hat @ self.A.T
+            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            err  = ((lin + quad - x) ** 2).mean().item()
+
+        return err
+    
+    def initialize_parameters(self):
+        """
+        Initializes the parameters A and Q for the quadratic unimodal distribution.
+        This can be used to set up the distribution before sampling.
+        """
+        self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
+        self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device)
+
+
+class Quadratic_Multimodal(Distribution):
+    def __init__(
+        self,
+        ambient_dim: int,
+        device: torch.device,
+        latent_dim: int,
+        noise_std: float = 1e-4,
+        A: torch.Tensor = None,
+        Q: torch.Tensor = None,
+        mode_num: int = 3
+    ):
+        eq = f"x = A·z + zᵀ·Q·z + noise, z~sum(N_i(u_i, I_{latent_dim}))"
+        super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Quadratic_Multimodal")
+        self.noise_std = noise_std
+        self.A = A or torch.randn(ambient_dim, latent_dim, device=device)
+        self.Q = Q or torch.randn(ambient_dim, latent_dim, latent_dim, device=device)
+        self.mode_num = mode_num
+
+        # Sample modes uniformly within a ball of 0.6
+        z = torch.randn(mode_num, self.latent_dim, device=self.device)
+        self.modes = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * 0.3
+        
+    def sample(self, n: int) -> torch.Tensor:
+        mode_indices = torch.randint(0, self.mode_num, (n,), device=self.device) # Sample n mode indices
+        
+        # Sample n latent vectors from truncated GMM
+        z = torch.randn(n, self.latent_dim, device=self.device)
+        r_np = truncnorm.rvs(0, 1, size=(n, 1)) * 0.5
+        r = torch.from_numpy(r_np.astype(np.float32)).to(self.device)
+        z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * r
+        z = self.modes[mode_indices] + z
+        
+        # Map onto quadratic manifold
+        quad = torch.einsum('ni,kij,nj->nk', z, self.Q, z)
+        linear = z @ self.A.T
+        return linear + quad + self.noise_std * torch.randn_like(linear)
+
+    def geometric_alignment(self, x: torch.Tensor) -> float:
+        """
+        Projects point(s) x onto the quadratic manifold by solving
+            min_z  || x - (A z + zᵀ Q z) ||²
+        via gradient descent. Returns the mean squared error.
+        """
+        num_steps = 100
+        lr = 1e-2
+
+        # initialize latent estimates
+        z_hat = torch.zeros(x.shape[0], self.latent_dim, device=self.device, requires_grad=True)
+        optimizer = optim.Adam([z_hat], lr=lr)
+
+        # gradient descent to find z_hat that minimizes the error
+        for _ in range(num_steps):
+            optimizer.zero_grad()
+            # linear term
+            lin = z_hat @ self.A.T 
+            # quadratic term
+            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            # prediction
+            x_hat = lin + quad
+            loss = ((x_hat - x) ** 2).mean()
+            loss.backward()
+            optimizer.step()
+
+        # compute final error
+        with torch.no_grad():
+            lin  = z_hat @ self.A.T
+            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            err  = ((lin + quad - x) ** 2).mean().item()
+
+        return err
+    
+    def initialize_parameters(self):
+        """
+        Initializes the parameters A, Q, and modes for the quadratic multimodal distribution.
+        This can be used to set up the distribution before sampling.
+        """
+        self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
+        self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device)
+        self.modes = torch.randn(self.mode_num, self.latent_dim, device=self.device)
+
+
+class Linear_Branched(Distribution):
+    def __init__(
+            self,
+            ambient_dim: int,
+            device: torch.device,
+            latent_dim: int,
+            noise_std: float = 1e-4,
+            branch_num: int = 3,
+    ):
+        eq = f"x = A_i z + offset + noise, A_i=[v_i_1, ..., v_i_{latent_dim}], z~sum(N_i(u_i, I_{latent_dim}))"
+        super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Linear_Branched")
+        self.noise_std = noise_std
+        self.branch_num = branch_num
+        self.basis = torch.randn(ambient_dim, latent_dim, device=device)  # Random basis for branches
+        # self.offset = torch.randn(ambient_dim, device=device)  # shared center offset
+        row_idx = torch.stack([
+            torch.randperm(ambient_dim, device=device)
+            for _ in range(branch_num)
+        ], dim=0)  # index for basis rows
+        self.branches = self.basis[row_idx]  # basis A_i for each branch
+        self.branches_pinv = torch.linalg.pinv(self.branches)  # precompute pseudo-inverse for each branch
+
+    def sample(self, n: int) -> torch.Tensor:
+        pis = torch.randint(
+            low=0,
+            high=self.branch_num,
+            size=(n,),
+            device=self.device
+        )  # sample branch indices
+        
+        # Sample latent vector from truncated normal
+        z = torch.randn(n, self.latent_dim, device=self.device)
+        r_np = truncnorm.rvs(0, 1, size=(n, 1))
+        r = torch.from_numpy(r_np.astype(np.float32)).to(self.device)
+        z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * r
+
+        # Map onto branched manifold
+        A_sel = self.branches[pis] # Select the appropriate branch basis
+        linear = torch.bmm(A_sel, z.unsqueeze(-1)).squeeze(-1)  # Linear transformation with branch basis and offset
+
+        return linear + self.noise_std * torch.randn_like(linear)
+
+    def geometric_alignment(self, x: torch.Tensor) -> float:
+        """
+        Compute the overall mean squared perpendicular error (MSE) of the batch x
+        to the closest branch-affine subspace. Returns a single float.
+        """
+        x = x.to(self.device)
+        xp = x # - self.offset  # center the points around the offset
+
+        # squared errors per sample per branch: (n, branch_num)
+        sq_err = torch.empty(xp.size(0), self.branch_num, device=self.device)
+        for i in range(self.branch_num):
+            A      = self.branches[i]      # branch basis (ambient_dim, latent_dim)
+            A_pinv = self.branches_pinv[i] # branch pseudo-inverse (latent_dim, ambient_dim)
+
+            # project and reconstruct
+            c     = xp @ A_pinv.T          # (n, latent_dim)
+            recon = torch.matmul(c, A.T)   # (n, ambient_dim)
+            res   = xp - recon             # (n, ambient_dim)
+
+            # sum squared errors
+            sq_err[:, i] = res.pow(2).sum(dim=1)
+
+        # minimum squared error per sample, then mean across samples
+        min_sq = torch.min(sq_err, dim=1).values  # (n,)
+        return min_sq.mean().item()
+    
+    def initialize_parameters(self):
+        """
+        Initializes the parameters for the branched linear distribution.
+        This can be used to set up the distribution before sampling.
+        """
+        self.basis = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
+        # self.offset = torch.randn(self.ambient_dim, device=self.device)
+        row_idx = torch.stack([
+            torch.randperm(self.ambient_dim, device=self.device)
+            for _ in range(self.branch_num)
+        ], dim=0)
+        self.branches = self.basis[row_idx]  # A_i for each branch
+        self.branches_pinv = torch.linalg.pinv(self.branches)
+
+
+class SwissRoll(Distribution):
+    def __init__(
+        self,
+        ambient_dim: int,
+        device: torch.device,
+        latent_dim: int,
+        noise_std: float = 1e-4,
+    ):
+        eq = (
+            f"x = A [cos(t1), sin(t1), t2...t_{latent_dim}, 0...0], t1~U(0,2π), [t2...t_{latent_dim}]~N(0,1)"
+        )
+        super().__init__(
+            ambient_dim,
+            device,
+            latent_dim=latent_dim,
+            equation=eq,
+            name="SwissRoll"
+        )
+        self.noise_std = noise_std
+        self.device = device
+        self.latent_dim = latent_dim
+        self.ambient_dim = ambient_dim
+
+        # Random linear transformation A (ambient_dim×ambient_dim)
+        self.A = torch.randn(ambient_dim, ambient_dim, device=device)
+        self.A_pinv = torch.linalg.pinv(self.A)
+
+    def sample(self, n: int) -> torch.Tensor:
+        """
+        Draw n samples on the swiss-roll manifold embedding.
+        Returns:
+            x: (n, ambient_dim) tensor
+        """
+        # draw t1 from [0, 6π] and gaussian t2...t_(latent_dim)
+        t1 = 6 * torch.pi * torch.rand(n, device=self.device)
+        if self.latent_dim > 1:
+            gauss = torch.randn(n, self.latent_dim - 1, device=self.device)
+        else:
+            gauss = None
+
+        # form v ∈ ℝ^ambient_dim
+        v = torch.zeros(n, self.ambient_dim, device=self.device)
+        v[:, 0] = t1 * torch.cos(t1)
+        v[:, 1] = t1 * torch.sin(t1)
+        if gauss is not None:
+            v[:, 2:self.latent_dim+1] = gauss  # fill t2...t_latent_dim
+
+        # apply A (linear transformation)
+        x = v @ self.A.T
+        return x + self.noise_std * torch.randn_like(x)
+
+    def geometric_alignment(self, x: torch.Tensor) -> float:
+        """
+        Estimate latent coordinates via gradient descent to minimize:
+            || x - A v(z) ||^2
+        where v(z) = [t1 cos(t1), t1 sin(t1), z2...z_latent_dim].
+        Returns the mean squared error over the batch.
+        """
+        x = x.to(self.device)
+        n = x.shape[0]
+
+        # Initialize z_hat from linear pseudo-inverse (first latent_dim entries)
+        z_init = x @ self.A_pinv.T  # (n, ambient_dim)
+        # keep only t1 and gaussian dims
+        z_hat = z_init[:, :self.latent_dim].clone().detach()
+        z_hat.requires_grad_(True)
+
+        optimizer = optim.Adam([z_hat], lr=1e-2)
+        num_steps = 100
+
+        for _ in range(num_steps):
+            optimizer.zero_grad()
+            t1 = z_hat[:, 0]  # (n,)
+
+            # build v from z_hat
+            v = torch.zeros(n, self.ambient_dim, device=self.device)
+            v[:, 0] = t1 * torch.cos(t1)
+            v[:, 1] = t1 * torch.sin(t1)
+            if self.latent_dim > 1:
+                v[:, 2 : self.latent_dim + 1] = z_hat[:, 1:]
+
+            x_hat = v @ self.A.T  # (n, ambient_dim)
+            loss = torch.mean((x_hat - x) ** 2)
+            loss.backward()
+            optimizer.step()
+
+        # final MSE
+        with torch.no_grad():
+            t1 = z_hat[:, 0]
+            v = torch.zeros(n, self.ambient_dim, device=self.device)
+            v[:, 0] = t1 * torch.cos(t1)
+            v[:, 1] = t1 * torch.sin(t1)
+            if self.latent_dim > 1:
+                v[:, 2 : self.latent_dim + 1] = z_hat[:, 1:]
+
+            x_hat = v @ self.A.T
+            mse = torch.mean((x_hat - x) ** 2).item()
+
+        return mse
+
+    def initialize_parameters(self):
+        """
+        Initializes the parameters A for the Swiss Roll distribution.
+        This can be used to set up the distribution before sampling.
+        """
+        self.A = torch.randn(self.ambient_dim, self.ambient_dim, device=self.device)
+        self.A_pinv = torch.linalg.pinv(self.A)
