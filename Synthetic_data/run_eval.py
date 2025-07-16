@@ -186,8 +186,8 @@ if (__name__ == "__main__"):
     batch_size    = int(input("Minimum Batch size (default 100): ") or 100)
     batch_num     = int(input("Number of batches per epoch (default 10): ") or 10)
     beta_a, beta_b = list(map(float,
-                        (input("Beta parameters for shifted FM (comma separated, default 0.5,1): ")
-                        .strip() or "0.5,1").split(",")))
+                        (input("Beta parameters for shifted FM (comma separated, default 1.5,1): ")
+                        .strip() or "1.5,1").split(",")))
     mf_list       = list(map(int,
                         (input("DGFM multiplier for global FM (comma separated, default 2,4): ")
                         .strip() or "2,4").split(",")))

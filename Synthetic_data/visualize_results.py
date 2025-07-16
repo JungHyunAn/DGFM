@@ -104,6 +104,8 @@ def plot_comparison(data, out_dir, dist_name):
 
 def plot_summary(data, out_dir, dist_name):
     summary = data.get("summary", {})
+    ambient_dim = data.get("ambient_dim")
+    latent_dim = data.get("latent_dim")
     if not summary:
         print("No summary section in JSON.")
         return
@@ -131,8 +133,8 @@ def plot_summary(data, out_dir, dist_name):
     ax1.set_xticks(x)
     ax1.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
     ax1.set_xlabel("Sample Size")
-    ax1.set_ylabel("Eval W2 Mean ± Std")
-    ax1.set_title(f"{dist_name} - Summary: Eval W2")
+    ax1.set_ylabel("Evaluation W2 Mean ± Std")
+    ax1.set_title(f"{dist_name} - (n, d) = ({ambient_dim}, {latent_dim})")
     ax1.legend()
     fig1.tight_layout()
     fig1.savefig(os.path.join(out_dir, f"{dist_name}_summary_eval_w2.png"), bbox_inches="tight")
@@ -141,6 +143,7 @@ def plot_summary(data, out_dir, dist_name):
     # Eval Geometric Alignment with error bars
     fig2, ax2 = plt.subplots()
     ax2.set_xscale('log')
+    #ax2.set_yscale('log') # for big difference in geometric alignment
     for method in methods:
         means = []
         stds = []
@@ -155,7 +158,7 @@ def plot_summary(data, out_dir, dist_name):
     ax2.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
     ax2.set_xlabel("Sample Size")
     ax2.set_ylabel("Geometric Alignment Mean ± Std")
-    ax2.set_title(f"{dist_name} - Summary: Geometric Alignment")
+    ax2.set_title(f"{dist_name} - (n, d) = ({ambient_dim}, {latent_dim})")
     ax2.legend()
     fig2.tight_layout()
     fig2.savefig(os.path.join(out_dir, f"{dist_name}_summary_geom_align.png"), bbox_inches="tight")
@@ -177,7 +180,7 @@ def plot_beta(beta_a, beta_b, out_dir):
     B = beta(beta_a, beta_b)
     
     # Evaluate PDF: f(x) = x^(a-1) * (1-x)^(b-1) / B(a, b)
-    pdf = x**(beta_a - 1) * (1 - x)**(beta_b - 1) / B
+    pdf = (1-x)**(beta_a - 1) * x**(beta_b - 1) / B
     
     # Create plot
     plt.figure()
@@ -208,7 +211,7 @@ def main():
     output_dir = os.path.expanduser(f"~/DGFM/Synthetic_data/eval_graphs/{os.path.basename(selected)}")
     os.makedirs(output_dir, exist_ok=True)
 
-    dist_name = data.get("distribution", os.path.splitext(os.path.basename(selected))[0])
+    dist_name = data.get("distribution", os.path.splitext(os.path.basename(selected))[0]).replace("_", " ")
     # plot_trials(data, output_dir, dist_name)
     plot_summary(data, output_dir, dist_name)
     plot_comparison(data, output_dir, dist_name)

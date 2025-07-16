@@ -153,16 +153,17 @@ class Quadratic_Unimodal(Distribution):
         eq = f"x = A·z + zᵀ·Q·z + noise, z~N(0, I_{latent_dim})"
         super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Quadratic_Unimodal")
         self.noise_std = noise_std
-        self.A = A or torch.randn(ambient_dim, latent_dim, device=device)
-        self.Q = Q or torch.randn(ambient_dim, latent_dim, latent_dim, device=device)
+        self.A = A or torch.randn(ambient_dim, latent_dim, device=device) / np.sqrt(ambient_dim)
+        self.Q = Q or torch.randn(ambient_dim, latent_dim, latent_dim, device=device) / np.sqrt(ambient_dim * latent_dim)
 
     def sample(self, n: int) -> torch.Tensor:
         # Sample n latent vectors from truncated normal
         z = torch.randn(n, self.latent_dim, device=self.device)
+        '''
         r_np = truncnorm.rvs(0, 1, size=(n, 1))
         r = torch.from_numpy(r_np.astype(np.float32)).to(self.device)
         z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * r
-
+        '''
         # Map onto quadratic manifold
         quad = torch.einsum('ni,kij,nj->nk', z, self.Q, z)
         linear = z @ self.A.T
@@ -174,12 +175,16 @@ class Quadratic_Unimodal(Distribution):
             min_z  || x - (A z + zᵀ Q z) ||²
         via gradient descent. Returns the mean squared error.
         """
-        num_steps = 100
+        num_steps = 5000
         lr = 1e-2
 
         # initialize latent estimates
         z_hat = torch.zeros(x.shape[0], self.latent_dim, device=self.device, requires_grad=True)
         optimizer = optim.Adam([z_hat], lr=lr)
+        
+        best_loss = float('inf')
+        patience = 10
+        patience_counter = 0
 
         # gradient descent to find z_hat that minimizes the error
         for _ in range(num_steps):
@@ -193,6 +198,16 @@ class Quadratic_Unimodal(Distribution):
             loss = ((x_hat - x) ** 2).mean()
             loss.backward()
             optimizer.step()
+
+            # Early stopping condition
+            current_loss = loss.item()
+            if current_loss < best_loss - 1e-6:  # small threshold
+                best_loss = current_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
 
         # compute final error
         with torch.no_grad():
@@ -207,8 +222,8 @@ class Quadratic_Unimodal(Distribution):
         Initializes the parameters A and Q for the quadratic unimodal distribution.
         This can be used to set up the distribution before sampling.
         """
-        self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
-        self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device)
+        self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device) / np.sqrt(self.ambient_dim)
+        self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device) / np.sqrt(self.ambient_dim * self.latent_dim)
 
 
 class Quadratic_Multimodal(Distribution):
@@ -220,27 +235,24 @@ class Quadratic_Multimodal(Distribution):
         noise_std: float = 1e-4,
         A: torch.Tensor = None,
         Q: torch.Tensor = None,
-        mode_num: int = 3
+        mode_num: int = 10
     ):
         eq = f"x = A·z + zᵀ·Q·z + noise, z~sum(N_i(u_i, I_{latent_dim}))"
         super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Quadratic_Multimodal")
         self.noise_std = noise_std
-        self.A = A or torch.randn(ambient_dim, latent_dim, device=device)
-        self.Q = Q or torch.randn(ambient_dim, latent_dim, latent_dim, device=device)
+        self.A = A or torch.randn(ambient_dim, latent_dim, device=device) / np.sqrt(ambient_dim)
+        self.Q = Q or torch.randn(ambient_dim, latent_dim, latent_dim, device=device) / np.sqrt(ambient_dim * latent_dim)
         self.mode_num = mode_num
 
-        # Sample modes uniformly within a ball of 0.6
+        # Sample modes
         z = torch.randn(mode_num, self.latent_dim, device=self.device)
-        self.modes = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * 0.3
+        self.modes = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6)
         
     def sample(self, n: int) -> torch.Tensor:
         mode_indices = torch.randint(0, self.mode_num, (n,), device=self.device) # Sample n mode indices
         
         # Sample n latent vectors from truncated GMM
         z = torch.randn(n, self.latent_dim, device=self.device)
-        r_np = truncnorm.rvs(0, 1, size=(n, 1)) * 0.5
-        r = torch.from_numpy(r_np.astype(np.float32)).to(self.device)
-        z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * r
         z = self.modes[mode_indices] + z
         
         # Map onto quadratic manifold
@@ -254,12 +266,16 @@ class Quadratic_Multimodal(Distribution):
             min_z  || x - (A z + zᵀ Q z) ||²
         via gradient descent. Returns the mean squared error.
         """
-        num_steps = 100
+        num_steps = 5000
         lr = 1e-2
 
         # initialize latent estimates
         z_hat = torch.zeros(x.shape[0], self.latent_dim, device=self.device, requires_grad=True)
         optimizer = optim.Adam([z_hat], lr=lr)
+        
+        best_loss = float('inf')
+        patience = 10
+        patience_counter = 0
 
         # gradient descent to find z_hat that minimizes the error
         for _ in range(num_steps):
@@ -274,6 +290,16 @@ class Quadratic_Multimodal(Distribution):
             loss.backward()
             optimizer.step()
 
+            # Early stopping condition
+            current_loss = loss.item()
+            if current_loss < best_loss - 1e-6:  # small threshold
+                best_loss = current_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+
         # compute final error
         with torch.no_grad():
             lin  = z_hat @ self.A.T
@@ -287,8 +313,8 @@ class Quadratic_Multimodal(Distribution):
         Initializes the parameters A, Q, and modes for the quadratic multimodal distribution.
         This can be used to set up the distribution before sampling.
         """
-        self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
-        self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device)
+        self.A = torch.randn(self.ambient_dim, self.latent_dim, device=self.device) / np.sqrt(self.ambient_dim)
+        self.Q = torch.randn(self.ambient_dim, self.latent_dim, self.latent_dim, device=self.device) / np.sqrt(self.ambient_dim * self.latent_dim)
         self.modes = torch.randn(self.mode_num, self.latent_dim, device=self.device)
 
 
@@ -305,7 +331,7 @@ class Linear_Branched(Distribution):
         super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Linear_Branched")
         self.noise_std = noise_std
         self.branch_num = branch_num
-        self.basis = torch.randn(ambient_dim, latent_dim, device=device)  # Random basis for branches
+        self.basis = torch.randn(ambient_dim, latent_dim, device=device) / np.sqrt(ambient_dim)  # Random basis for branches
         # self.offset = torch.randn(ambient_dim, device=device)  # shared center offset
         row_idx = torch.stack([
             torch.randperm(ambient_dim, device=device)
@@ -324,9 +350,6 @@ class Linear_Branched(Distribution):
         
         # Sample latent vector from truncated normal
         z = torch.randn(n, self.latent_dim, device=self.device)
-        r_np = truncnorm.rvs(0, 1, size=(n, 1))
-        r = torch.from_numpy(r_np.astype(np.float32)).to(self.device)
-        z = z / z.norm(dim=1, keepdim=True).clamp(min=1e-6) * r
 
         # Map onto branched manifold
         A_sel = self.branches[pis] # Select the appropriate branch basis
@@ -365,7 +388,7 @@ class Linear_Branched(Distribution):
         Initializes the parameters for the branched linear distribution.
         This can be used to set up the distribution before sampling.
         """
-        self.basis = torch.randn(self.ambient_dim, self.latent_dim, device=self.device)
+        self.basis = torch.randn(self.ambient_dim, self.latent_dim, device=self.device) / np.sqrt(self.ambient_dim)
         # self.offset = torch.randn(self.ambient_dim, device=self.device)
         row_idx = torch.stack([
             torch.randperm(self.ambient_dim, device=self.device)
@@ -399,7 +422,7 @@ class SwissRoll(Distribution):
         self.ambient_dim = ambient_dim
 
         # Random linear transformation A (ambient_dim×ambient_dim)
-        self.A = torch.randn(ambient_dim, ambient_dim, device=device)
+        self.A = torch.randn(ambient_dim, ambient_dim, device=device) / np.sqrt(ambient_dim)
         self.A_pinv = torch.linalg.pinv(self.A)
 
     def sample(self, n: int) -> torch.Tensor:
@@ -408,8 +431,8 @@ class SwissRoll(Distribution):
         Returns:
             x: (n, ambient_dim) tensor
         """
-        # draw t1 from [0, 6π] and gaussian t2...t_(latent_dim)
-        t1 = 6 * torch.pi * torch.rand(n, device=self.device)
+        # draw t1 from [0, 1] and gaussian t2...t_(latent_dim)
+        t1 = torch.rand(n, device=self.device)
         if self.latent_dim > 1:
             gauss = torch.randn(n, self.latent_dim - 1, device=self.device)
         else:
@@ -417,8 +440,8 @@ class SwissRoll(Distribution):
 
         # form v ∈ ℝ^ambient_dim
         v = torch.zeros(n, self.ambient_dim, device=self.device)
-        v[:, 0] = t1 * torch.cos(t1)
-        v[:, 1] = t1 * torch.sin(t1)
+        v[:, 0] = t1 * torch.cos(4 * torch.pi * t1)
+        v[:, 1] = t1 * torch.sin(4 * torch.pi * t1)
         if gauss is not None:
             v[:, 2:self.latent_dim+1] = gauss  # fill t2...t_latent_dim
 
@@ -437,22 +460,28 @@ class SwissRoll(Distribution):
         n = x.shape[0]
 
         # Initialize z_hat from linear pseudo-inverse (first latent_dim entries)
-        z_init = x @ self.A_pinv.T  # (n, ambient_dim)
+        z_init = (x @ self.A_pinv.T)[:, 1:]  # (n, ambient_dim)
+        z_init[:, 0] = torch.zeros_like(z_init[:, 0])
+
         # keep only t1 and gaussian dims
         z_hat = z_init[:, :self.latent_dim].clone().detach()
         z_hat.requires_grad_(True)
 
         optimizer = optim.Adam([z_hat], lr=1e-2)
-        num_steps = 100
+
+        best_loss = float('inf')
+        patience = 10
+        patience_counter = 0
+        num_steps = 5000
 
         for _ in range(num_steps):
             optimizer.zero_grad()
-            t1 = z_hat[:, 0]  # (n,)
+            t1 = torch.sigmoid(z_hat[:, 0])  # (n,), within [0, 1]
 
             # build v from z_hat
             v = torch.zeros(n, self.ambient_dim, device=self.device)
-            v[:, 0] = t1 * torch.cos(t1)
-            v[:, 1] = t1 * torch.sin(t1)
+            v[:, 0] = t1 * torch.cos(4 * torch.pi * t1)
+            v[:, 1] = t1 * torch.sin(4 * torch.pi * t1)
             if self.latent_dim > 1:
                 v[:, 2 : self.latent_dim + 1] = z_hat[:, 1:]
 
@@ -461,12 +490,21 @@ class SwissRoll(Distribution):
             loss.backward()
             optimizer.step()
 
+            current_loss = loss.item()
+            if current_loss < best_loss - 1e-6:  # small threshold
+                best_loss = current_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+
         # final MSE
         with torch.no_grad():
-            t1 = z_hat[:, 0]
+            t1 = torch.sigmoid(z_hat[:, 0])
             v = torch.zeros(n, self.ambient_dim, device=self.device)
-            v[:, 0] = t1 * torch.cos(t1)
-            v[:, 1] = t1 * torch.sin(t1)
+            v[:, 0] = t1 * torch.cos(4 * torch.pi * t1)
+            v[:, 1] = t1 * torch.sin(4 * torch.pi * t1)
             if self.latent_dim > 1:
                 v[:, 2 : self.latent_dim + 1] = z_hat[:, 1:]
 
@@ -480,5 +518,5 @@ class SwissRoll(Distribution):
         Initializes the parameters A for the Swiss Roll distribution.
         This can be used to set up the distribution before sampling.
         """
-        self.A = torch.randn(self.ambient_dim, self.ambient_dim, device=self.device)
+        self.A = torch.randn(self.ambient_dim, self.ambient_dim, device=self.device) / np.sqrt(self.ambient_dim)
         self.A_pinv = torch.linalg.pinv(self.A)
