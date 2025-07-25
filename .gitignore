@@ -2,3 +2,7 @@ Synthetic_data/eval_results/
 Synthetic_data/eval_graphs/
 Synthetic_data/__pycache__/
 .vscode/
+Robot_simulation/__pycache__/
+Robot_simulation/heuristic_dataset/
+Robot_simulation/videos/
+Robot_simulation/train_sac_door.py

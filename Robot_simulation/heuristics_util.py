@@ -1,0 +1,466 @@
+import imageio
+import numpy as np
+import logging
+logging.disable(logging.INFO)
+
+from typing import List, Optional
+from scipy.interpolate import CubicSpline
+
+from robosuite.environments.manipulation.door import Door
+from robosuite.environments.manipulation.wipe import Wipe
+from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
+from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
+from robosuite.utils.placement_samplers import UniformRandomSampler
+from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
+
+
+def step_towards(
+    env,
+    eef_id: int,
+    adim: int,
+    record_q,
+    target_pos: np.ndarray,
+    target_quat: np.ndarray,
+    steps: int = 40,
+    pos_gain: float = 100.0,
+    ori_gain: float = 1.0,
+    gripper_val: float | None = None,
+    render: bool = False,
+    frames: list | None = None,
+    camera_name: str = "frontview",
+):
+    """
+    Interpolate from current EEF pose to (target_pos, target_quat) over `steps`
+    using OSC deltas. Works whether or not a gripper channel exists.
+
+    Required outer-scope/args:
+        env, eef_id, adim, record_q
+    Optional:
+        frames list if you want to append rendered images.
+    """
+    # Detect gripper
+    has_gripper = adim > 6
+    grip_idx = adim - 1 if has_gripper else None
+
+    # Start pose
+    start_pos  = env.sim.data.site_xpos[eef_id].copy()
+    R_now      = env.sim.data.site_xmat[eef_id].reshape(3, 3)
+    start_quat = mat2quat(R_now)
+
+    fracs = np.linspace(0.0, 1.0, steps + 1)[1:]
+    for f in fracs:
+        p_des = (1 - f) * start_pos + f * target_pos
+        q_des = quat_slerp(start_quat, target_quat, f)
+
+        a = np.zeros(adim)
+
+        # position
+        cur_pos = env.sim.data.site_xpos[eef_id].copy()
+        a[0:3] = (p_des - cur_pos) * pos_gain
+
+        # orientation
+        q_now = mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3))
+        q_rel = quat_multiply(q_des, quat_inverse(q_now))
+        w     = q_rel[3]
+        th    = 2 * np.arccos(np.clip(w, -1, 1))
+        if abs(th) < 1e-6:
+            axis = np.zeros(3)
+        else:
+            axis = q_rel[:3] / np.sin(th / 2)
+        a[3:6] = axis * th * ori_gain
+
+        if has_gripper and gripper_val is not None:
+            a[grip_idx] = gripper_val
+
+        env.step(a)
+        record_q()
+        if render and frames is not None:
+            img = env.sim.render(640, 480, camera_name=camera_name)
+            frames.append(np.flipud(img))
+
+
+def make_env(
+    task_name: str,
+    control_freq: int = 20,
+    has_renderer: bool = False,
+    has_offscreen_renderer: bool = False,
+    use_camera_obs: bool = False,
+    use_joint_control: bool = False,
+    environment_setting: Optional[List[float]] = None,
+):
+    """
+    Build and reset a robosuite environment (currently only 'door'), optionally
+    switch the robot to JOINT_POSITION control for replay, and (if provided)
+    restore a previously saved MuJoCo state.
+
+    Args:
+        task_name: Name of the task. Either 'door', 'wipe', 'two_arm', and 'nut'
+        control_freq: Physics/control frequency for the env.
+        has_renderer: Whether to create an on-screen viewer.
+        has_offscreen_renderer: Whether to enable off-screen rendering.
+        use_camera_obs: If True, image observations are returned by env.step().
+        use_joint_control: If True, change the Panda controller to absolute
+            joint-position control (useful for replaying trajectories).
+        environment_setting: Dict with keys {"qpos","qvel","body_pos","body_quat"}
+            (all np.ndarray) that fully specify a saved simulator state. When
+            given, it is copied into the env after reset to recreate the scene.
+
+    Returns:
+        env: The initialized (and possibly restored) robosuite environment.
+
+    Side Effects:
+        - Calls env.reset() once to initialize simulator buffers.
+        - If `environment_setting` is provided, disables further random placement
+          by nulling `env.placement_initializer`.
+
+    Notes:
+        Writing only to `data.body_xpos` or `model.body_pos` is insufficient for
+        reproducibility when bodies are attached via joints. Copying the entire
+        state arrays is robust.
+    """
+
+    # 1) for task "door"
+    assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
+    if task_name == "door":
+        cfg = load_composite_controller_config(robot="Panda")
+        door_sampler = UniformRandomSampler(
+            name="door_placer",
+            mujoco_objects=None,          # Door() will add the door object internally
+            x_range=[-0.05, 0.05],         # push along table x
+            y_range=[-0.3, -0.1],
+            rotation=(-np.pi/2 - 0.25, -np.pi/2),
+            rotation_axis="z",
+            reference_pos=(-0.2, -0.35, 0.8),  # same as env.table_offset
+            ensure_object_boundary_in_range=False,
+            ensure_valid_placement=True,
+        )
+        if use_joint_control: # for rendering
+            arm_key = next(iter(cfg["body_parts"]))
+            orig = cfg["body_parts"][arm_key]
+            grip_spec = orig["gripper"]
+            bp = cfg["body_parts"][arm_key]
+            bp.update({
+                "type": "JOINT_POSITION",
+                "kp": 10.0,
+                "kd": 2.0,
+                "interpolation": "linear",
+                "ndim": 7,
+                "input_type": "absolute",
+                "input_max": [np.pi]*7,
+                "input_min": [-np.pi]*7,
+                "output_max": [np.pi]*7,
+                "output_min": [-np.pi]*7,
+                "gripper": grip_spec,
+            })
+        env = Door(
+            robots="Panda",
+            controller_configs=cfg,
+            placement_initializer=door_sampler,
+            use_latch=True,
+            has_renderer=has_renderer,
+            has_offscreen_renderer=has_offscreen_renderer,
+            initialization_noise={'magnitude': 0.2, 'type': "uniform"},
+            use_camera_obs=use_camera_obs,
+            camera_names=["frontview"],
+            camera_heights=[480],
+            camera_widths=[640],
+            camera_depths=[False],
+            control_freq=control_freq,
+        )
+        env.reset()
+        if environment_setting is not None:
+            env.sim.data.qpos[:]      = environment_setting["qpos"]
+            env.sim.data.qvel[:]      = environment_setting["qvel"]
+            env.sim.model.body_pos[:] = environment_setting["body_pos"]
+            env.sim.model.body_quat[:]= environment_setting["body_quat"]
+            env.placement_initializer = None
+            env.sim.forward()   # now forward will KEEP it
+
+    elif task_name == "wipe":
+        cfg = load_composite_controller_config(robot="Panda")
+        if use_joint_control:
+            arm_key = next(iter(cfg["body_parts"]))
+            orig = cfg["body_parts"][arm_key]
+            grip_spec = orig["gripper"]
+            bp = cfg["body_parts"][arm_key]
+            bp.update({
+                "type": "JOINT_POSITION",
+                "kp": 10.0,
+                "kd": 2.0,
+                "interpolation": "linear",
+                "ndim": 7,
+                "input_type": "absolute",
+                "input_max": [np.pi]*7,
+                "input_min": [-np.pi]*7,
+                "output_max": [np.pi]*7,
+                "output_min": [-np.pi]*7,
+                "gripper": grip_spec,
+            })
+        env = Wipe(
+            robots="Panda",
+            controller_configs=cfg,
+            has_renderer=has_renderer,
+            has_offscreen_renderer=has_offscreen_renderer,
+            use_camera_obs=use_camera_obs,
+            camera_names=["frontview"],
+            camera_heights=[480] * 3,
+            camera_widths =[640] * 3,
+            camera_depths =[False] * 3,
+            control_freq=control_freq,
+        )
+        env.task_config["num_markers"] = 50
+        env.num_markers = 50
+        env.task_config["table_full_size"] = [0.4, 0.6, 0.05]
+        env.table_full_size = [0.4, 0.6, 0.05]
+        env.task_config['contact_threshold'] = 0.01
+        env.contact_threshold = 0.01
+        env.task_config["table_offset"] = [0.3, 0, 1.0]
+        env.table_offset = [0.3, 0, 1.0]
+        
+        env.reset()
+
+        if environment_setting is not None:
+            arena = env.model.mujoco_arena
+            delta_z = 0.01
+            env.sim.data.qpos[:] = environment_setting["qpos"]
+            env.sim.data.qvel[:] = environment_setting["qvel"]
+            env.sim.model.body_pos[:] = environment_setting["body_pos"]
+            env.sim.model.body_quat[:] = environment_setting["body_quat"]
+            for marker in arena.markers:
+                bid = env.sim.model.body_name2id(marker.root_body)
+                env.sim.model.body_pos[bid] += np.array([0.0, 0.0, delta_z])
+            env.placement_initializer = None
+            env.sim.forward()
+
+    elif task_name == "two_arm":
+        cfg = load_composite_controller_config(robot="Panda")
+        if use_joint_control: # for rendering
+            for arm_key, bp in cfg["body_parts"].items():
+                grip_spec = bp["gripper"]
+                bp.update({
+                    "type": "JOINT_POSITION",
+                    "kp": 10.0,
+                    "kd": 2.0,
+                    "interpolation": "linear",
+                    "ndim": 7,
+                    "input_type": "absolute",
+                    "input_max": [np.pi]*7,
+                    "input_min": [-np.pi]*7,
+                    "output_max": [np.pi]*7,
+                    "output_min": [-np.pi]*7,
+                    "gripper": grip_spec,
+                })
+        env = TwoArmLift(
+            robots=["Panda", "Panda"],
+            controller_configs=cfg,
+            env_configuration="parallel",
+            has_renderer=has_renderer,
+            has_offscreen_renderer=has_offscreen_renderer,
+            use_camera_obs=use_camera_obs,
+            camera_names=["frontview"],
+            camera_heights=[480],
+            camera_widths=[640],
+            camera_depths=[False],
+            control_freq=control_freq,
+        )
+        env.reset()
+        if environment_setting is not None:
+            env.sim.data.qpos[:]      = environment_setting["qpos"]
+            env.sim.data.qvel[:]      = environment_setting["qvel"]
+            env.sim.model.body_pos[:] = environment_setting["body_pos"]
+            env.sim.model.body_quat[:]= environment_setting["body_quat"]
+            env.placement_initializer = None
+            env.sim.forward()
+    else:
+        env = None
+    return env
+
+
+def write_grid_video(
+    episodes_frames: List[List[np.ndarray]],
+    path: str,
+    grid_shape=(5,5),
+    fps: int = 20
+):
+    """
+    Stitch multiple episode videos (lists of RGB frames) into a single grid video.
+
+    Args:
+        episodes_frames: Outer list = episodes, inner list = frames (H×W×3 uint8).
+        path: Output .mp4 file path.
+        grid_shape: (rows, cols) layout of the grid.
+        fps: Frames per second for the output video.
+
+    Raises:
+        AssertionError: If the number of episodes exceeds rows*cols.
+
+    Behavior:
+        - Truncates all episodes to the shortest length so they align in time.
+        - Fills empty grid slots (if any) with black frames.
+    """
+
+    rows, cols = grid_shape
+    num_eps = len(episodes_frames)
+    assert num_eps <= rows*cols, "Too many episodes for grid!"
+    min_len = min(len(frames) for frames in episodes_frames)
+    H, W, _ = episodes_frames[0][0].shape
+
+    grid_frames = []
+    for t in range(min_len):
+        rows_imgs = []
+        for r in range(rows):
+            cells = []
+            for c in range(cols):
+                idx = r*cols + c
+                if idx < num_eps:
+                    cells.append(episodes_frames[idx][t])
+                else:
+                    cells.append(np.zeros((H, W, 3), dtype=np.uint8))
+            rows_imgs.append(np.concatenate(cells, axis=1))
+        grid_frames.append(np.concatenate(rows_imgs, axis=0))
+
+    imageio.mimsave(path, grid_frames, fps=fps)
+
+
+def compute_smooth_trajectory_gripper(
+    joint_keys: np.ndarray,
+    gripper_ids = (7, 8),
+    control_freq: int = 20,
+    render_freq: int = 120,
+    closure_steps: int = 1,
+    closure_insertion: int = 5,
+) -> np.ndarray:
+    """
+    Upsample sparse joint keyframes to a higher rate using cubic splines for tasks with single gipper,
+    inserting a short 'closure' segment that duplicates one keyframe (e.g., to
+    hold the gripper closed) and shifts subsequent timestamps accordingly.
+
+    Args:
+        joint_keys: (N, dof) low-rate keyframes.
+        control_freq: Sampling rate of the keyframes (Hz).
+        render_freq: Desired high-rate sampling (Hz).
+        closure_steps: Number of duplicated frames to insert.
+        closure_insertion: 1-based index of the keyframe to insert.
+
+    Returns:
+        q_high: (T_high, dof) high-rate trajectory.
+    """
+    
+    dof    = joint_keys.shape[1]
+    dt_low = 1.0 / control_freq
+    dt_high= 1.0 / render_freq
+
+    # original key times
+    N = joint_keys.shape[0]
+    t_low = np.arange(N) * dt_low
+
+    # closure insertion
+    t_cl = t_low[closure_insertion - 1] + np.arange(1, closure_steps+1)*dt_low
+    q_cl = np.tile((joint_keys[closure_insertion-1,:]), (closure_steps,1))
+
+    t_low_after = closure_steps * dt_low + t_low[closure_insertion:]
+    t_ext = np.concatenate([t_low[:closure_insertion], t_cl, t_low_after])
+    q_ext = np.vstack([joint_keys[:closure_insertion], q_cl, joint_keys[closure_insertion:]])
+    q_ext[:closure_insertion, gripper_ids] = -1.0
+    q_ext[closure_insertion:, gripper_ids] = 1.0
+
+    # splines
+    splines = [CubicSpline(t_ext, q_ext[:,j], extrapolate=False) for j in range(dof)]
+
+    # sample high‑rate
+    t_high = np.arange(t_ext[0], t_ext[-1], dt_high)
+    q_high = np.stack([[s(t) for s in splines] for t in t_high])
+    return q_high
+
+
+def compute_smooth_trajectory_wipper(
+    joint_keys: np.ndarray,
+    control_freq: int = 20,
+    render_freq: int = 120,
+) -> np.ndarray:
+    dof    = joint_keys.shape[1]
+    dt_low = 1.0 / control_freq
+    dt_high= 1.0 / render_freq
+
+    # original key times
+    N = joint_keys.shape[0]
+    t_low = np.arange(N) * dt_low
+
+    # splines
+    splines = [CubicSpline(t_low, joint_keys[:,j], extrapolate=False) for j in range(dof)]
+
+    # sample high‑rate
+    t_high = np.arange(t_low[0], t_low[-1], dt_high)
+    q_high = np.stack([[s(t) for s in splines] for t in t_high])
+    return q_high
+
+
+def render_trajectory(
+    env,
+    task_name: str,
+    q_high: np.ndarray,
+    initial_pose: np.ndarray,
+    fps: int,
+    camera_name: str = "frontview"
+) -> List[np.ndarray]:
+    """
+    Replay a high-rate joint trajectory in the environment and capture rendered frames.
+
+    Args:
+        env: The robosuite environment (already restored to the correct scene).
+        q_high: (T, dof) joint trajectory produced by `compute_smooth_trajectory`.
+        initial_pose: (dof,) joint configuration to reset the robot before replay.
+        fps: Rendered video FPS (used only for consistency when saving later).
+        camera_name: Name of the MuJoCo camera to render.
+
+    Returns:
+        frames: List of RGB images (H×W×3 uint8), one per step.
+
+    Notes:
+        - Joint indices are resolved once, then we set `env.sim.data.qpos[joint_idx]`.
+        - For a two-DOF gripper, we average the two joint values to produce a single
+          scalar action (matches Door controller interface).
+        - If you switched to a JOINT_POSITION controller, ensure the action format
+          matches (absolute joint targets) instead of OSC deltas.
+    """
+    
+    # restore robot + door
+    offset = 0
+    for robot in env.robots:
+        # collect this robot's joint names
+        arm_names  = robot.robot_model.joints
+        grip_names = next(iter(robot.gripper.values())).joints
+        names      = arm_names + grip_names
+
+        # how many values to pull from initial_pose
+        n = len(names)
+
+        # look up their indices in qpos
+        idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in names]
+
+        # copy the slice of initial_pose into sim.data.qpos
+        env.sim.data.qpos[idx] = initial_pose[offset:offset + n]
+
+        offset += n
+    env.sim.forward()
+
+    frames = []
+    for q in q_high:
+        if task_name in ["door", "nut"]:
+            arm_q = q[:7]
+            gripper = (q[7] + q[8]) / 2.0
+            action = np.concatenate([arm_q, [gripper]])
+        elif task_name == "wipe":
+            action = q[:7]
+        else:
+            arm1 = q[0:7]
+            arm2 = q[9:16]
+            grip1 = (q[7] + q[8]) / 2.0
+            grip2 = (q[16] + q[17]) / 2.0
+            action = np.concatenate([arm1, [grip1], arm2, [grip2]])
+
+        env.step(action)
+
+        img = env.sim.render(640,480, camera_name=camera_name)
+        frames.append(np.flipud(img))
+    return frames
