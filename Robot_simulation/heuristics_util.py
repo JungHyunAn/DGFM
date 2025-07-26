@@ -9,6 +9,7 @@ from scipy.interpolate import CubicSpline
 from robosuite.environments.manipulation.door import Door
 from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
+from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
@@ -272,7 +273,51 @@ def make_env(
             env.placement_initializer = None
             env.sim.forward()
     else:
-        env = None
+        cfg = load_composite_controller_config(robot="Panda")
+        if use_joint_control: # for rendering
+            arm_key = next(iter(cfg["body_parts"]))
+            orig = cfg["body_parts"][arm_key]
+            grip_spec = orig["gripper"]
+            bp = cfg["body_parts"][arm_key]
+            bp.update({
+                "type": "JOINT_POSITION",
+                "kp": 10.0,
+                "kd": 2.0,
+                "interpolation": "linear",
+                "ndim": 7,
+                "input_type": "absolute",
+                "input_max": [np.pi]*7,
+                "input_min": [-np.pi]*7,
+                "output_max": [np.pi]*7,
+                "output_min": [-np.pi]*7,
+                "gripper": grip_spec,
+            })
+        env = NutAssembly(
+            robots="Panda",
+            single_object_mode=2,
+            nut_type="square",
+            controller_configs=cfg,
+            has_renderer=has_renderer,
+            has_offscreen_renderer=has_offscreen_renderer,
+            use_camera_obs=use_camera_obs,
+            camera_names=["frontview"],
+            camera_heights=[480],
+            camera_widths =[640],
+            camera_depths =[False],
+            control_freq=20,
+        )
+        delta_z = 0.1       
+        env.table_offset = [0, 0, 0.82 + delta_z]
+        env.placement_initializer = None
+        env.reset()
+        if environment_setting is not None:
+            env.sim.data.qpos[:]      = environment_setting["qpos"]
+            env.sim.data.qvel[:]      = environment_setting["qvel"]
+            env.sim.model.body_pos[:] = environment_setting["body_pos"]
+            env.sim.model.body_quat[:]= environment_setting["body_quat"]
+            env.placement_initializer = None
+            env.sim.forward()
+        
     return env
 
 
@@ -329,6 +374,8 @@ def compute_smooth_trajectory_gripper(
     render_freq: int = 120,
     closure_steps: int = 1,
     closure_insertion: int = 5,
+    rest_steps: int = 0,
+    open_after_end: bool = False,
 ) -> np.ndarray:
     """
     Upsample sparse joint keyframes to a higher rate using cubic splines for tasks with single gipper,
@@ -370,6 +417,20 @@ def compute_smooth_trajectory_gripper(
     # sample high‑rate
     t_high = np.arange(t_ext[0], t_ext[-1], dt_high)
     q_high = np.stack([[s(t) for s in splines] for t in t_high])
+    prefix = np.vstack([q_high[0]] * rest_steps)                # also (rest_steps, dof)
+    q_high = np.vstack([prefix, q_high])                       # same result
+
+    # open after end
+    if open_after_end:
+        open_steps = 10
+        # take the very last configuration and repeat it
+        last_cfg = q_high[-1:].copy()                         # shape (1, dof)
+        pad      = np.repeat(last_cfg, open_steps, axis=0)    # shape (10, dof)
+        # force gripper joints to “open” = –1.0
+        for gid in gripper_ids:
+            pad[:, gid] = -1.0
+        # append
+        q_high = np.vstack([q_high, pad])
     return q_high
 
 

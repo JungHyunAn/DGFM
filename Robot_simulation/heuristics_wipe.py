@@ -55,13 +55,6 @@ def generate_wipe_trajectory(
               "body_pos":  env.sim.model.body_pos.copy(),
               "body_quat": env.sim.model.body_quat.copy(),
             }
-
-    Notes:
-        - Actions are constructed for the default OSC controller
-          (pos/ori deltas + gripper scalar). If you switch controllers,
-          update the action packing accordingly.
-        - `mat2quat`, `quat_*` utilities assume MuJoCo’s [w,x,y,z] quaternion order.
-        - `frontview_frames` can be large; avoid `render=True` when parallelizing.
     """
 
     # ---------- storage ----------

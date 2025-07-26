@@ -29,11 +29,23 @@ from Robot_simulation.heuristics_util import (make_env,
 DOWNSAMPLE_RATIOS  = {"door"    : 2,
                       "wipe"    : -1,
                       "two_arm" : 2,
-                      "nut"     : 1}
-KEYFRAME_INTERVALS = {"door"    : [(140, 150, 3), (150, 153, 2), (160, 210, 10), (210, 250, 10)],
+                      "nut"     : 2}
+KEYFRAME_INTERVALS = {"door"    : [(140, 150, 3), 
+                                   (150, 153, 2), 
+                                   (160, 210, 10), 
+                                   (210, 250, 10)],
                       "wipe"    : [(60, -1, 25)],
-                      "two_arm" : [(110, 130, 3), (130, 133, 2), (140, -1, 20)],
-                      "nut"     : []}
+                      "two_arm" : [(110, 130, 3), 
+                                   (130, 133, 2), 
+                                   (140, -1, 20)],
+                      "nut"     : [(100, 120, 3), 
+                                   (120, 125, 2), 
+                                   (130, 176, 8), 
+                                   (176, 180, 2), 
+                                   (180, 183, 2), 
+                                   (183, 205, 4), 
+                                   (205, 215, 2),
+                                   (215, 230, 2)]}
 
 
 def init_hdf5(path: str, task_name: str, env):
@@ -213,6 +225,7 @@ def worker_generate(
         trials += 1
         # generator now returns (actions, success, frames, initial_qpos)
         q_traj, success, _, init_qpos, environment_setting = generator(env, render=False)
+        # print(trials, success)
         if success:
             # door_bid = env.object_body_ids["door"]
             # print("Passed door position: ", env.sim.data.body_xpos[door_bid])
@@ -393,6 +406,23 @@ def generate_data_parallel(
                     q_keys,
                     control_freq=control_freq/15,
                     render_freq=control_freq/2,
+                )
+            elif task_name == "nut":
+                gripper_ids = [
+                    env_r.sim.model.get_joint_qpos_addr(joint_name)
+                    for robot in env_r.robots
+                    for gripper in robot.gripper.values()
+                    for joint_name in gripper.joints
+                ]
+                q_high = compute_smooth_trajectory_gripper(
+                    q_keys,
+                    gripper_ids=gripper_ids,
+                    control_freq=control_freq/15,
+                    render_freq=control_freq/2,
+                    closure_steps=1,
+                    closure_insertion=5,
+                    rest_steps=10,
+                    open_after_end=True,
                 )
             else:
                 gripper_ids = [

@@ -10,7 +10,7 @@ from robosuite.utils.transform_utils import mat2quat, quat_slerp, quat_multiply,
 
 def generate_two_arm_trajectory(
     env,
-    open_steps: int = 100,
+    lift_steps: int = 100,
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
@@ -22,7 +22,7 @@ def generate_two_arm_trajectory(
       • PHASE1‑1: 100‑step approach to a random offset around each handle
       • PHASE1‑2: 30-step descend to handle
       • PHASE2: 10-step grasping handle
-      • PHASE3: (open_steps)‑step lift (keep level)
+      • PHASE3: (lift_steps)‑step lift (keep level)
 
     Args:
         env: robosuite TwoArmLift environment (already constructed).
@@ -172,12 +172,12 @@ def generate_two_arm_trajectory(
             img = env.sim.render(640,480, camera_name="frontview")
             frames.append(np.flipud(img))
 
-    # ---------- PHASE3: (open_steps)-step lifting the pot ----------
+    # ---------- PHASE3: (lift_steps)-step lifting the pot ----------
     # average initial handle height
     hz0 = env.sim.data.site_xpos[handle_ids[0]][2]
     hz1 = env.sim.data.site_xpos[handle_ids[1]][2]
     base_z      = 0.5 * (hz0 + hz1)
-    dz          = 0.2 / open_steps  # lift by 20cm total
+    dz          = 0.2 / lift_steps  # lift by 20cm total
 
     # move x,y by cubic function
     ax, bx, cx, ay, by, cy = np.random.uniform(-0.001,0.001,6)
@@ -188,14 +188,14 @@ def generate_two_arm_trajectory(
     phase   = np.random.uniform(0,2*np.pi)
     yaw_prev = 0.0
 
-    for i in range(open_steps):
+    for i in range(lift_steps):
         # get current eef positions
         p0 = env.sim.data.site_xpos[eefL].copy()
         p1 = env.sim.data.site_xpos[eefR].copy()
 
         # target: same orientation, random small xy jitter, rising z
-        dx = ax*(float(i)/open_steps)**3 + bx*(float(i)/open_steps)**2 + cx*(float(i)/open_steps)
-        dy = ay*(float(i)/open_steps)**3 + by*(float(i)/open_steps)**2 + cy*(float(i)/open_steps)
+        dx = ax*(float(i)/lift_steps)**3 + bx*(float(i)/lift_steps)**2 + cx*(float(i)/lift_steps)
+        dy = ay*(float(i)/lift_steps)**3 + by*(float(i)/lift_steps)**2 + cy*(float(i)/lift_steps)
         t0 = np.array([p0[0]+dx, p0[1]+dy, base_z + dz*(i+1)])
         t1 = np.array([p1[0]+dx, p1[1]+dy, base_z + dz*(i+1)])
 
@@ -205,7 +205,7 @@ def generate_two_arm_trajectory(
         a[7:10]  = (t1 - p1) * 100.0
 
         # small yaw changes
-        frac     = (i+1)/open_steps
+        frac     = (i+1)/lift_steps
         yaw_cur  = max_yaw * np.sin(2*np.pi*freq*frac + phase)
         yaw_delta = yaw_cur - yaw_prev
         yaw_prev  = yaw_cur
