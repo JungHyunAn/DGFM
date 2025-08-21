@@ -91,6 +91,11 @@ def generate_door_trajectory(
         "body_quat": body_quat,
     }
 
+    handle_pos = env._handle_xpos.copy()
+    R_handle   = env.sim.data.site_xmat[handle_id].reshape(3,3)
+    yaw = np.arctan2(R_handle[1,0], R_handle[0,0])
+    environment_parameters = (handle_pos[0], handle_pos[1], yaw)
+
     # ---------- helper for recording ----------
     def record_q():
         full = env.sim.data.qpos.copy()
@@ -101,17 +106,15 @@ def generate_door_trajectory(
 
     # ---------- compute pre-grasp pose (for PHASE1-1) ----------
     curr_pos   = env.sim.data.site_xpos[eef_id].copy()
-    handle_pos = env._handle_xpos.copy()
+    
     handle_off = np.random.uniform(0.03, 0.08)
-    pre_grasp  = handle_pos + np.array([handle_off, 0.1, 0.0])
-    R_handle   = env.sim.data.site_xmat[handle_id].reshape(3,3)
+    pre_grasp  = handle_pos + np.array([handle_off, 0.2, 0.0])
+    
     q_handle   = mat2quat(R_handle)
-
     for axis, ang in [(R_handle[:,0], -np.pi/2), (R_handle[:,1], np.pi/2)]:
         axis = axis / np.linalg.norm(axis)
         q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
         q_handle = quat_multiply(q_rot, q_handle)    
-
 
     # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
     step_towards(env=env,
@@ -128,8 +131,9 @@ def generate_door_trajectory(
     # ---------- PHASE1‑2: 50-step careful approach to handle ----------
     for _ in range(50):
         a = np.zeros(adim)
-        a[0:3] = [0, -0.21, 0]
+        a[0:3] = [0, -0.40, 0]
         env.step(a)
+        # print(env._gripper_to_handle)
         record_q()
         if render:
             img = env.sim.render(640,480, camera_name="frontview")
@@ -167,6 +171,7 @@ def generate_door_trajectory(
         a[6]   = 1.0
 
         env.step(a)
+        # print(env._gripper_to_handle)
         record_q()
         eef_pos = target_pos.copy()
         if render:
@@ -192,7 +197,7 @@ def generate_door_trajectory(
         if verbose:
             print(f"Saved frontview video to {out}")
 
-    return np.stack(q_traj, axis=0), success, frontview_frames, init_qpos, environment_setting
+    return np.stack(q_traj, axis=0), success, frontview_frames, init_qpos, environment_setting, environment_parameters
 
 
 if __name__ == "__main__":
@@ -229,7 +234,7 @@ if __name__ == "__main__":
         control_freq=20,
     )
 
-    traj, success, _, init_qpos, env_state = generate_door_trajectory(
+    traj, success, _, init_qpos, env_state, env_param = generate_door_trajectory(
         env,
         open_steps=50,
         render=True,
@@ -241,7 +246,7 @@ if __name__ == "__main__":
         print("Door task success!")
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
-
+    print("Environment parameters:", env_param)
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():
         print(f"  {k}: {v.shape}  dtype={v.dtype}")

@@ -70,6 +70,11 @@ def generate_two_arm_trajectory(
         "body_pos": env.sim.model.body_pos.copy(),
         "body_quat":env.sim.model.body_quat.copy(),
     }
+    posL = env.sim.data.site_xpos[hidL].copy()
+    posR = env.sim.data.site_xpos[hidR].copy()
+    R0   = env.sim.data.site_xmat[hidL].reshape(3,3)
+    yaw  = np.arctan2(R0[1,0], R0[0,0])
+    environment_parameters = ((posL[0]+posR[0])/2, (posL[1]+posR[1])/2, yaw)
 
     # ---------- helper for recording ----------
     def record_q():
@@ -79,11 +84,8 @@ def generate_two_arm_trajectory(
     record_q()
 
     # ---------- compute pre-grasp pose (for PHASE1-1) ----------
-    posL = env.sim.data.site_xpos[hidL].copy()
-    posR = env.sim.data.site_xpos[hidR].copy()
     tgtL = posL + np.array([0,0,0.015]) # pre-grasp pose for left arm
     tgtR = posR + np.array([0,0,0.015]) # pre-grasp pose for right arm
-    R0   = env.sim.data.site_xmat[hidL].reshape(3,3)
     target_quat   = mat2quat(R0)
 
     for axis, ang in [(R0[:,0], np.pi), (R0[:, 2], -np.pi/2)]:
@@ -234,7 +236,7 @@ def generate_two_arm_trajectory(
         if verbose:
             print(f"Saved video to {path}")
 
-    return np.stack(q_traj, axis=0), success, frames, init_qpos, env_setting
+    return np.stack(q_traj, axis=0), success, frames, init_qpos, env_setting, environment_parameters
 
 
 if __name__ == "__main__":
@@ -256,7 +258,7 @@ if __name__ == "__main__":
         control_freq=20,
     )
 
-    traj, success, _, init_qpos, env_state = generate_two_arm_trajectory(
+    traj, success, _, init_qpos, env_state, env_param = generate_two_arm_trajectory(
         env,
         render=True,
         video_folder="Robot_simulation/videos",
@@ -267,6 +269,7 @@ if __name__ == "__main__":
         print("Two Arm task success!")
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
+    print("Environment parameters:", env_param)
 
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():

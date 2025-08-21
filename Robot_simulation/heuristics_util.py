@@ -1,7 +1,81 @@
+"""
+Robosuite dataset generation & rendering utilities
+==================================================
+
+Helpers to **replay** joint-space trajectories in RoboSuite deterministically
+and **render** them to video.
+
+What this module includes
+-------------------------
+- `make_env` — Build task-specific RoboSuite envs with optional absolute
+  JOINT_POSITION control for arms (useful for replay).
+- `restore_environment` — Deterministically restore a saved MuJoCo state
+  (`qpos`, `qvel`, `body_pos`, `body_quat`).
+- `compute_smooth_trajectory_*` & `compute_smooth_trajectory` — Convert sparse
+  keyframes to high-rate trajectories via cubic splines; includes simple, task-
+  specific gripper timing.
+- `render_trajectory` — Teleport robot to the first pose and step the trajectory
+  frame-by-frame, optionally holding the first pose to avoid a “frame-0 jerk”.
+- `write_grid_video` — Tile multiple per-episode videos into a grid.
+- `step_towards` — (Optional) Short OSC interpolation for debug / approach moves.
+
+Design & assumptions
+--------------------
+1) **Deterministic restoration**
+   If `environment_setting` is passed to `make_env`, we copy the full MuJoCo state
+   and set `env.placement_initializer = None` so subsequent `forward()` preserves
+   placements.
+
+2) **Controller mode for replay**
+   With `use_joint_control=True`, Panda arms run an absolute 7-DoF
+   JOINT_POSITION controller (linear interpolation). Action packing used by
+   `_to_action_from_q` mirrors task interfaces:
+     • door / nut:  7 arm joints + 1 gripper scalar (avg of the two fingers)
+     • wipe:        7 arm joints
+     • two_arm:     ([7 arm] + [1 grip]) × 2
+   If you change controllers or action conventions, update `_to_action_from_q`.
+
+3) **Start-of-trajectory alignment**
+   `render_trajectory` writes `q_high[0]` into `env.sim.data.qpos` and zeros the
+   corresponding `qvel` before stepping. With `hold_init=True`, it briefly steps
+   that pose so internal set-points sync — preventing initial snapping of the
+   end-effector or gripper.
+
+4) **Spline upsampling**
+   For single-gripper tasks, `compute_smooth_trajectory_gripper` inserts a short
+   “closure” segment by duplicating a keyframe and sets gripper joints to
+   open/close values on either side, then fits per-joint cubic splines. The
+   wrapper resolves gripper joint indices from the live env. Wipe uses a minimal
+   spline without gripper logic.
+
+5) **Rendering path**
+   `render_trajectory` builds per-frame actions via `_to_action_from_q`, steps
+   the env, and captures off-screen frames with `env.sim.render`.
+
+Task-specific notes
+-------------------
+- Wipe: table size / offsets and marker count are set for consistency.
+- Nut: table is slightly lifted to avoid initial penetrations.
+
+Gotchas / tips
+--------------
+- Ensure `q_high` joint order matches the robot model’s joint names.
+- The spline functions have their own `control_freq` / `render_freq`; revisit
+  if you change the env control rate.
+- If you still see instability at t≈0, enable `hold_init=True` or reduce
+  controller gains in `make_env` for debugging.
+- `step_towards` is a convenience and not used in the main replay path.
+"""
+
 import imageio
 import numpy as np
 import logging
-logging.disable(logging.INFO)
+logging.disable(logging.WARNING)
+robosuite_logger = logging.getLogger("robosuite")
+robosuite_logger.setLevel(logging.ERROR)  
+robosuite_logger.propagate = False        
+for h in list(robosuite_logger.handlers): 
+    robosuite_logger.removeHandler(h)
 
 from typing import List, Optional
 from scipy.interpolate import CubicSpline
@@ -78,6 +152,23 @@ def step_towards(
         if render and frames is not None:
             img = env.sim.render(640, 480, camera_name=camera_name)
             frames.append(np.flipud(img))
+
+
+def restore_environment(
+    env,
+    environment_setting: Optional[List[float]],
+):
+    """
+    Restores the robosuite environment based on environment _setting
+
+    Args:
+        env: Robosuite environment
+        environment_setting: Dict with keys {"qpos","qvel","body_pos","body_quat"}
+    """
+    env.sim.data.qpos[:]      = environment_setting["qpos"]
+    env.sim.data.qvel[:]      = environment_setting["qvel"]
+    env.sim.model.body_pos[:] = environment_setting["body_pos"]
+    env.sim.model.body_quat[:]= environment_setting["body_quat"]
 
 
 def make_env(
@@ -167,13 +258,11 @@ def make_env(
             camera_widths=[640],
             camera_depths=[False],
             control_freq=control_freq,
+            reward_shaping=True,
         )
         env.reset()
         if environment_setting is not None:
-            env.sim.data.qpos[:]      = environment_setting["qpos"]
-            env.sim.data.qvel[:]      = environment_setting["qvel"]
-            env.sim.model.body_pos[:] = environment_setting["body_pos"]
-            env.sim.model.body_quat[:]= environment_setting["body_quat"]
+            restore_environment(env, environment_setting)
             env.placement_initializer = None
             env.sim.forward()   # now forward will KEEP it
 
@@ -223,10 +312,7 @@ def make_env(
         if environment_setting is not None:
             arena = env.model.mujoco_arena
             delta_z = 0.01
-            env.sim.data.qpos[:] = environment_setting["qpos"]
-            env.sim.data.qvel[:] = environment_setting["qvel"]
-            env.sim.model.body_pos[:] = environment_setting["body_pos"]
-            env.sim.model.body_quat[:] = environment_setting["body_quat"]
+            restore_environment(env, environment_setting)
             for marker in arena.markers:
                 bid = env.sim.model.body_name2id(marker.root_body)
                 env.sim.model.body_pos[bid] += np.array([0.0, 0.0, delta_z])
@@ -266,10 +352,7 @@ def make_env(
         )
         env.reset()
         if environment_setting is not None:
-            env.sim.data.qpos[:]      = environment_setting["qpos"]
-            env.sim.data.qvel[:]      = environment_setting["qvel"]
-            env.sim.model.body_pos[:] = environment_setting["body_pos"]
-            env.sim.model.body_quat[:]= environment_setting["body_quat"]
+            restore_environment(env, environment_setting)
             env.placement_initializer = None
             env.sim.forward()
     else:
@@ -311,10 +394,7 @@ def make_env(
         env.placement_initializer = None
         env.reset()
         if environment_setting is not None:
-            env.sim.data.qpos[:]      = environment_setting["qpos"]
-            env.sim.data.qvel[:]      = environment_setting["qvel"]
-            env.sim.model.body_pos[:] = environment_setting["body_pos"]
-            env.sim.model.body_quat[:]= environment_setting["body_quat"]
+            restore_environment(env, environment_setting)
             env.placement_initializer = None
             env.sim.forward()
         
@@ -367,6 +447,55 @@ def write_grid_video(
     imageio.mimsave(path, grid_frames, fps=fps)
 
 
+# Wrapper for compute_smooth_trajectory_{gripper type}
+def compute_smooth_trajectory(
+    env_r,
+    task_name,
+    q_keys: np.ndarray,
+    control_freq: int,
+) -> np.ndarray:
+    if task_name == "wipe":
+        q_high = compute_smooth_trajectory_wipper(
+            q_keys,
+            control_freq=control_freq/15,
+            render_freq=control_freq/2,
+        )
+    elif task_name == "nut":
+        gripper_ids = [
+            env_r.sim.model.get_joint_qpos_addr(joint_name)
+            for robot in env_r.robots
+            for gripper in robot.gripper.values()
+            for joint_name in gripper.joints
+        ]
+        q_high = compute_smooth_trajectory_gripper(
+            q_keys,
+            gripper_ids=gripper_ids,
+            control_freq=control_freq/15,
+            render_freq=control_freq/2,
+            closure_steps=1,
+            closure_insertion=5,
+            rest_steps=10,
+            open_after_end=True,
+        )
+    else:
+        gripper_ids = [
+            env_r.sim.model.get_joint_qpos_addr(joint_name)
+            for robot in env_r.robots
+            for gripper in robot.gripper.values()
+            for joint_name in gripper.joints
+        ]
+        q_high = compute_smooth_trajectory_gripper(
+            q_keys,
+            gripper_ids=gripper_ids,
+            control_freq=control_freq/15,
+            render_freq=control_freq/2,
+            closure_steps=1,
+            closure_insertion=5
+        )
+    
+    return q_high
+
+
 def compute_smooth_trajectory_gripper(
     joint_keys: np.ndarray,
     gripper_ids = (7, 8),
@@ -417,8 +546,10 @@ def compute_smooth_trajectory_gripper(
     # sample high‑rate
     t_high = np.arange(t_ext[0], t_ext[-1], dt_high)
     q_high = np.stack([[s(t) for s in splines] for t in t_high])
-    prefix = np.vstack([q_high[0]] * rest_steps)                # also (rest_steps, dof)
-    q_high = np.vstack([prefix, q_high])                       # same result
+
+    if rest_steps:
+        prefix = np.vstack([q_high[0]] * rest_steps)                # also (rest_steps, dof)
+        q_high = np.vstack([prefix, q_high])                       # same result
 
     # open after end
     if open_after_end:
@@ -456,13 +587,30 @@ def compute_smooth_trajectory_wipper(
     return q_high
 
 
+def _to_action_from_q(q, task_name):
+    """Match exactly the action packing you already use in env.step(...)."""
+    if task_name in ["door", "nut"]:
+        arm_q   = q[:7]
+        grip_sc = float((q[7] + q[8]) / 2.0)   # your current compression
+        return np.concatenate([arm_q, [grip_sc]])
+    elif task_name == "wipe":
+        return q[:7]
+    else:  # two_arm
+        arm1 = q[0:7]
+        grip1 = float((q[7] + q[8]) / 2.0)
+        arm2 = q[9:16]
+        grip2 = float((q[16] + q[17]) / 2.0)
+        return np.concatenate([arm1, [grip1], arm2, [grip2]])
+    
+
 def render_trajectory(
     env,
     task_name: str,
     q_high: np.ndarray,
     initial_pose: np.ndarray,
-    fps: int,
-    camera_name: str = "frontview"
+    fps: int = 60,
+    camera_name: str = "frontview",
+    hold_init: bool = False,
 ) -> List[np.ndarray]:
     """
     Replay a high-rate joint trajectory in the environment and capture rendered frames.
@@ -501,25 +649,19 @@ def render_trajectory(
 
         # copy the slice of initial_pose into sim.data.qpos
         env.sim.data.qpos[idx] = initial_pose[offset:offset + n]
+        env.sim.data.qvel[:] = 0
 
         offset += n
     env.sim.forward()
 
+    if hold_init:
+        for _ in range(100):
+            env.step(_to_action_from_q(q_high[0], task_name))
+
     frames = []
     for q in q_high:
-        if task_name in ["door", "nut"]:
-            arm_q = q[:7]
-            gripper = (q[7] + q[8]) / 2.0
-            action = np.concatenate([arm_q, [gripper]])
-        elif task_name == "wipe":
-            action = q[:7]
-        else:
-            arm1 = q[0:7]
-            arm2 = q[9:16]
-            grip1 = (q[7] + q[8]) / 2.0
-            grip2 = (q[16] + q[17]) / 2.0
-            action = np.concatenate([arm1, [grip1], arm2, [grip2]])
-
+        action = _to_action_from_q(q, task_name)
+        
         env.step(action)
 
         img = env.sim.render(640,480, camera_name=camera_name)

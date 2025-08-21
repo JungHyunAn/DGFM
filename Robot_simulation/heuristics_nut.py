@@ -129,6 +129,9 @@ def generate_nut_trajectory(
         "body_pos": env.sim.model.body_pos.copy(),
         "body_quat":env.sim.model.body_quat.copy(),
     }
+    yaw = np.arctan2(R0[1,0], R0[0,0])
+    environment_parameters = (nut_pos[0], nut_pos[1], yaw)
+
     # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
     grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
     step_towards(env, eef_id, adim, record_q,
@@ -200,7 +203,7 @@ def generate_nut_trajectory(
         if verbose:
             print(f"Saved frontview video to {path}")
 
-    return np.stack(q_traj, axis=0), success, frames, init_qpos, environment_setting
+    return np.stack(q_traj, axis=0), success, frames, init_qpos, environment_setting, environment_parameters
 
 
 if __name__ == "__main__":
@@ -228,7 +231,7 @@ if __name__ == "__main__":
     env.table_offset[2] += delta_z
     env.reset()    
     
-    traj, success, _, init_qpos, env_state = generate_nut_trajectory(
+    traj, success, _, init_qpos, env_state, env_param = generate_nut_trajectory(
         env,
         delta_x,
         delta_z,
@@ -241,6 +244,7 @@ if __name__ == "__main__":
         print("Nut task success!")
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
+    print("Environment parameters:", env_param)
 
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():

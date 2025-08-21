@@ -1,3 +1,106 @@
+"""
+Heuristic dataset generator for RoboSuite (parallel)
+===================================================
+
+This program generates successful demonstration episodes for RoboSuite tasks
+using hand-coded heuristics, samples keyframes, and saves everything into a
+single HDF5 dataset. It can also optionally replay a subset of the episodes and
+export a grid video for quick inspection.
+
+What this script does
+---------------------
+1) **Environment & heuristics**:
+   - Builds a task-specific RoboSuite environment (`make_env`).
+   - Calls the task’s heuristic policy to produce a full low-level joint
+     trajectory plus a full simulator snapshot:
+       door       → `generate_door_trajectory`
+       wipe       → `generate_wipe_trajectory`
+       two_arm    → `generate_two_arm_trajectory`
+       nut        → `generate_nut_trajectory`
+
+2) **Keyframe selection** (`sample_keyframes`):
+   - Optionally downsample the full trajectory by a fixed stride
+     (`DOWNSAMPLE_RATIOS[task]`), or, for *wipe*, infer the stride so that a
+     given interval contributes exactly `n` frames (`-1` sentinel).
+   - For each configured interval `(start, end, n)` in **original** indices
+     (`KEYFRAME_INTERVALS[task]`), pick `n` uniformly spaced indices and map
+     them back to the original trace.
+   - Returns `(q_keys, key_inds)` where `q_keys` is (K, dof) and `key_inds` is (K,).
+
+3) **HDF5 writing** (`save_episode`, `init_hdf5`):
+   - Creates `/meta` with attributes:
+       task, timestamp, robot, dof
+   - For each successful episode, creates:
+       /data/entire_episode_{i}/
+         ├─ joint_angles          (K, dof)        # sampled keyframes (not full trace)
+         ├─ key_inds              (K,)            # original indices in the full trace
+         ├─ initial_pose          (dof,)          # robot pose at episode start
+         ├─ attrs: success=1, num_keyframes=K
+         ├─ environment_setting/                # full simulator state to restore
+         │    ├─ qpos
+         │    ├─ qvel
+         │    ├─ body_pos
+         │    └─ body_quat
+         └─ environment_parameters/values       # task-specific (P,)
+
+4) **Parallel collection** (`generate_data_parallel`):
+   - Launches `num_workers` processes; each worker repeatedly calls the heuristic
+     until it accumulates `chunk_size` successful episodes or hits a trial cap.
+   - Continues resubmitting workers until `n` successes have been saved.
+
+5) **Optional rendering**:
+   - Recreates the environment from saved `environment_setting`, upsamples
+     keyframes to a smooth high-rate trajectory via `compute_smooth_trajectory`,
+     replays it with `render_trajectory`, and stitches per-episode videos into a
+     grid MP4 (`write_grid_video`).
+
+Task presets
+------------
+- **Downsample ratios** (`DOWNSAMPLE_RATIOS`):
+    door=2, two_arm=2, nut=2, wipe=−1 (auto-stride computed from the first interval)
+- **Keyframe intervals** (`KEYFRAME_INTERVALS`):
+    Per-task lists of `(start_idx, end_idx, n_samples)` in original indices.
+    Use `end = -1` to denote the last frame of the original trace.
+
+CLI
+---
+python -m Robot_simulation.generate_dataset_parallel
+  --n 250
+  --task_name door                # {door, wipe, two_arm, nut}
+  --render                        # (optional) write grid MP4
+  --num_workers 8
+  --chunk_size 3
+  --verbose
+
+Important notes & assumptions
+-----------------------------
+- The **heuristic generator** must return:
+    (q_traj, success, frames_unused, initial_qpos, environment_setting, env_param)
+  where `environment_setting` contains full MuJoCo state arrays. Only episodes
+  with `success=True` are saved.
+- Keyframes are sampled from a potentially downsampled trace but `key_inds`
+  are always in the **original** trace index space.
+- `make_env(..., use_joint_control=True, environment_setting=...)` restores the
+  exact scene for deterministic replay and disables random placement thereafter.
+- The upsampler (`compute_smooth_trajectory`) handles task-specific gripper
+  timing and rates. If you change the env `control_freq`, revisit its arguments.
+
+Outputs
+-------
+- HDF5 dataset at: `Robot_simulation/heuristic_dataset/{task}_dataset_{n}.hdf5`
+- (Optional) grid video: `{task}_grid_{n}.mp4` in the same folder.
+
+Gotchas / tips
+--------------
+- Ensure the heuristic’s joint ordering matches the RoboSuite model joints.
+- If rendering looks unstable at t≈0, verify the replay utilities teleport the
+  robot to the first pose and zero velocities before stepping (handled in
+  `render_trajectory` in the utilities module).
+- For very long episodes, adjust `KEYFRAME_INTERVALS` to cover the parts you
+  care about, and/or increase `DOWNSAMPLE_RATIOS`.
+"""
+
+
 import os
 import time
 import h5py
@@ -22,29 +125,31 @@ from Robot_simulation.heuristics_two_arm import generate_two_arm_trajectory
 from Robot_simulation.heuristics_nut import generate_nut_trajectory
 from Robot_simulation.heuristics_util import (make_env, 
                                               write_grid_video, 
-                                              compute_smooth_trajectory_gripper,
-                                              compute_smooth_trajectory_wipper, 
+                                              compute_smooth_trajectory, 
                                               render_trajectory)
 
 DOWNSAMPLE_RATIOS  = {"door"    : 2,
                       "wipe"    : -1,
                       "two_arm" : 2,
                       "nut"     : 2}
-KEYFRAME_INTERVALS = {"door"    : [(140, 150, 3), 
+KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1),
+                                   (110, 120, 1),
+                                   (120, 130, 1),
+                                   (130, 140, 1),
+                                   (140, 150, 3), 
                                    (150, 153, 2), 
-                                   (160, 210, 10), 
-                                   (210, 250, 10)],
+                                   (160, 210, 8), 
+                                   (210, 250, 8)],
                       "wipe"    : [(60, -1, 25)],
                       "two_arm" : [(110, 130, 3), 
                                    (130, 133, 2), 
                                    (140, -1, 20)],
                       "nut"     : [(100, 120, 3), 
                                    (120, 125, 2), 
-                                   (130, 176, 8), 
-                                   (176, 180, 2), 
-                                   (180, 183, 2), 
-                                   (183, 205, 4), 
-                                   (205, 215, 2),
+                                   (130, 180, 10),
+                                   (180, 202, 4), 
+                                   (202, 207, 2), 
+                                   (207, 215, 2),
                                    (215, 230, 2)]}
 
 
@@ -139,7 +244,8 @@ def save_episode(
     key_inds: np.ndarray,
     success: bool,
     initial_pose: np.ndarray,
-    env_setting: float,
+    env_setting,
+    env_param,
 ):
     """
     Write one successful episode into the HDF5 file.
@@ -151,6 +257,11 @@ def save_episode(
             - initial_pose         (dof,)
             - attrs: success, num_keyframes
             - environment_setting/ (group of arrays: qpos, qvel, body_pos, body_quat, ...)
+            - environment_parameters/ (tuple of parameters for the environment
+                                        - Door   : door handle x coordinate, y coordinate, yaw
+                                        - Wipe   : dirt x coordinate, y coordinate, maximum radius
+                                        - TwoArm : pot x coordinate, y coordinate, yaw
+                                        - Nut    : nut handle x coordinate, y coordinate, yaw)
 
     Args:
         hf: Open HDF5 file handle.
@@ -172,10 +283,17 @@ def save_episode(
     grp.attrs["success"]       = int(success)
     grp.attrs["num_keyframes"] = joint_angles.shape[0]
     grp.create_dataset("initial_pose", data=initial_pose, compression="gzip")
-    # scalar — drop compression
-    env_grp = grp.create_group("environment_setting")
+    # save environment settings
+    env_setting_grp = grp.create_group("environment_setting")
     for k, v in env_setting.items():
-        env_grp.create_dataset(k, data=v, compression="gzip")
+        env_setting_grp.create_dataset(k, data=v, compression="gzip")
+    # save environment parameters
+    env_param_grp = grp.create_group("environment_parameters")
+    env_param_grp.create_dataset(
+        "values",
+        data=np.array(env_param, dtype=np.float32),
+        compression="gzip"
+    )
 
 
 def worker_generate(
@@ -224,7 +342,7 @@ def worker_generate(
     while len(successes) < chunk_size and trials < max_trials:
         trials += 1
         # generator now returns (actions, success, frames, initial_qpos)
-        q_traj, success, _, init_qpos, environment_setting = generator(env, render=False)
+        q_traj, success, _, init_qpos, environment_setting, env_param = generator(env, render=False)
         # print(trials, success)
         if success:
             # door_bid = env.object_body_ids["door"]
@@ -236,7 +354,8 @@ def worker_generate(
                 "joint_angles": q_keys,         # (35,dof)
                 "key_inds":      idx,           # (35,)
                 "initial_pose":  init_qpos,
-                "environment_setting":  environment_setting
+                "environment_setting":  environment_setting,
+                "environment_parameters": env_param,
             })
 
     env.close()
@@ -324,17 +443,17 @@ def generate_data_parallel(
     # Sample env for metadata & fps (no offscreen / no camera obs)
     sample_env = make_env(task_name, has_offscreen_renderer=False, use_camera_obs=False)
     control_freq = sample_env.control_freq
-    sample_env.close()
 
     # HDF5 init
     if hdf5_name is None:
-        hdf5_name = f"{task_name}_dataset.hdf5"
+        hdf5_name = f"{task_name}_dataset_{n}.hdf5"
     h5_path = os.path.join(output_dir, hdf5_name)
     hf = init_hdf5(
         h5_path,
         task_name,
-        make_env(task_name, has_offscreen_renderer=False, use_camera_obs=False)
+        sample_env
     )
+    sample_env.close()
 
     episode_idx = 0
     success_count = 0
@@ -368,7 +487,8 @@ def generate_data_parallel(
                         entry["key_inds"],
                         True,
                         entry["initial_pose"],
-                        entry["environment_setting"]
+                        entry["environment_setting"],
+                        entry["environment_parameters"]
                     )
 
                     pbar.update(1)
@@ -401,44 +521,8 @@ def generate_data_parallel(
                              use_camera_obs=False, 
                              use_joint_control=True, 
                              environment_setting=environment_setting)
-            if task_name == "wipe":
-                q_high = compute_smooth_trajectory_wipper(
-                    q_keys,
-                    control_freq=control_freq/15,
-                    render_freq=control_freq/2,
-                )
-            elif task_name == "nut":
-                gripper_ids = [
-                    env_r.sim.model.get_joint_qpos_addr(joint_name)
-                    for robot in env_r.robots
-                    for gripper in robot.gripper.values()
-                    for joint_name in gripper.joints
-                ]
-                q_high = compute_smooth_trajectory_gripper(
-                    q_keys,
-                    gripper_ids=gripper_ids,
-                    control_freq=control_freq/15,
-                    render_freq=control_freq/2,
-                    closure_steps=1,
-                    closure_insertion=5,
-                    rest_steps=10,
-                    open_after_end=True,
-                )
-            else:
-                gripper_ids = [
-                    env_r.sim.model.get_joint_qpos_addr(joint_name)
-                    for robot in env_r.robots
-                    for gripper in robot.gripper.values()
-                    for joint_name in gripper.joints
-                ]
-                q_high = compute_smooth_trajectory_gripper(
-                    q_keys,
-                    gripper_ids=gripper_ids,
-                    control_freq=control_freq/15,
-                    render_freq=control_freq/2,
-                    closure_steps=1,
-                    closure_insertion=5
-                )
+            
+            q_high = compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
 
             frames = render_trajectory(
                 env_r, task_name, q_high, init_q,
@@ -448,7 +532,7 @@ def generate_data_parallel(
             episodes_frames.append(frames)
         env_r.close()
 
-        grid_path = os.path.join(output_dir, f"{task_name}_grid.mp4")
+        grid_path = os.path.join(output_dir, f"{task_name}_grid_{n}.mp4")
         write_grid_video(episodes_frames, grid_path, grid_shape=(5,5), fps=control_freq)
         if verbose:
             print(f"Saved grid video: {grid_path}")

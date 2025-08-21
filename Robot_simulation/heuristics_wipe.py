@@ -102,6 +102,7 @@ def generate_wipe_trajectory(
 
     # ---------- choose single dirt center ----------
     max_radius, center, _ = env._get_wipe_information()
+    environment_paramters = (center[0], center[1], max_radius)
     
     # ---------- contact&approach height ----------
     table_z = getattr(env, "table_offset", np.array([0, 0, 0]))[2]
@@ -189,7 +190,7 @@ def generate_wipe_trajectory(
         if verbose:
             print(f"Saved frontview video to {out}")
 
-    return np.stack(q_traj, axis=0), success, frames, init_qpos, env_setting
+    return np.stack(q_traj, axis=0), success, frames, init_qpos, env_setting, environment_paramters
 
 
 if __name__ == "__main__":
@@ -225,7 +226,7 @@ if __name__ == "__main__":
     env.task_config["table_full_size"] = [0.4, 0.6, 0.05]
     env.table_full_size = [0.4, 0.6, 0.05]
 
-    traj, success, frames, init_qpos, env_state = generate_wipe_trajectory(
+    traj, success, frames, init_qpos, env_state, env_param = generate_wipe_trajectory(
         env,
         render=True,
         video_folder="Robot_simulation/videos",
@@ -236,7 +237,8 @@ if __name__ == "__main__":
         print("Wipe task success!")
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
-
+    print("Environment parameters:", env_param)
+    
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():
         print(f"  {k}: {v.shape}  dtype={v.dtype}")
