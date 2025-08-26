@@ -32,7 +32,7 @@ Design & assumptions
    `_to_action_from_q` mirrors task interfaces:
      • door / nut:  7 arm joints + 1 gripper scalar (avg of the two fingers)
      • wipe:        7 arm joints
-     • two_arm:     ([7 arm] + [1 grip]) × 2
+     • two_arm:     ([7 arm] + [1 grip]) x 2
    If you change controllers or action conventions, update `_to_action_from_q`.
 
 3) **Start-of-trajectory alignment**
@@ -59,7 +59,7 @@ Task-specific notes
 
 Gotchas / tips
 --------------
-- Ensure `q_high` joint order matches the robot model’s joint names.
+- Ensure `q_high` joint order matches the robot model's joint names.
 - The spline functions have their own `control_freq` / `render_freq`; revisit
   if you change the env control rate.
 - If you still see instability at t≈0, enable `hold_init=True` or reduce
@@ -233,8 +233,8 @@ def make_env(
             bp = cfg["body_parts"][arm_key]
             bp.update({
                 "type": "JOINT_POSITION",
-                "kp": 10.0,
-                "kd": 2.0,
+                "kp": 40.0,
+                "kd": 4.0,
                 "interpolation": "linear",
                 "ndim": 7,
                 "input_type": "absolute",
@@ -275,7 +275,7 @@ def make_env(
             bp = cfg["body_parts"][arm_key]
             bp.update({
                 "type": "JOINT_POSITION",
-                "kp": 10.0,
+                "kp": 40.0,
                 "kd": 2.0,
                 "interpolation": "linear",
                 "ndim": 7,
@@ -326,7 +326,7 @@ def make_env(
                 grip_spec = bp["gripper"]
                 bp.update({
                     "type": "JOINT_POSITION",
-                    "kp": 10.0,
+                    "kp": 40.0,
                     "kd": 2.0,
                     "interpolation": "linear",
                     "ndim": 7,
@@ -364,7 +364,7 @@ def make_env(
             bp = cfg["body_parts"][arm_key]
             bp.update({
                 "type": "JOINT_POSITION",
-                "kp": 10.0,
+                "kp": 40.0,
                 "kd": 2.0,
                 "interpolation": "linear",
                 "ndim": 7,
@@ -454,6 +454,12 @@ def compute_smooth_trajectory(
     q_keys: np.ndarray,
     control_freq: int,
 ) -> np.ndarray:
+    gripper_ids = [
+        env_r.sim.model.get_joint_qpos_addr(joint_name)
+        for robot in env_r.robots
+        for gripper in robot.gripper.values()
+        for joint_name in gripper.joints
+    ]
     if task_name == "wipe":
         q_high = compute_smooth_trajectory_wipper(
             q_keys,
@@ -461,12 +467,6 @@ def compute_smooth_trajectory(
             render_freq=control_freq/2,
         )
     elif task_name == "nut":
-        gripper_ids = [
-            env_r.sim.model.get_joint_qpos_addr(joint_name)
-            for robot in env_r.robots
-            for gripper in robot.gripper.values()
-            for joint_name in gripper.joints
-        ]
         q_high = compute_smooth_trajectory_gripper(
             q_keys,
             gripper_ids=gripper_ids,
@@ -477,13 +477,16 @@ def compute_smooth_trajectory(
             rest_steps=10,
             open_after_end=True,
         )
-    else:
-        gripper_ids = [
-            env_r.sim.model.get_joint_qpos_addr(joint_name)
-            for robot in env_r.robots
-            for gripper in robot.gripper.values()
-            for joint_name in gripper.joints
-        ]
+    elif task_name == "door":
+        q_high = compute_smooth_trajectory_gripper(
+            q_keys,
+            gripper_ids=gripper_ids,
+            control_freq=control_freq/15,
+            render_freq=control_freq/2,
+            closure_steps=1,
+            closure_insertion=9
+        )
+    else: # two arm
         q_high = compute_smooth_trajectory_gripper(
             q_keys,
             gripper_ids=gripper_ids,

@@ -84,8 +84,8 @@ def generate_two_arm_trajectory(
     record_q()
 
     # ---------- compute pre-grasp pose (for PHASE1-1) ----------
-    tgtL = posL + np.array([0,0,0.015]) # pre-grasp pose for left arm
-    tgtR = posR + np.array([0,0,0.015]) # pre-grasp pose for right arm
+    tgtL = posL + np.array([0,0,0.045]) # pre-grasp pose for left arm
+    tgtR = posR + np.array([0,0,0.045]) # pre-grasp pose for right arm
     target_quat   = mat2quat(R0)
 
     for axis, ang in [(R0[:,0], np.pi), (R0[:, 2], -np.pi/2)]:
@@ -151,8 +151,8 @@ def generate_two_arm_trajectory(
     for _ in range(30):
         a = np.zeros(adim)
         # small downward move
-        a[2] = -0.08
-        a[9] = -0.08
+        a[2] = -0.205
+        a[9] = -0.205
         # keep orientation & open gripper
         a[6]  = -1
         a[13] = -1

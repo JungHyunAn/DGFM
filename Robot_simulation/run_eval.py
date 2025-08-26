@@ -33,7 +33,7 @@ What this script does
 
 5) **Save artifacts** under `--results_path/<Asia/Seoul timestamp>/`:
    - `results.json`: full config + metrics across training.
-   - `success_rates.png`: success vs. epoch.
+   - `success_rates.png`: success / loss vs. epoch.
    - `model.pt`: best model weights (PyTorch).
    - `*_grid_*.mp4`: optional rendered grids from evaluation.
 
@@ -114,6 +114,7 @@ Behavioral notes & tips
 
 import os
 import numpy as np
+import random
 import math
 import torch
 import torch.optim as optim
@@ -135,16 +136,14 @@ for h in list(robosuite_logger.handlers):
 from Robot_simulation.FM_util import VectorField, train_uniform_FM, train_shifted_FM, train_DGFM, eval_model
 
 
-def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, num_cycles=0.5, last_epoch=-1):
-    """
-    Create a schedule with a learning rate that increases linearly during warmup, then decays as cosine.
-    """
-    def lr_lambda(current_epoch):
-        if current_epoch < warmup_epochs:
-            return float(current_epoch) / float(max(1, warmup_epochs))
-        progress = float(current_epoch - warmup_epochs) / float(max(1, total_epochs - warmup_epochs))
-        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * num_cycles * 2.0 * progress)))
-
+def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            return epoch / max(1, warmup_epochs)
+        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
+        progress = max(0.0, min(1.0, progress))  # clamp to [0,1]
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_scale + (1.0 - min_lr_scale) * cosine
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
@@ -204,6 +203,9 @@ def train_and_eval_FM(
 
     # sample the target trajectories & its environment parameters
     torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
     perm_idx = torch.randperm(N, device=device)
     target_trajectories = data_trajectories[perm_idx]
     env_params = data_env_params[perm_idx]
@@ -247,16 +249,17 @@ def train_and_eval_FM(
     else:
         # dimension for tasks
         if task_name == "door":
-            cluster_d = seq_len * 2 # 50
-            cluster_size = max(int(N/20), cluster_d)
+            cluster_d = seq_len * 2 # 50 | end effector stays on 1-dimension path
+            cluster_size = max(int(N/10), cluster_d)
         elif task_name == "wipe":
-            cluster_d = seq_len * 3 # 75
+            cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
             cluster_size = max(int(N/20), cluster_d)
         elif task_name == "two_arm":
-            cluster_d = seq_len * 6 # 150
+            cluster_d = seq_len * 6 # 150 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
             cluster_size = max(int(N/20), cluster_d)
         elif task_name == "nut":
-            cluster_d = seq_len * 4 # 100
+            cluster_d = int(seq_len * 3.2) # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
+                                           #      for the rest 0.6 portion, end effector stays on 1=dimension path
             cluster_size = max(int(N/20), cluster_d)
         else:
             cluster_d = None
@@ -299,7 +302,7 @@ def train_and_eval_FM(
                                                 trials=evaluation_samples,
                                                 render_width=4,
                                                 render_num=8,
-                                                base_seed=1032)
+                                                base_seed=seed+1)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
     success_rate_last, avg_reward_last = eval_model(model=last_model,
@@ -315,7 +318,7 @@ def train_and_eval_FM(
                                                 trials=evaluation_samples,
                                                 render_width=4,
                                                 render_num=8,
-                                                base_seed=1032)
+                                                base_seed=seed+1)
     print(f"Success rate : {success_rate_last:.3f}, Average reward : {avg_reward_last:.3f}")
 
 
@@ -324,6 +327,7 @@ def train_and_eval_FM(
     if FM_type == "DGFM":
         output = {
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+            "seed":            seed,
             "FM_type":         FM_type,
             "N":               N,
             "task_name":       task_name,
@@ -347,6 +351,7 @@ def train_and_eval_FM(
     else:
         output = {
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+            "seed":            seed,
             "FM_type":         FM_type,
             "N":               N,
             "task_name":       task_name,
@@ -369,13 +374,42 @@ def train_and_eval_FM(
 
     # plot and save records
     epochs = sorted(recs.keys())
-    rates  = [recs[e]["success_rate"] for e in epochs]
-    plt.figure()
-    plt.plot(epochs, rates)
-    plt.xlabel('Epoch')
-    plt.ylabel('Success Rate')
-    plt.title(f'{FM_type} Success Rate')
-    plot_path = os.path.join(exp_dir, 'success_rates.png')
+    rates  = [recs[e].get("success_rate", float("nan")) for e in epochs]
+
+    fig, ax1 = plt.subplots()
+    ln1 = ax1.plot(epochs, rates, linewidth=2, label="success_rate")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Success Rate")
+    ax1.set_title(f"{FM_type} Training Curves")
+
+    # second axis for losses
+    ax2 = ax1.twinx()
+    loss_lines = []
+
+    if FM_type == "DGFM":
+        g_loss = [recs[e].get("g_loss") for e in epochs]
+        l_loss = [recs[e].get("l_loss") for e in epochs]
+        if any(v is not None for v in g_loss):
+            ln2 = ax2.plot(epochs, g_loss, linestyle="--", label="g_loss")
+            loss_lines += ln2
+        if any(v is not None for v in l_loss):
+            ln3 = ax2.plot(epochs, l_loss, linestyle=":", label="l_loss")
+            loss_lines += ln3
+    else:
+        loss = [recs[e].get("loss") for e in epochs]
+        if any(v is not None for v in loss):
+            ln4 = ax2.plot(epochs, loss, linestyle="--", label="loss")
+            loss_lines += ln4
+
+    ax2.set_ylabel("Loss")
+
+    # combined legend
+    lines  = ln1 + loss_lines
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc="best")
+
+    plot_path = os.path.join(exp_dir, "success_rates.png")  # keep original filename
+    plt.tight_layout()
     plt.savefig(plot_path)
     plt.close()
     print(f"[Saved plot to {plot_path}]")
@@ -418,6 +452,8 @@ if __name__ == "__main__":
         dev = torch.device(args.device)
     else:
         dev = torch.device("cpu")
+
+    print(f"Running on {dev}\n")
 
     train_and_eval_FM(
         FM_type            = args.FM_type,

@@ -1,4 +1,5 @@
 import time
+import random
 import numpy as np
 import torch
 import torch.optim as optim
@@ -23,7 +24,7 @@ from Synthetic_data.FM_utils import VectorField, \
 NUM_WORKERS = 5  # Number of parallel workers for training DGFM
 
 
-def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
+def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
                   total_n_t, global_n_t, local_n_t, max_epochs, batch_size, early_stopping,
                   mf_list, test_size, device):
     """
@@ -31,7 +32,11 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta
     on sample size n, returns a dict mapping method names to their
     per-epoch records.
     """
-    # 1) instantiate distribution
+    # 1) instantiate distribution & set seed
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
     if dist_name == "Normal":
         dist = NormalDistribution(ambient_dim, device)
     elif dist_name == "Quadratic_Uniform":
@@ -46,6 +51,7 @@ def run_one_trial(n, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta
         dist = SwissRoll(ambient_dim, device, latent_dim)
     else:
         raise ValueError(f"Unknown distribution: {dist_name}")
+    
     
     # 2) sample training data
     X_train = dist.sample(n)
@@ -173,11 +179,12 @@ if (__name__ == "__main__"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Running on {device}\n")
 
-    # 1) pick sample size & trials
+    # 1) pick sample size & trials & seed
     sample_sizes = list(map(int,
                         (input("Enter sample sizes (comma separated, default 500,1000,2000,4000,8000,16000): ")
                         .strip() or "500,1000,2000,4000,8000,16000").split(",")))
-    repeats  = int(input("Number of trials per config (default 5): ") or 5)
+    repeats = int(input("Number of trials per config (default 5): ") or 5)
+    seed = int(input("Input the seed (default 1000): ") or 1000)
 
     # 2) experiment setup
     ambient_dim   = int(input("Ambient dimension (default 40): ") or 40)
@@ -235,7 +242,7 @@ if (__name__ == "__main__"):
 
             futures = {
                 executor.submit(
-                    run_one_trial, n, trial, dist_name,
+                    run_one_trial, n, seed + trial, trial, dist_name,
                     ambient_dim, latent_dim, beta_a, beta_b,
                     total_n_t, global_n_t, local_n_t,
                     total_epochs, max(batch_size, int(n/batch_num)), early_stopping,
@@ -322,6 +329,7 @@ if (__name__ == "__main__"):
     with open(fname, 'w') as f:
         json.dump({
             "datetime" : datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+            "seed" : seed,
             "distribution": dist_name,
             "ambient_dim": ambient_dim,
             "latent_dim": latent_dim,

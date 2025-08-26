@@ -11,7 +11,7 @@ What this module provides
   mapping (x_t, t, c) → v_t used by UniformFM / ShiftedFM / DGFM trainers.
 - **MixtureSampler**: a low-rank conditional Gaussian mixture over trajectories
   and environment parameters used by **Dimension-Guided FM (DGFM)** to provide
-  informative conditional targets and structured noise.
+  intermediate (interpolated) samples.
 - **Trainers**: `train_uniform_FM`, `train_shifted_FM`, `train_DGFM`—each returns
   `(best_model, last_model, records)` with validation metrics over epochs.
 - **Evaluation**: `eval_model` runs many parallel rollouts in RoboSuite,
@@ -24,17 +24,17 @@ Key design choices & assumptions
 1) **Shapes & conventions**
    - Trajectories are `(B, T, D)` = (batch, seq_len, dof).
    - Environment parameters are `(B, P)`.
-   - Times `t ∈ [0, 1]`. Some trainers rescale / shift `t` internally.
+   - Times `t ∈ [0, 1]`.
    - For gripper DoF, models can ignore (mask) those joints during training.
 
-2) **DGFM’s low-rank mixture (used only when training DGFM)**
+2) **DGFM's low-rank mixture (used only when training DGFM)**
    - Per mixture component *k* we model:
-       x = μ_x^k + B^k z,  with  z|c ~ 𝓝(μ_{z|c}^k, Σ_{z|c}^k),   and   c ~ 𝓝(μ_c^k, Σ_cc^k)
-     where B^k ∈ ℝ^{D×d} is a PCA basis (d ≪ D). We precompute for each cluster:
+       x = μ_x^k + B^k z,  with  z|c ~ N(μ_{z|c}^k, Σ_{z|c}^k),   and   c ~ N(μ_c^k, Σ_cc^k)
+     where B^k ∈ R^{D x d} is a PCA basis (d < D). We precompute for each cluster:
        Σ_zz^k, Σ_zc^k, Σ_cc^k and Cholesky factors; responsibilities use p(c|k) only.
    - Conditioning uses standard Gaussian identities:
-       μ_{z|c}^k = Σ_zc^k Σ_cc^{k−1} (c − μ_c^k),
-       Σ_{z|c}^k = Σ_zz^k − Σ_zc^k Σ_cc^{k−1} Σ_cz^k.
+       μ_{z|c}^k = Σ_zc^k {Σ_cc^k}^{-1} (c - μ_c^k),
+       Σ_{z|c}^k = Σ_zz^k - Σ_zc^k {Σ_cc^k}^{-1} Σ_cz^k.
    - Sampling supports optional truncated normal in z (for robustness) and a small
      orthogonal noise on x (σ⊥) to account for off-subspace variability.
    - Numerical stability: all covariances are symmetrized and Tikhonov-regularized
@@ -42,10 +42,9 @@ Key design choices & assumptions
 
 3) **Trainers**
    - **UniformFM**: sample t ~ Uniform[0,1], regress v_t (standard FM).
-   - **ShiftedFM**: shift / warp t (and targets) to emphasize late time steps.
-   - **DGFM**: use the mixture to define conditional targets / proposals aligned
-     with dominant motion subspaces (configurable via `mf`, `cluster_d`, `cluster_size`,
-     `n_t_global`, `n_t_local`).
+   - **ShiftedFM**: shift / warp t to emphasize early (or late) time steps.
+   - **DGFM**: use the mixture to define intermediate targets (configurable via `mf`, 
+     `cluster_d`, `cluster_size`, `n_t_global`, `n_t_local`).
    - Schedules: cosine with warmup; Adam optimizer; early stopping supported.
 
 4) **Evaluation loop**
@@ -92,6 +91,7 @@ state restoration, trajectory smoothing, and rendering are provided by
 """
 
 import numpy as np
+import random
 import os
 import copy
 import torch
@@ -121,9 +121,9 @@ import torch.nn.functional as F
 
 
 class FiLM(nn.Module):
-    """Feature‑wise Linear Modulation (FiLM) for 1D feature maps.
+    """Feature-wise Linear Modulation (FiLM) for 1D feature maps.
 
-    Applies a per‑channel affine transform conditioned on a context vector.
+    Applies a per-channel affine transform conditioned on a context vector.
 
     Args:
     in_channels: Number of channels in the feature map to be modulated.
@@ -183,9 +183,9 @@ class ConvBlock(nn.Module):
 
 
 class UNet1D(nn.Module):
-    """A 1D U‑Net with FiLM conditioning on the skip and decoder paths.
+    """A 1D U-Net with FiLM conditioning.
 
-    This backbone models per‑time‑step dynamics across joint sequences.
+    This backbone models per-timestep dynamics across joint sequences.
 
     Args:
     dof: Number of channels == robot DoF to model (typically arm DoF only).
@@ -199,7 +199,7 @@ class UNet1D(nn.Module):
     Returns:
     (B, dof, T) tensor of predicted velocities.
     """
-    def __init__(self, dof, condition_dim, channels=[64, 128, 256, 512]):
+    def __init__(self, dof, condition_dim, channels=[160, 320, 640, 640]):
         super().__init__()
         self.channels = channels
         # Encoder
@@ -250,8 +250,8 @@ class VectorField(nn.Module):
     """Conditional vector field v(x, t, c) over joint trajectories.
 
     The model isolates arm DoF from gripper DoF and predicts a velocity field
-    only for arm joints using a 1D U‑Net; gripper channels are held at zero
-    by a built‑in mask. Time is encoded via a small MLP and concatenated with
+    only for arm joints using a 1D U-Net; gripper channels are held at zero
+    by a built-in mask. Time is encoded via a small MLP and concatenated with
     (optionally scaled) environment parameters for FiLM conditioning.
 
     Args:
@@ -259,10 +259,10 @@ class VectorField(nn.Module):
         dof: Total joint DoF per time step (includes grippers if present).
         param_len: Dimensionality of environment parameter vector `c`.
         gripper_idx: Indices of gripper joints within the DoF. If provided,
-            these channels are excluded from the U‑Net and zeroed in the output.
+            these channels are excluded from the U-Net and zeroed in the output.
 
     Attributes:
-        arm_idx (Tensor): Indices of arm joints modeled by the U‑Net.
+        arm_idx (Tensor): Indices of arm joints modeled by the U-Net.
         loss_mask (Tensor): (1, 1, dof) mask that zeros gripper dims in loss.
 
     Forward Args:
@@ -337,9 +337,9 @@ class VectorField(nn.Module):
     
 
 class MixtureSampler:
-    """Low‑rank conditional Gaussian mixture over (x, c).
+    """Low-rank conditional Gaussian mixture over (x, c).
 
-    Each component places a low‑rank Gaussian on the flattened trajectory `x`
+    Each component places a low-rank Gaussian on the flattened trajectory `x`
     via a basis `B` and a full Gaussian on environment parameters `c`. The
     conditional p(x|c) is efficient to sample using precomputed Choleskies.
 
@@ -348,14 +348,14 @@ class MixtureSampler:
     Args:
         mu_x: (K, Dx) component means for flattened trajectories.
         mu_c: (K, Dc) component means for environment parameters.
-        B: (K, Dx, d) component bases, with `d` ≪ `Dx`.
+        B: (K, Dx, d) component bases, with `d` < `Dx`.
         Sig_zz: (K, d, d) covariance of latent coordinates z.
-        Sig_zc: (K, d, Dc) cross‑covariance between z and c.
+        Sig_zc: (K, d, Dc) cross-covariance between z and c.
         Sig_cc: (K, Dc, Dc) covariance of c.
         weights: (K,) mixture weights (will be normalized).
         device: Torch device for internal tensors and sampling.
         reg: Diagonal regularizer added to covariances for stability.
-        orth_sigma: Optional isotropic noise added in x‑space (orthogonal to B).
+        orth_sigma: Optional isotropic noise added in x-space (orthogonal to B).
 
     Methods:
         sample_cond(c, ...): Sample x ~ p(x|c) optionally forcing components.
@@ -397,7 +397,7 @@ class MixtureSampler:
             self.invcc.append(invcc_k)
             self.logdet_cc.append(2.0 * torch.log(torch.diag(Lcc_k)).sum())
 
-            # Σ_{z|c} = Σ_zz - Σ_zc Σ_cc^{-1} Σ_cz  (constant wrt c)
+            # Σ_{z|c} = Σ_zz - Σ_zc Σ_cc^{-1} Σ_cz
             Szgc_k = self.Szz[k] - self.Szc[k] @ invcc_k @ self.Szc[k].transpose(0,1)
             # stabilize
             Szgc_k = 0.5 * (Szgc_k + Szgc_k.transpose(0,1)) + self.reg * torch.eye(Szgc_k.shape[0], device=self.device)
@@ -499,7 +499,7 @@ class MixtureSampler:
         """Sample (x, c) pairs jointly from the mixture.
 
         Components are drawn first (unless `pis` is provided), then `c` is sampled
-        from N(μ_c, Σ_cc) followed by x|c using the fixed‑component sampler.
+        from N(μ_c, Σ_cc) followed by x|c using the fixed-component sampler.
 
         Args:
             M: Number of samples to generate.
@@ -529,7 +529,7 @@ class MixtureSampler:
             c_k = self.mu_c[k].unsqueeze(0) + eps @ self.Lcc[k].T
             c[mask] = c_k
 
-        # direct path: avoid calling sample_cond to save the O(BK) structure entirely
+        # sample x given c
         x = torch.empty(M, self.Dx, device=self.device)
         for k in pis.unique(sorted=True).tolist():
             mask = (pis == k)
@@ -538,26 +538,16 @@ class MixtureSampler:
         return x, c, pis
 
 
-def run_flow(model, x0, env_param, device, n_steps=500):
-    """Integrate the learned vector field with explicit Euler.
-
-    Args:
-        model: Vector field module v(x, t, c).
-        x0: (B, T, D) initial points to integrate from.
-        env_param: (B, P) environment parameters for conditioning.
-        device: Torch device to compute on.
-        n_steps: Number of Euler steps (uniform dt = 1/n_steps).
-
-    Returns:
-        (B, T, D) terminal points after integrating from t=0 to t=1.
-    """
-    dt = 1/n_steps
-    with torch.no_grad():
-        for i in range(n_steps):
-            t = torch.full((x0.shape[0], 1), i*dt, device=device)
-            v = model(x0, t, env_param)
-            x0 = x0 + v*dt
-    return x0
+@torch.no_grad()
+def run_flow(model, x, c, device, n_steps=500):
+    dt = 1.0 / n_steps
+    for i in range(n_steps):
+        t  = torch.full((x.shape[0], 1), i*dt, device=device)
+        v1 = model(x, t, c)
+        x_mid = x + v1 * dt
+        v2 = model(x_mid, t + dt, c)
+        x  = x + 0.5 * (v1 + v2) * dt  # Heun (RK2)
+    return x
 
 
 def _get_environment_params(
@@ -761,7 +751,7 @@ def _eval_batch(
     if gripper_idx is None:
         gripper_idx = []
 
-    # 1) Reconstruct model in this process
+    # Reconstruct model in this process
     model = model_class(seq_len, dof, param_len, gripper_idx).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
@@ -770,56 +760,66 @@ def _eval_batch(
     reward_sum = 0.0
     success_info = []
     fail_info = []
-    env = make_env(task_name, use_joint_control=True)
+
     torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
 
-    for _ in range(num_trials):
-        # 0-a) make a fresh env for each trial
-        env.reset()
-        # 0-b) prepare env parameters
-        env_param = _get_environment_params(env, task_name)
-        env_param = torch.tensor(env_param, dtype=torch.float32, device=device).unsqueeze(0)
-        # 0-c) sample and run flow
-        x0    = torch.randn(1, seq_len, dof, device=device)
+    env_batch = min(20, num_trials) # how many envs to keep alive at once
+
+    # iterate over trials in chunks
+    for start in range(0, num_trials, env_batch):
+        end = min(num_trials, start + env_batch)
+        m = end - start
+
+        # --- create m envs and collect params/settings ---
+        envs, env_settings, env_params_list = [], [], []
+        for _ in range(m):
+            env = make_env(task_name, use_joint_control=True)
+            env.reset()
+
+            env_settings.append({
+                "qpos":      env.sim.data.qpos.copy(),
+                "qvel":      env.sim.data.qvel.copy(),
+                "body_pos":  env.sim.model.body_pos.copy(),
+                "body_quat": env.sim.model.body_quat.copy(),
+            })
+            env_params_list.append(_get_environment_params(env, task_name))
+            envs.append(env)
+
+        # --- single batched model pass for this chunk ---
+        c = torch.tensor(np.asarray(env_params_list, np.float32), device=device)          # (m, Dc)
+        x0 = torch.randn(m, seq_len, dof, device=device)                                  # (m, T, D)
         with torch.no_grad():
-            q_low = run_flow(model, x0, env_param, device)
-        q_low = q_low.cpu().numpy()[0]
-        # 0-d) upsample to high‑freq
-        q_high = compute_smooth_trajectory(env, task_name, q_low, env.control_freq)
-        # 0-e) save first pose
-        q0 = q_high[0].copy()
+            q_low_batch = run_flow(model, x0, c, device)                                  # (m, T, D)
+        q_low_batch = q_low_batch.cpu().numpy()
 
-        # 1) teleport robot to first trajectory pose
-        _set_robot_qpos(env, q0, task_name)
+        # --- per-env rollout and cleanup ---
+        for i, env in enumerate(envs):
+            q_low  = q_low_batch[i]
+            q_high = compute_smooth_trajectory(env, task_name, q_low, env.control_freq)
 
-        qpos_all   = env.sim.data.qpos.copy()
-        qvel_all   = env.sim.data.qvel.copy()
-        body_pos   = env.sim.model.body_pos.copy()
-        body_quat  = env.sim.model.body_quat.copy()
-        environment_setting = {
-            "qpos":      qpos_all,
-            "qvel":      qvel_all,
-            "body_pos":  body_pos,
-            "body_quat": body_quat,
-        }
+            # align sim to first pose and brief hold
+            q0 = q_high[0].copy()
+            _set_robot_qpos(env, q0, task_name)
+            a0 = _to_action_from_q(q0, task_name)
+            for _ in range(100):
+                env.step(a0)
 
-        # 2) small hold for stability
-        a0 = _to_action_from_q(q0, task_name)
-        for _ in range(100):
-            env.step(a0)
+            for q in q_high[1:]:
+                env.step(_to_action_from_q(q, task_name))
 
-        # 3) play the rest of the plan
-        for q in q_high[1:]:
-            env.step(_to_action_from_q(q, task_name))
+            if env._check_success():
+                successes += 1
+                success_info.append({"traj": q_high, "setting": env_settings[i]})
+            else:
+                fail_info.append({"traj": q_high, "setting": env_settings[i]})
+            reward_sum += env.reward()
+            env.close()
 
-        # 4) record results for success and fail
-        if env._check_success():
-            successes += 1
-            success_info.append({"traj": q_high, "setting": environment_setting})
-        else:
-            fail_info.append({"traj": q_high, "setting": environment_setting})
-
-        reward_sum += env.reward()        
+        # free GPU cache between chunks if using CUDA
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
 
     return successes, reward_sum, success_info, fail_info
 
@@ -860,7 +860,7 @@ def eval_model(
         video_name: Optional video filename stem (without extension).
         trials: Total number of episodes to evaluate.
         num_workers: Number of worker processes.
-        render_width: Grid width/height (W) to form W×W panel video.
+        render_width: Grid width/height (W) to form W x W panel video.
         render_num: Number of successful runs to render (rest filled with failures).
         base_seed: Base seed; each worker gets `base_seed + i`.
 
@@ -967,7 +967,7 @@ def eval_model(
 
 
 def _standardize_cols(A, eps=1e-8):
-    """Z‑score standardize each column of `A`.
+    """Z-score standardize each column of `A`.
 
     Args:
         A: (N, D) array.
@@ -985,12 +985,12 @@ def _standardize_cols(A, eps=1e-8):
 
 def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
                          standardize=True, scale_x=1.0, scale_c=1.0):
-    """Greedy set‑cover style clustering on joint features [X | C].
+    """Greedy set-cover style clustering on joint features [X | C].
 
     Steps:
-      1) Build local m‑NN neighborhoods in a standardized / scaled feature space.
+      1) Build local m-NN neighborhoods in a standardized / scaled feature space.
       2) Choose uncovered seeds and take their neighborhoods as candidate clusters.
-      3) Merge seed clusters with Jaccard overlap ≥ `jaccard_thresh` using seed‑to‑seed KNN.
+      3) Merge seed clusters with Jaccard overlap ≥ `jaccard_thresh` using seed-to-seed KNN.
       4) Ensure full coverage and build an inverse map from point index to cluster ids.
 
     Args:
@@ -999,18 +999,13 @@ def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
         m: Neighborhood size for initial local clusters (m ≥ 2).
         jaccard_thresh: Merge threshold on set overlap.
         merge_k: Number of nearest seed clusters to consider when merging.
-        standardize: If True, z‑score features before clustering.
+        standardize: If True, z-score features before clustering.
         scale_x: Scale factor applied to standardized X block.
         scale_c: Scale factor applied to standardized C block.
 
     Returns:
         clusters: List[Set[int]] of merged index sets.
         inv_cluster: Dict[int, List[int]] mapping point → list of cluster ids.
-
-    Notes:
-        - There is a minor logging issue in the coverage repair print that
-          references `missing` before assignment; it's harmless but may print
-          an incorrect count. Compute `missing` first if you modify this code.
     """
     N, Dx = X.shape
     Dc = C.shape[1]
@@ -1103,14 +1098,11 @@ def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
         for j in cluster:
             inv_cluster[j].append(ci)
 
-    # final safety: no empties
-    # (optional) assert all(inv_cluster[j] for j in range(N))
-
     return merged_clusters, inv_cluster
 
 
 def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples):
-    """Compute per‑cluster low‑rank stats on X and full stats on C.
+    """Compute per-cluster low-rank stats on X and full stats on C.
 
     Workflow:
       - Joint outlier filter using empirical covariance of [X|C].
@@ -1121,17 +1113,17 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
         X: (N, Dx) flattened trajectories for all points.
         C: (N, Dc) environment parameters for all points.
         idx: Iterable of indices belonging to this cluster.
-        d_x: Target rank for the low‑rank basis on X.
+        d_x: Target rank for the low-rank basis on X.
         eps: Numerical regularization for covariances.
-        chi2_thresh: Chi‑square quantile for joint outlier removal in [X|C].
+        chi2_thresh: Chi-square quantile for joint outlier removal in [X|C].
         max_pca_samples: Subsample size cap for PCA fit for speed.
 
     Returns:
         mu_x: (Dx,) mean of X in cluster (after outlier filter).
         mu_c: (Dc,) mean of C in cluster.
-        Bx: (Dx, d_x) low‑rank basis for X.
+        Bx: (Dx, d_x) low-rank basis for X.
         Sig_zz: (d_x, d_x) covariance in latent space.
-        Sig_zc: (d_x, Dc) cross‑covariance between latent z and C.
+        Sig_zc: (d_x, Dc) cross-covariance between latent z and C.
         Sig_cc: (Dc, Dc) covariance of C.
         weight: Relative cluster weight (#inliers / N).
     """
@@ -1168,8 +1160,6 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
     col_var = Xp0.var(axis=0)                  # (Dx,)
     total_var = float(col_var.sum())
 
-    Dx = Xi.shape[1]  # already defined above
-
     if total_var <= 1e-12 or Xp.shape[0] < 2:
         # Degenerate cluster: no usable variance. Use a fixed fallback basis.
         n_comp = min(d_x, Dx)
@@ -1196,7 +1186,6 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
             # U, S, Vt = np.linalg.svd(Xp_red, full_matrices=False)
             # B_red = Vt[:n_comp].T
 
-            # If you prefer to keep IncrementalPCA:
             ipca = IncrementalPCA(n_components=n_comp, batch_size=min(1024, Xp_red.shape[0]), whiten=False)
             ipca.fit(Xp_red)                   # denominator > 0 now -> no warning
             B_red = ipca.components_.T         # (Dx_red, n_comp)
@@ -1205,7 +1194,6 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
             Bx = np.zeros((Dx, n_comp), dtype=np.float32)
             Bx[keep, :] = B_red
 
-    # (optional) If n_comp < d_x and your downstream code expects exactly d_x,
     # pad with orthonormal columns in the complement subspace:
     if Bx.shape[1] < d_x:
         k = d_x - Bx.shape[1]
@@ -1240,7 +1228,7 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
 def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
                                    eps=1e-3, outlier_q=0.9,
                                    max_pca_samples=2000, n_jobs=-1):
-    """Parallel per‑cluster statistics for DGFM.
+    """Parallel per-cluster statistics for DGFM.
 
     Args:
         X: (N, Dx) flattened trajectories.
@@ -1248,7 +1236,7 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
         clusters: Iterable of sets/iterables with point indices per cluster.
         d_x: Target rank for the X basis per cluster.
         eps: Numerical regularization for covariances.
-        outlier_q: Quantile (0..1) for joint [X|C] chi‑square outlier cutoff.
+        outlier_q: Quantile (0..1) for joint [X|C] chi-square outlier cutoff.
         max_pca_samples: Cap on samples used to fit PCA for speed.
         n_jobs: Joblib parallel workers (-1 uses all cores).
 
@@ -1305,7 +1293,7 @@ def train_uniform_FM(
 ):
     """Train vanilla Flow Matching with uniform `t`.
 
-    The data term draws (x0, x1) pairs where x0~N(0, I) and x1 is a ground‑truth
+    The data term draws (x0, x1) pairs where x0~N(0, I) and x1 is a ground-truth
     trajectory from the dataset. The network is trained to match v* = x1 - x0 at
     uniformly sampled times.
 
@@ -1325,11 +1313,11 @@ def train_uniform_FM(
         batch_size: Batch size (on x1 instances).
         device: Torch device string.
         val_period: Evaluate every `val_period` epochs.
-        early_stopping: Whether to stop after `stop_criteria` non‑improvements.
+        early_stopping: Whether to stop after `stop_criteria` non-improvements.
         stop_criteria: Number of consecutive validations allowed without improvement.
 
     Returns:
-        best_model: Deep‑copied best performing model (may be None if never improved).
+        best_model: Deep-copied best performing model (may be None if never improved).
         last_model: Model at the end of training / interruption.
         success_rate_recs: Dict[epoch → metrics] logged at validation epochs.
     """
@@ -1347,6 +1335,7 @@ def train_uniform_FM(
         for epoch in tqdm(range(1, max_epochs + 1),
                         desc="UniformFM Training",
                         unit="epoch"):
+            model.train()
 
             perm_t = torch.randperm(N, device=device)
             loss_sum = 0
@@ -1375,7 +1364,8 @@ def train_uniform_FM(
                 loss.backward()
                 loss_sum += loss.item()
                 optimizer.step()
-                scheduler.step()
+                
+            scheduler.step()
 
             if epoch % val_period == 0:
                 success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, device)
@@ -1421,14 +1411,14 @@ def train_shifted_FM(
     val_period=5,
     early_stopping=True,
     stop_criteria=3,
-    beta_a = 0.5,
+    beta_a = 1.5,
     beta_b = 1,
 ):
-    """Train Flow Matching with Beta‑biased time sampling ("Shifted FM").
+    """Train Flow Matching with Beta-biased time sampling ("Shifted FM").
 
     Draw time `t` from Beta(beta_a, beta_b), then reflect to emphasize later
     parts of the trajectory (`t <- 1 - t`). Useful when later stages carry more
-    task‑relevant signal.
+    task-relevant signal.
 
     Args are the same as `train_uniform_FM` with two additional parameters:
         beta_a: Alpha parameter of Beta distribution.
@@ -1450,6 +1440,7 @@ def train_shifted_FM(
         for epoch in tqdm(range(1, max_epochs + 1),
                         desc="ShiftedFM Training",
                         unit="epoch"):
+            model.train()
 
             perm_t = torch.randperm(N, device=device)
             loss_sum = 0
@@ -1480,7 +1471,8 @@ def train_shifted_FM(
                 loss.backward()
                 loss_sum += loss.item()
                 optimizer.step()
-                scheduler.step()
+                
+            scheduler.step()
 
             if epoch % val_period == 0:
                 success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, device)
@@ -1533,10 +1525,10 @@ def train_DGFM(
     scale_x=1.0,
     scale_c=1.0,
 ):
-    """Train Dimension‑Guided Flow Matching (DGFM, conditional).
+    """Train Dimension-Guided Flow Matching (DGFM, conditional).
 
     DGFM builds a conditional mixture over (x, c) by clustering joint features
-    and computing per‑cluster low‑rank statistics on trajectories. Training then
+    and computing per-cluster low-rank statistics on trajectories. Training then
     alternates two phases per epoch:
 
       1) Global FM (t ∈ [0, 0.5]):
@@ -1559,7 +1551,7 @@ def train_DGFM(
         n_t_local: # of time samples per batch item in local phase.
         n_t_global: # of time samples per batch item in global phase.
         cluster_size: Local neighborhood size m for clustering.
-        cluster_d: Target rank for per‑cluster PCA basis on X.
+        cluster_d: Target rank for per-cluster PCA basis on X.
         max_epochs, batch_size, device: Usual training hyperparameters.
         val_period, early_stopping, stop_criteria: Validation / ES settings.
         scale_x, scale_c: Feature scaling used during clustering.
@@ -1636,8 +1628,6 @@ def train_DGFM(
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
                 g_loss_sum += float(loss.item())
 
             # ===== Local FM: t ∈ [0.5, 1.0] (scale factor 2) =====
@@ -1676,9 +1666,10 @@ def train_DGFM(
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
                 l_loss_sum += float(loss.item())
+
+            if scheduler is not None:
+                scheduler.step()
 
             # ===== Validation / early stopping =====
             if epoch % val_period == 0:

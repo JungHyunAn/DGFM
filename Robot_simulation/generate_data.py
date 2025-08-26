@@ -132,25 +132,30 @@ DOWNSAMPLE_RATIOS  = {"door"    : 2,
                       "wipe"    : -1,
                       "two_arm" : 2,
                       "nut"     : 2}
-KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1),
-                                   (110, 120, 1),
-                                   (120, 130, 1),
-                                   (130, 140, 1),
-                                   (140, 150, 3), 
-                                   (150, 153, 2), 
-                                   (160, 210, 8), 
-                                   (210, 250, 8)],
-                      "wipe"    : [(60, -1, 25)],
-                      "two_arm" : [(110, 130, 3), 
-                                   (130, 133, 2), 
-                                   (140, -1, 20)],
-                      "nut"     : [(100, 120, 3), 
-                                   (120, 125, 2), 
-                                   (130, 180, 10),
-                                   (180, 202, 4), 
-                                   (202, 207, 2), 
-                                   (207, 215, 2),
-                                   (215, 230, 2)]}
+KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
+                                   (110, 120, 1), # approaching
+                                   (120, 130, 1), # approaching
+                                   (130, 140, 1), # approaching
+                                   (140, 150, 3), # approaching very close 
+                                   (150, 153, 2), # hovering on door handle
+                                   (160, 210, 8), # turning door handle
+                                   (210, 250, 8)],# pulling door
+
+                      "wipe"    : [(60, -1, 25)], # wiping
+
+                      "two_arm" : [(110, 120, 1), # approaching
+                                   (120, 130, 2), # approaching
+                                   (130, 133, 2), # hovering on handles
+                                   (140, -1, 20)],# lifting
+
+                      "nut"     : [(100, 120, 3), # approaching
+                                   (120, 125, 2), # hovering on handle
+                                   (130, 180, 10),# carrying to peg end
+                                   (180, 202, 4), # entering peg
+                                   (202, 207, 2), # entering peg
+                                   (207, 215, 2), # entering peg
+                                   (215, 230, 2)] # entering peg
+                    }
 
 
 def init_hdf5(path: str, task_name: str, env):

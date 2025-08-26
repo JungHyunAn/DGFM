@@ -108,7 +108,7 @@ def generate_door_trajectory(
     curr_pos   = env.sim.data.site_xpos[eef_id].copy()
     
     handle_off = np.random.uniform(0.03, 0.08)
-    pre_grasp  = handle_pos + np.array([handle_off, 0.2, 0.0])
+    pre_grasp  = handle_pos + np.array([handle_off, 0.1, 0.0])
     
     q_handle   = mat2quat(R_handle)
     for axis, ang in [(R_handle[:,0], -np.pi/2), (R_handle[:,1], np.pi/2)]:
@@ -131,7 +131,7 @@ def generate_door_trajectory(
     # ---------- PHASE1‑2: 50-step careful approach to handle ----------
     for _ in range(50):
         a = np.zeros(adim)
-        a[0:3] = [0, -0.40, 0]
+        a[0:3] = [0, -0.21, 0]
         env.step(a)
         # print(env._gripper_to_handle)
         record_q()
