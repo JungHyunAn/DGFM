@@ -516,13 +516,13 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
             clusters, inv_cluster = cluster_points_annoy(X_train.detach().cpu().numpy(), cluster_size)
         else:
             clusters, inv_cluster  = cluster_points(X_train.detach().cpu().numpy(), cluster_size)
-        print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
+        # print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
         t0 = time.thread_time()
         if fast_PCA:
             mus, covs, weights = compute_cluster_pca_fast(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
         else:
             mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
-        print(f"PCA took {time.thread_time() - t0:.2f} seconds")
+        # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
         mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
         
 

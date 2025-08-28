@@ -125,7 +125,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
     # ----- DGFM (one entry per mf) -----
     for mf in mf_list:
-        key_dg    = f"DGFM_mf{mf}"
+        key_dg    = f"DGFM-{mf}"
         model_dg  = VectorField(ambient_dim).to(device)
         opt_dg    = optim.Adam(model_dg.parameters(), lr=1e-3)
         time_dg   = 0.0
@@ -281,7 +281,7 @@ if (__name__ == "__main__"):
                 ],
                 ...
             },
-            "DGFM_mf<multiplier>": {
+            "DGFM-<multiplier>": {
                 "<trial_index>": [ ... ],
                 ...
             },
