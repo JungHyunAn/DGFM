@@ -555,7 +555,7 @@ class MixtureSampler:
 
 
 @torch.no_grad()
-def run_flow(model, x, c, device, n_steps=100):
+def run_flow(model, x, c, device, n_steps=1000):
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t  = torch.full((x.shape[0], 1), i*dt, device=device)
