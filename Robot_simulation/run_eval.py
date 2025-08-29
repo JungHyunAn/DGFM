@@ -120,11 +120,14 @@ import torch
 import torch.optim as optim
 from torch.optim.lr_scheduler import LambdaLR
 from datetime import datetime
+from typing import Tuple, List
 import json
 import h5py
 import argparse
 import matplotlib.pyplot as plt
 from zoneinfo import ZoneInfo
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 import logging
 logging.disable(logging.WARNING)
 robosuite_logger = logging.getLogger("robosuite")
@@ -133,7 +136,8 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
 
-from Robot_simulation.FM_util import VectorField, train_uniform_FM, train_shifted_FM, train_DGFM, eval_model
+from Robot_simulation.FM_util import VectorField, train_uniform_FM, train_shifted_FM, train_DGFM, eval_model, _get_environment_params
+from Robot_simulation.heuristics_util import make_env
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
@@ -145,6 +149,32 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_scale + (1.0 - min_lr_scale) * cosine
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def _spawn_env_once(task_name: str, seed: int, idx: int):
+    # keep workers single-threaded & headless
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+    os.environ.setdefault("MUJOCO_GL", "egl")
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+    # per-worker seeds for determinism
+    np.random.seed(seed); random.seed(seed); torch.manual_seed(seed)
+
+    env = make_env(task_name, use_joint_control=True)
+    try:
+        env.reset()
+        setting = {
+            "qpos":      env.sim.data.qpos.copy(),
+            "qvel":      env.sim.data.qvel.copy(),
+            "body_pos":  env.sim.model.body_pos.copy(),
+            "body_quat": env.sim.model.body_quat.copy(),
+        }
+        params = np.asarray(_get_environment_params(env, task_name), dtype=np.float32)  # (Dc,)
+        return idx, setting, params
+    finally:
+        env.close()
 
 
 def train_and_eval_FM(
@@ -252,7 +282,7 @@ def train_and_eval_FM(
             cluster_d = seq_len * 2 + 3 # 53 | end effector stays on 1-dimension path + env_params
             cluster_size = max(int(N/10), cluster_d)
         elif task_name == "wipe":
-            cluster_d = seq_len * 3 + 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
+            cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
             cluster_size = max(int(N/20), cluster_d)
         elif task_name == "two_arm":
             cluster_d = seq_len * 6 + 3 # 150 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
@@ -289,6 +319,29 @@ def train_and_eval_FM(
 
     # evaluate model
     print(f"Training finished, evaluating for {evaluation_samples} trials . . .")
+
+    # ====== PARALLEL ENV GENERATION ======
+    env_params_list: list[np.ndarray] = [None] * evaluation_samples
+    env_settings_all: list[dict]      = [None] * evaluation_samples
+
+    # choose worker count (env creation is CPU-bound)
+    ENV_WORKERS = min(
+        evaluation_samples,
+        max(1, (os.cpu_count() or 4) - 2),
+        int(os.getenv("EVAL_ENV_WORKERS", "10"))
+    )
+
+    ctx = get_context("spawn")  # safe with MuJoCo/OpenGL
+    with ProcessPoolExecutor(max_workers=ENV_WORKERS, mp_context=ctx) as ex:
+        futs = [ex.submit(_spawn_env_once, task_name, seed + i, i) for i in range(evaluation_samples)]
+        for fut in as_completed(futs):
+            idx, setting, params = fut.result()
+            env_settings_all[idx] = setting
+            env_params_list[idx]  = params
+
+    # stack to (N, Dc) float32 (order matches idx)
+    eval_params = np.asarray(env_params_list, dtype=np.float32)
+
     success_rate_best, avg_reward_best = eval_model(model=best_model,
                                                 model_class=VectorField,
                                                 task_name=task_name,
@@ -298,6 +351,8 @@ def train_and_eval_FM(
                                                 gripper_idx=gripper_idx,
                                                 render_dir=exp_dir,
                                                 video_name="best",
+                                                val_params=eval_params,
+                                                env_settings_all=env_settings_all,
                                                 device=device,
                                                 trials=evaluation_samples,
                                                 render_width=4,
@@ -305,6 +360,7 @@ def train_and_eval_FM(
                                                 base_seed=seed+1)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
+    '''
     success_rate_last, avg_reward_last = eval_model(model=last_model,
                                                 model_class=VectorField,
                                                 task_name=task_name,
@@ -320,7 +376,7 @@ def train_and_eval_FM(
                                                 render_num=8,
                                                 base_seed=seed+1)
     print(f"Success rate : {success_rate_last:.3f}, Average reward : {avg_reward_last:.3f}")
-
+    '''
 
     # write results    
     json_path = os.path.join(exp_dir, 'results.json')
@@ -344,8 +400,8 @@ def train_and_eval_FM(
             "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
-            "success_rate_last": success_rate_last,
-            "average_reward_last": avg_reward_last,
+            #"success_rate_last": success_rate_last,
+            #"average_reward_last": avg_reward_last,
             "records":         recs,
         }
     else:
@@ -364,8 +420,8 @@ def train_and_eval_FM(
             "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
-            "success_rate_last": success_rate_last,
-            "average_reward_last": avg_reward_last,
+            #"success_rate_last": success_rate_last,
+            #"average_reward_last": avg_reward_last,
             "records":         recs,
         }
     with open(json_path, "w") as f:

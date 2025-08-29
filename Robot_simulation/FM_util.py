@@ -92,6 +92,7 @@ state restoration, trajectory smoothing, and rendering are provided by
 
 import numpy as np
 import random
+import time
 import os
 import copy
 import torch
@@ -308,6 +309,21 @@ class VectorField(nn.Module):
 
     def forward(self, x, t, env_params):
         # x: (B, seq_len, dof), t: (B, 1), env_params: (B, param_len)
+        dev, dt = x.device, x.dtype
+        if torch.is_tensor(t):
+            t = t.to(dev)
+            if torch.is_floating_point(t):
+                t = t.to(dt)
+            else:
+                t = torch.as_tensor(t, device=dev, dtype=dt)
+
+        if torch.is_tensor(env_params):
+            env_params = env_params.to(dev)
+            if torch.is_floating_point(env_params):
+                env_params = env_params.to(dt)
+        else:
+            env_params = torch.as_tensor(env_params, device=dev, dtype=dt)
+
         B, seq_len, dof = x.shape
         assert seq_len == self.seq_len and dof == self.dof, "Shape mismatch"
 
@@ -330,7 +346,7 @@ class VectorField(nn.Module):
 
         # ------ stitch back to full DOF with zeros in grippers ------
         v_full = x.new_zeros(B, seq_len, dof)
-        v_full[:, :, self.arm_idx] = v_arm
+        v_full[:, :, self.arm_idx] = v_arm.to(v_full.dtype)
         # gripper dims remain zero -> "no flow" for grippers
 
         return v_full
@@ -539,7 +555,7 @@ class MixtureSampler:
 
 
 @torch.no_grad()
-def run_flow(model, x, c, device, n_steps=500):
+def run_flow(model, x, c, device, n_steps=100):
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t  = torch.full((x.shape[0], 1), i*dt, device=device)
@@ -709,130 +725,60 @@ def _to_action_from_q(q, task_name):
         return np.concatenate([arm1, [grip1], arm2, [grip2]])
 
 
-def _eval_batch(
-    model_class,               # the class of your flow model
-    model_state_dict: dict,    # its CPU state dict
+def _rollout_batch(
     task_name: str,
-    seq_len: int,
-    dof: int,
-    param_len: int,
-    gripper_idx: list | None,
-    device: str,
-    num_trials: int,
-    seed: int,
-) -> Tuple[int, float]:
-    """Evaluate a model in a worker process over `num_trials` episodes.
+    q_low_batch: np.ndarray,          # (m, T, D) float32 on CPU
+    env_settings: List[dict],         # length m
+) -> Tuple[int, float, list, list]:
+    """Worker: restore envs from settings, upsample to controller rate, roll out CPU-only."""
+    successes, reward_sum = 0, 0.0
+    success_info, fail_info = [], []
 
-    This helper reconstructs the model from a CPU state dict (to avoid CUDA IPC
-    overheads), then loops over fresh environments for stability. For each trial:
-    it samples a latent path, integrates the flow to get a low‑rate plan, upsamples
-    it to the controller rate, teleports the robot to the first joint pose, and
-    executes the plan.
+    m = len(env_settings)
+    assert m == len(q_low_batch), "settings and q_low_batch length mismatch"
 
-    Args:
-        model_class: Class object to instantiate the model.
-        model_state_dict: CPU state dict of the trained model.
-        task_name: Task key (door|wipe|two_arm|nut).
-        seq_len: Trajectory time steps T.
-        dof: Joint dimensionality D.
-        param_len: Environment parameter length P.
-        gripper_idx: Gripper joint indices to mask during training / loss.
-        device: Torch device to evaluate on (e.g., "cpu" or "cuda:0").
-        num_trials: Number of environments / rollouts to run.
-        seed: Torch seed for reproducibility inside the process.
+    for i in range(m):
+        setting = env_settings[i]
+        env = make_env(task_name,
+                       use_joint_control=True,
+                       environment_setting=setting)
+        # plan at low rate -> smooth to control rate
+        q_low  = q_low_batch[i]
+        q_high = compute_smooth_trajectory(env, task_name, q_low, env.control_freq)
 
-    Returns:
-        successes: Number of successful episodes.
-        reward_sum: Sum of terminal rewards across episodes.
-        success_info: List of dicts with "traj" and "setting" for successful runs.
-        fail_info: List of dicts with "traj" and "setting" for failures.
-    """
+        # align sim to first pose and brief hold
+        q0 = q_high[0].copy()
+        _set_robot_qpos(env, q0, task_name)
+        a0 = _to_action_from_q(q0, task_name)
+        for _ in range(100):
+            env.step(a0)
 
-    if gripper_idx is None:
-        gripper_idx = []
+        for q in q_high[1:]:
+            env.step(_to_action_from_q(q, task_name))
 
-    # Reconstruct model in this process
-    model = model_class(seq_len, dof, param_len, gripper_idx).to(device)
-    model.load_state_dict(model_state_dict)
-    model.eval()
+        if env._check_success():
+            successes += 1
+            success_info.append({"traj": q_high, "setting": setting})
+        else:
+            fail_info.append({"traj": q_high, "setting": setting})
 
-    successes = 0
-    reward_sum = 0.0
-    success_info = []
-    fail_info = []
-
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-
-    env_batch = min(20, num_trials) # how many envs to keep alive at once
-
-    # iterate over trials in chunks
-    for start in range(0, num_trials, env_batch):
-        end = min(num_trials, start + env_batch)
-        m = end - start
-
-        # --- create m envs and collect params/settings ---
-        envs, env_settings, env_params_list = [], [], []
-        for _ in range(m):
-            env = make_env(task_name, use_joint_control=True)
-            env.reset()
-
-            env_settings.append({
-                "qpos":      env.sim.data.qpos.copy(),
-                "qvel":      env.sim.data.qvel.copy(),
-                "body_pos":  env.sim.model.body_pos.copy(),
-                "body_quat": env.sim.model.body_quat.copy(),
-            })
-            env_params_list.append(_get_environment_params(env, task_name))
-            envs.append(env)
-
-        # --- single batched model pass for this chunk ---
-        c = torch.tensor(np.asarray(env_params_list, np.float32), device=device)          # (m, Dc)
-        x0 = torch.randn(m, seq_len, dof, device=device)                                  # (m, T, D)
-        with torch.no_grad():
-            q_low_batch = run_flow(model, x0, c, device)                                  # (m, T, D)
-        q_low_batch = q_low_batch.cpu().numpy()
-
-        # --- per-env rollout and cleanup ---
-        for i, env in enumerate(envs):
-            q_low  = q_low_batch[i]
-            q_high = compute_smooth_trajectory(env, task_name, q_low, env.control_freq)
-
-            # align sim to first pose and brief hold
-            q0 = q_high[0].copy()
-            _set_robot_qpos(env, q0, task_name)
-            a0 = _to_action_from_q(q0, task_name)
-            for _ in range(100):
-                env.step(a0)
-
-            for q in q_high[1:]:
-                env.step(_to_action_from_q(q, task_name))
-
-            if env._check_success():
-                successes += 1
-                success_info.append({"traj": q_high, "setting": env_settings[i]})
-            else:
-                fail_info.append({"traj": q_high, "setting": env_settings[i]})
-            reward_sum += env.reward()
-            env.close()
-
-        # free GPU cache between chunks if using CUDA
-        if torch.device(device).type == "cuda":
-            torch.cuda.empty_cache()
+        reward_sum += env.reward()
+        env.close()
 
     return successes, reward_sum, success_info, fail_info
 
 
 def eval_model(
     model,
-    model_class,
+    model_class,                 # kept for signature compatibility (not used here)
     task_name: str,
     seq_len: int,
     dof: int,
     param_len: int,
     gripper_idx,
-    device: str = "cpu",
+    val_params,
+    env_settings_all,
+    device: str = "cuda",
     render_dir: str = " ",
     video_name: str = None,
     trials: int = 100,
@@ -840,127 +786,141 @@ def eval_model(
     render_width: int = 0,
     render_num: int = 0,
     base_seed: int = 123,
+    gpu_chunk_size: int | None = None,  # NEW: set to chunk the single GPU forward if memory-bound
 ) -> Tuple[float, float]:
-    """Evaluate `model` with multiprocessing and optional rendering grid.
-
-    The total `trials` are evenly split across `num_workers` processes using a
-    spawn context (safe with CUDA). Successful / failed episodes can be rendered
-    as a grid video using the saved environment states.
-
-    Args:
-        model: Trained vector field model to evaluate.
-        model_class: Class to reconstruct model in child processes.
-        task_name: Task key (door|wipe|two_arm|nut).
-        seq_len: Trajectory time steps T.
-        dof: Joint dimensionality D.
-        param_len: Environment parameter length P.
-        gripper_idx: Indices of gripper joints.
-        device: Torch device string for evaluation (parent process).
-        render_dir: Output directory for grid video.
-        video_name: Optional video filename stem (without extension).
-        trials: Total number of episodes to evaluate.
-        num_workers: Number of worker processes.
-        render_width: Grid width/height (W) to form W x W panel video.
-        render_num: Number of successful runs to render (rest filled with failures).
-        base_seed: Base seed; each worker gets `base_seed + i`.
-
-    Returns:
-        success_rate: Successful episodes / trials.
-        mean_reward: Mean terminal reward over trials.
     """
-    # 0) Put model on CPU & serialize once
-    with torch.no_grad():
-        state_dict = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    New evaluation pipeline:
+      1) Parent makes envs sequentially, saves settings/params, then closes.
+      2) Parent runs ONE GPU forward (optionally chunked) to get all q_low.
+      3) Workers restore envs, upsample, and roll out on CPU (no GPU in workers).
+    """
+    rng = np.random.RandomState(base_seed)
+    torch.manual_seed(base_seed)
+    random.seed(base_seed)
 
-    # 1) Compute how many trials per worker
-    base, rem = divmod(trials, num_workers)
-    worker_args: List[Tuple] = []
+    # ---- (2) One GPU forward (optionally chunked) to produce all q_low ----
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    if not use_cuda:
+        device = "cpu"
+
+    model.eval()
+
+    # pre-allocate to collect all q_low on CPU
+    q_low_all = np.empty((trials, seq_len, dof), dtype=np.float32)
+
+    if gpu_chunk_size is None or gpu_chunk_size <= 0:
+        # single shot (ensure it fits!)
+        x0 = torch.from_numpy(rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
+        c  = torch.from_numpy(val_params).to(device)
+        if use_cuda:
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                q_low = run_flow(model, x0, c, device)          # (N, T, D) on CUDA
+            q_low_all[:] = q_low.float().cpu().numpy()
+            del q_low; torch.cuda.empty_cache()
+        else:
+            with torch.inference_mode():
+                q_low = run_flow(model, x0, c, device)          # CPU path
+            q_low_all[:] = q_low.cpu().numpy()
+    else:
+        # chunked single pass to cap VRAM
+        N = trials
+        for s in range(0, N, gpu_chunk_size):
+            e = min(N, s + gpu_chunk_size)
+            bs = e - s
+            x0 = torch.from_numpy(rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
+            c  = torch.from_numpy(val_params[s:e]).to(device)
+            if use_cuda:
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                    q_low = run_flow(model, x0, c, device)
+                q_low_all[s:e] = q_low.float().cpu().numpy()
+                del q_low; torch.cuda.empty_cache()
+            else:
+                with torch.inference_mode():
+                    q_low = run_flow(model, x0, c, device)
+                q_low_all[s:e] = q_low.cpu().numpy()
+
+    # ---- (3) Roll out on CPU with multiple workers ----
+    # even split of trials across workers
+    base, rem = divmod(trials, max(1, num_workers))
+    splits: List[tuple[int, int]] = []
+    off = 0
     for i in range(num_workers):
         n = base + (1 if i < rem else 0)
         if n > 0:
-            worker_args.append((
-                model_class,
-                state_dict,
-                task_name,
-                seq_len,
-                dof,
-                param_len,
-                gripper_idx,
-                device,
-                n,
-                base_seed + i
-            ))
+            splits.append((off, off + n))
+            off += n
 
-    # 2) Launch processes
     total_success = 0
     total_reward  = 0.0
-    success_info = []
-    failure_info = []
+    success_info: List[dict] = []
+    failure_info: List[dict] = []
+    s_count = 0
+    f_count = 0
 
-    ctx = get_context('spawn')
-    success_count = 0
-    fail_count = 0
-    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as exe:
-        futures = [exe.submit(_eval_batch, *args) for args in worker_args]
-        for fut in futures:
+    ctx = get_context("spawn")
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as ex:
+        futs = []
+        for (s, e) in splits:
+            futs.append(ex.submit(
+                _rollout_batch,
+                task_name,
+                q_low_all[s:e],                 # numpy slice (copies view to child)
+                env_settings_all[s:e],
+            ))
+        for fut in futs:
             succ, rew, info_s, info_f = fut.result()
             total_success += succ
             total_reward  += rew
-            if success_count < render_num:
-                success_info += info_s
-                success_count += len(info_s)
-            
-            if fail_count < (render_width*render_width - render_num):
-                failure_info += info_f
-                fail_count += len(info_f)
 
-    # render
+            if s_count < render_num:
+                take = min(render_num - s_count, len(info_s))
+                success_info += info_s[:take]; s_count += take
+            if f_count < (render_width*render_width - render_num):
+                take = min(render_width*render_width - render_num - f_count, len(info_f))
+                failure_info += info_f[:take]; f_count += take
+
+    # ---- (optional) render sample grid (unchanged) ----
     episode_frames = []
-    success_count = min(success_count, render_num)
-    fail_count = min(fail_count, render_width*render_width - render_num)
-    while success_count > 0:
+    s_left = min(s_count, render_num)
+    f_left = min(f_count, render_width*render_width - render_num)
+
+    while s_left > 0:
         env_r = make_env(task_name,
                          has_offscreen_renderer=True,
                          use_camera_obs=False,
                          use_joint_control=True,
-                         environment_setting=success_info[success_count - 1]["setting"])
-        
-        frames = render_trajectory(env_r, 
-                                   task_name, 
-                                   success_info[success_count - 1]["traj"], 
-                                   success_info[success_count - 1]["traj"][0, :],
+                         environment_setting=success_info[s_left - 1]["setting"])
+        frames = render_trajectory(env_r,
+                                   task_name,
+                                   success_info[s_left - 1]["traj"],
+                                   success_info[s_left - 1]["traj"][0, :],
                                    camera_name="frontview",
                                    hold_init=True)
-
         episode_frames.append(frames)
         env_r.close()
+        s_left -= 1
 
-        success_count -= 1
-
-    while fail_count > 0:
+    while f_left > 0:
         env_r = make_env(task_name,
                          has_offscreen_renderer=True,
                          use_camera_obs=False,
                          use_joint_control=True,
-                         environment_setting=failure_info[fail_count - 1]["setting"])
-        
-        frames = render_trajectory(env_r, 
-                                   task_name, 
-                                   failure_info[fail_count - 1]["traj"], 
-                                   failure_info[fail_count - 1]["traj"][0, :],
+                         environment_setting=failure_info[f_left - 1]["setting"])
+        frames = render_trajectory(env_r,
+                                   task_name,
+                                   failure_info[f_left - 1]["traj"],
+                                   failure_info[f_left - 1]["traj"][0, :],
                                    camera_name="frontview",
                                    hold_init=True)
-
         episode_frames.append(frames)
         env_r.close()
-
-        fail_count -= 1
+        f_left -= 1
 
     if render_num:
         grid_path = os.path.join(render_dir, f"{task_name}_grid_{video_name}.mp4")
-        write_grid_video(episode_frames, grid_path, grid_shape=(render_width, render_width))
+        write_grid_video(episode_frames, grid_path,
+                         grid_shape=(render_width, render_width))
 
-    # 3) Aggregate and return
     success_rate = total_success / trials
     mean_reward  = total_reward  / trials
     return success_rate, mean_reward
@@ -1290,6 +1250,7 @@ def train_uniform_FM(
     val_period=5,
     early_stopping=True,
     stop_criteria=3,
+    val_trials=100,
 ):
     """Train vanilla Flow Matching with uniform `t`.
 
@@ -1328,6 +1289,23 @@ def train_uniform_FM(
     success_rate_recs = {}
     stop_count = 0
 
+    # ---- Build environments sequentially for validation and close them ----
+    env_params_list: List[np.ndarray] = []
+    env_settings_all: List[dict] = []
+    for _ in range(val_trials):
+        env = make_env(task_name, use_joint_control=True)
+        env.reset()
+
+        env_settings_all.append({
+            "qpos":      env.sim.data.qpos.copy(),
+            "qvel":      env.sim.data.qvel.copy(),
+            "body_pos":  env.sim.model.body_pos.copy(),
+            "body_quat": env.sim.model.body_quat.copy(),
+        })
+        env_params_list.append(_get_environment_params(env, task_name))
+        env.close()
+    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+
     try: 
         model = model.to(device)
         target_trajectories = target_trajectories.to(device)
@@ -1353,13 +1331,14 @@ def train_uniform_FM(
                 env_params_r = env_params.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, param_len)
 
                 target_v = x1r - x0r
-                pred_v   = model(xt,t, env_params_r)
-                sq_err = (pred_v - target_v) ** 2
-                # If the model registered a (1,1,dof) mask that zeros gripper dims, use it:
-                if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                    sq_err = sq_err * model.loss_mask
+                with torch.enable_grad():
+                    pred_v   = model(xt,t, env_params_r)
+                    sq_err = (pred_v - target_v) ** 2
+                    # If the model registered a (1,1,dof) mask that zeros gripper dims, use it:
+                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
+                        sq_err = sq_err * model.loss_mask
+                    loss = sq_err.mean()
 
-                loss = sq_err.mean()
                 optimizer.zero_grad()
                 loss.backward()
                 loss_sum += loss.item()
@@ -1368,7 +1347,7 @@ def train_uniform_FM(
             scheduler.step()
 
             if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, device)
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device)                
                 success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                 if success_rate < best_success_rate:
                     tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
@@ -1413,6 +1392,7 @@ def train_shifted_FM(
     stop_criteria=3,
     beta_a = 1.5,
     beta_b = 1,
+    val_trials =100,
 ):
     """Train Flow Matching with Beta-biased time sampling ("Shifted FM").
 
@@ -1433,6 +1413,24 @@ def train_shifted_FM(
     best_model = None
     success_rate_recs = {}
     stop_count = 0
+
+    # ---- Build environments sequentially for validation and close them ----
+    env_params_list: List[np.ndarray] = []
+    env_settings_all: List[dict] = []
+    for _ in range(val_trials):
+        env = make_env(task_name, use_joint_control=True)
+        env.reset()
+
+        env_settings_all.append({
+            "qpos":      env.sim.data.qpos.copy(),
+            "qvel":      env.sim.data.qvel.copy(),
+            "body_pos":  env.sim.model.body_pos.copy(),
+            "body_quat": env.sim.model.body_quat.copy(),
+        })
+        env_params_list.append(_get_environment_params(env, task_name))
+        env.close()
+    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+
     try: 
         model = model.to(device)
         target_trajectories = target_trajectories.to(device)
@@ -1460,13 +1458,15 @@ def train_shifted_FM(
                 env_params_r = env_params.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, param_len)
 
                 target_v = x1r - x0r
-                pred_v   = model(xt,t, env_params_r)
-                sq_err = (pred_v - target_v) ** 2
-                # If the model registered a (1,1,dof) mask that zeros gripper dims, use it:
-                if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                    sq_err = sq_err * model.loss_mask
 
-                loss = sq_err.mean()
+                with torch.enable_grad():
+                    pred_v   = model(xt,t, env_params_r)
+                    sq_err = (pred_v - target_v) ** 2
+                    # If the model registered a (1,1,dof) mask that zeros gripper dims, use it:
+                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
+                        sq_err = sq_err * model.loss_mask
+                    loss = sq_err.mean()
+
                 optimizer.zero_grad()
                 loss.backward()
                 loss_sum += loss.item()
@@ -1475,7 +1475,11 @@ def train_shifted_FM(
             scheduler.step()
 
             if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, device)
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device)
+                
+                if not torch.is_grad_enabled():
+                    torch.set_grad_enabled(True)
+                
                 success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                 if success_rate < best_success_rate:
                     tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
@@ -1524,6 +1528,7 @@ def train_DGFM(
     stop_criteria=3,
     scale_x=1.0,
     scale_c=1.0,
+    val_trials=100,
 ):
     """Train Dimension-Guided Flow Matching (DGFM, conditional).
 
@@ -1590,6 +1595,23 @@ def train_DGFM(
     success_rate_recs = {}
     stop_count = 0
 
+    # ---- Build environments sequentially for validation and close them ----
+    env_params_list: List[np.ndarray] = []
+    env_settings_all: List[dict] = []
+    for _ in range(val_trials):
+        env = make_env(task_name, use_joint_control=True)
+        env.reset()
+
+        env_settings_all.append({
+            "qpos":      env.sim.data.qpos.copy(),
+            "qvel":      env.sim.data.qvel.copy(),
+            "body_pos":  env.sim.model.body_pos.copy(),
+            "body_quat": env.sim.model.body_quat.copy(),
+        })
+        env_params_list.append(_get_environment_params(env, task_name))
+        env.close()
+    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+
     try:
         model = model.to(device)
         target_trajectories = target_trajectories.to(device)          # (N, T, dof)
@@ -1618,15 +1640,17 @@ def train_DGFM(
 
                 # broadcast env params from mixture
                 env_r = c1.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
-
                 target_v = 2.0 * (x1r - x0r)
-                pred_v   = model(xt, 0.5 * t, env_r)
-                sq_err   = (pred_v - target_v) ** 2
-                if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                    sq_err = sq_err * model.loss_mask
-                loss = sq_err.mean()
-                optimizer.zero_grad()
-                loss.backward()
+
+                with torch.enable_grad():
+                    pred_v   = model(xt, 0.5 * t, env_r)
+                    sq_err   = (pred_v - target_v) ** 2
+                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
+                        sq_err = sq_err * model.loss_mask
+                    loss = sq_err.mean()
+                    optimizer.zero_grad()
+                    loss.backward()
+
                 optimizer.step()
                 g_loss_sum += float(loss.item())
 
@@ -1658,11 +1682,14 @@ def train_DGFM(
                 env_r = c_true.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
 
                 target_v = 2.0 * (x1r - x0r)
-                pred_v   = model(xt, 0.5 * t + 0.5, env_r)
-                sq_err   = (pred_v - target_v) ** 2
-                if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                    sq_err = sq_err * model.loss_mask
-                loss = sq_err.mean()
+
+                with torch.enable_grad():
+                    pred_v   = model(xt, 0.5 * t + 0.5, env_r)
+                    sq_err   = (pred_v - target_v) ** 2
+                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
+                        sq_err = sq_err * model.loss_mask
+                    loss = sq_err.mean()
+                    
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
@@ -1674,9 +1701,11 @@ def train_DGFM(
             # ===== Validation / early stopping =====
             if epoch % val_period == 0:
                 model.eval()
-                success_rate, avg_reward = eval_model(
-                    model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, device
-                )
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device)
+                
+                if not torch.is_grad_enabled():
+                    torch.set_grad_enabled(True)
+
                 success_rate_recs[epoch] = {
                     "success_rate": success_rate,
                     "avg_reward":   avg_reward,
