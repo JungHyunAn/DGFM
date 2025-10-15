@@ -136,7 +136,7 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
 
-from Robot_simulation.FM_util import VectorField, train_uniform_FM, train_shifted_FM, train_DGFM, eval_model, _get_environment_params
+from Robot_simulation.FM_util import VectorField, train_uniform_FM, train_shifted_FM, train_DGFM, eval_model, _get_environment_params, _align_handle_to_nut
 from Robot_simulation.heuristics_util import make_env
 
 
@@ -163,7 +163,10 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
     np.random.seed(seed); random.seed(seed); torch.manual_seed(seed)
 
     env = make_env(task_name, use_joint_control=True)
-    try:
+    if task_name == "nut":
+        env.reset()
+        setting, params = _align_handle_to_nut(env)
+    else:
         env.reset()
         setting = {
             "qpos":      env.sim.data.qpos.copy(),
@@ -172,10 +175,10 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
             "body_quat": env.sim.model.body_quat.copy(),
         }
         params = np.asarray(_get_environment_params(env, task_name), dtype=np.float32)  # (Dc,)
-        return idx, setting, params
-    finally:
-        env.close()
-
+    
+    env.close()
+    return idx, setting, params
+        
 
 def train_and_eval_FM(
     FM_type: str,
@@ -280,17 +283,17 @@ def train_and_eval_FM(
         # dimension for tasks
         if task_name == "door":
             cluster_d = seq_len * 2 + 3 # 53 | end effector stays on 1-dimension path + env_params
-            cluster_size = max(int(N/10), cluster_d)
+            cluster_size = max(int(N/5), cluster_d + 5)
         elif task_name == "wipe":
             cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
-            cluster_size = max(int(N/20), cluster_d)
+            cluster_size = max(int(N/5), cluster_d + 5)
         elif task_name == "two_arm":
             cluster_d = seq_len * 6 + 3 # 150 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
-            cluster_size = max(int(N/20), cluster_d)
+            cluster_size = max(int(N/5), cluster_d + 5)
         elif task_name == "nut":
-            cluster_d = int(seq_len * 3.2) + 3 # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
-                                               #      for the rest 0.6 portion, end effector stays on 1=dimension path
-            cluster_size = max(int(N/20), cluster_d)
+            cluster_d = int(seq_len * 3.2)     # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
+                                               #     for the rest 0.6 portion, end effector stays on 1=dimension path
+            cluster_size = max(int(N/5), cluster_d + 5)
         else:
             cluster_d = None
             cluster_size = None
