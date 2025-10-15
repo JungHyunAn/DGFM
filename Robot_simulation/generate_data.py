@@ -143,18 +143,26 @@ KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
 
                       "wipe"    : [(60, -1, 25)], # wiping
 
-                      "two_arm" : [(110, 120, 1), # approaching
-                                   (120, 130, 2), # approaching
+                      "two_arm" : [(100, 105, 1), # approaching
+                                   (105, 110, 1), # approaching
+                                   (110, 115, 1), # approaching
+                                   (115, 120, 1), # approaching
+                                   (120, 123, 1), # approaching                            
+                                   (123, 126, 1), # approaching                            
+                                   (126, 130, 1), # approaching      
                                    (130, 133, 2), # hovering on handles
-                                   (140, -1, 20)],# lifting
+                                   (140, -1, 16)],# lifting
 
-                      "nut"     : [(100, 120, 3), # approaching
-                                   (120, 125, 2), # hovering on handle
-                                   (130, 180, 10),# carrying to peg end
-                                   (180, 202, 4), # entering peg
-                                   (202, 207, 2), # entering peg
-                                   (207, 215, 2), # entering peg
-                                   (215, 230, 2)] # entering peg
+                      "nut"     : [(130, 140, 2), # carrying to peg end
+                                   (140, 150, 2), # carrying to peg end
+                                   (150, 160, 2), # carrying to peg end
+                                   (160, 170, 2), # carrying to peg end
+                                   (170, 180, 2), # carrying to peg end
+                                   (180, 190, 3), # entering peg
+                                   (190, 202, 3), # entering peg
+                                   (202, 207, 3), # entering peg
+                                   (207, 215, 3), # entering peg
+                                   (215, 230, 3)] # entering peg
                     }
 
 

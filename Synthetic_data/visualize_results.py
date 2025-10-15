@@ -143,7 +143,7 @@ def plot_summary(data, out_dir, dist_name):
     # Eval Geometric Alignment with error bars
     fig2, ax2 = plt.subplots()
     ax2.set_xscale('log')
-    #ax2.set_yscale('log') # for big difference in geometric alignment
+    ax2.set_yscale('log') # for big difference in geometric alignment
     for method in methods:
         means = []
         stds = []

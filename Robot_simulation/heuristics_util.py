@@ -77,8 +77,9 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
 
-from typing import List, Optional
+from typing import List, Optional, Callable
 from scipy.interpolate import CubicSpline
+import mujoco
 
 from robosuite.environments.manipulation.door import Door
 from robosuite.environments.manipulation.wipe import Wipe
@@ -87,6 +88,22 @@ from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
+
+
+SIG = (mujoco.mjtState.mjSTATE_INTEGRATION)
+def save_mj_state(env):
+    m = env.sim.model._model
+    d = env.sim.data._data
+    n = mujoco.mj_stateSize(m, int(SIG))
+    buf = np.empty(n, dtype=np.float64)           # mjtNum is float64 in Python bindings
+    mujoco.mj_getState(m, d, buf, int(SIG))
+    return buf                                    # numpy array you can store
+def restore_mj_state(env, buf: np.ndarray):
+    m = env.sim.model._model
+    d = env.sim.data._data
+    mujoco.mj_setState(m, d, np.asarray(buf, dtype=np.float64), int(SIG))
+    # finalize caches / kinematics
+    env.sim.forward()
 
 
 def step_towards(
@@ -165,11 +182,26 @@ def restore_environment(
         env: Robosuite environment
         environment_setting: Dict with keys {"qpos","qvel","body_pos","body_quat"}
     """
-    env.sim.data.qpos[:]      = environment_setting["qpos"]
-    env.sim.data.qvel[:]      = environment_setting["qvel"]
-    env.sim.model.body_pos[:] = environment_setting["body_pos"]
-    env.sim.model.body_quat[:]= environment_setting["body_quat"]
+    env.sim.model.body_pos[:] = np.copy(environment_setting["body_pos"])
+    env.sim.model.body_quat[:]= np.copy(environment_setting["body_quat"])
 
+    mujoco.mj_setConst(env.sim.model._model, env.sim.data._data)  # rebuild derived constants
+
+    env.sim.data.qpos[:]      = np.copy(environment_setting["qpos"])
+    env.sim.data.qvel[:]      = np.copy(environment_setting["qvel"])
+    
+    # Optional extras if present
+    if "ctrl" in environment_setting:
+        env.sim.data.ctrl[:] = environment_setting["ctrl"]
+    if "act" in environment_setting:
+        env.sim.data.act[:] = environment_setting["act"]
+    if "mocap_pos" in environment_setting:
+        env.sim.data.mocap_pos[:] = environment_setting["mocap_pos"]
+    if "mocap_quat" in environment_setting:
+        env.sim.data.mocap_quat[:] = environment_setting["mocap_quat"]
+
+    env.sim.forward()
+    
 
 def make_env(
     task_name: str,
@@ -179,6 +211,7 @@ def make_env(
     use_camera_obs: bool = False,
     use_joint_control: bool = False,
     environment_setting: Optional[List[float]] = None,
+    training: bool = False,
 ):
     """
     Build and reset a robosuite environment (currently only 'door'), optionally
@@ -311,7 +344,7 @@ def make_env(
 
         if environment_setting is not None:
             arena = env.model.mujoco_arena
-            delta_z = 0.01
+            delta_z = 0.005
             restore_environment(env, environment_setting)
             for marker in arena.markers:
                 bid = env.sim.model.body_name2id(marker.root_body)
@@ -394,8 +427,17 @@ def make_env(
         env.placement_initializer = None
         env.reset()
         if environment_setting is not None:
+            if training and delta_z:
+                m = env.sim.model
+                for name in m.body_names:
+                    n = name.lower()
+                    if ("peg" in n) or ("stand" in n) or ("board" in n):
+                        m.body_pos[m.body_name2id(name)][2] += delta_z
+            mujoco.mj_setConst(env.sim.model._model, env.sim.data._data)
+
             restore_environment(env, environment_setting)
-            env.placement_initializer = None
+
+            # restore_mj_state(env, environment_setting) # restore via full mujoco setting
             env.sim.forward()
         
     return env
@@ -447,6 +489,176 @@ def write_grid_video(
     imageio.mimsave(path, grid_frames, fps=fps)
 
 
+def _plan_linear(q0, q1, duration, hz):
+    """
+    Linear interpolation in joint space.
+    Returns:
+      t: (T,) timestamps in [0, duration]
+      q: (T, D) waypoints with q[0]=q0, q[-1]=q1
+    """
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+    assert q0.shape == q1.shape, "q0 and q1 must have same shape"
+    D = q0.shape[0]
+
+    if duration <= 0 or hz <= 0:
+        # Degenerate: just return the target
+        return np.array([0.0]), np.asarray(q1, dtype=float).reshape(1, D)
+
+    # +1 to include both endpoints; ~1/hz spacing
+    T = max(int(np.round(duration * hz)) + 1, 2)
+    t = np.linspace(0.0, duration, T, endpoint=True)
+
+    alpha = (t / duration)[:, None]  # (T, 1)
+    q = (1.0 - alpha) * q0 + alpha * q1
+
+    # Numerical safety
+    q[0]  = q0
+    q[-1] = q1
+    return t, q
+
+
+# ---------- minimal IK utilities ----------
+def _site_pose(sim, site_id):
+    p = sim.data.site_xpos[site_id].copy()
+    R = sim.data.site_xmat[site_id].reshape(3,3).copy()
+    return p, R
+
+
+def _orient_err(Rcur, Rtar):
+    Re = Rtar.T @ Rcur
+    return 0.5*np.array([Re[2,1]-Re[1,2], Re[0,2]-Re[2,0], Re[1,0]-Re[0,1]])
+
+
+def _default_arm_joint_ids(env, n=7):
+    sim = env.sim
+    ids = [j for j in range(sim.model.njnt)
+           if sim.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE][:n]
+    return ids if ids else list(range(min(n, sim.model.njnt)))
+
+
+def _ee_ik_solve_by_dof(sim, eef_site_id, q_init,
+                        p_target, R_target,
+                        dof_indices,                    # qvel/qpos column indices for arm joints
+                        iters=500, tol_p=1e-5, tol_r=1e-4, lam=1e-3, step_clip=0.05):
+    """
+    Damped least-squares IK that:
+      - updates sim.data.qpos directly,
+      - calls sim.forward() (robosuite),
+      - gets Jacobians via MjSimState.get_site_jacp / get_site_jacr (name-based).
+    """
+    q  = q_init.copy()
+    nv = sim.model.nv
+    dof_indices = np.asarray(dof_indices, dtype=int)
+
+    # site name for the MjSimState Jacobian helpers
+    eef_name = sim.model.site_id2name(eef_site_id)
+
+    for _ in range(iters):
+        # set configuration & update kinematics
+        sim.data.qpos[dof_indices] = q[:7]
+        sim.forward()
+
+        # current pose
+        p_cur = sim.data.site_xpos[eef_site_id].copy()
+        R_cur = sim.data.site_xmat[eef_site_id].reshape(3,3).copy()
+
+        # pose error
+        dp = p_target - p_cur
+        Re = R_target.T @ R_cur
+        dr = 0.5 * np.array([Re[2,1]-Re[1,2], Re[0,2]-Re[2,0], Re[1,0]-Re[0,1]])
+
+        if np.linalg.norm(dp) < tol_p and np.linalg.norm(dr) < tol_r:
+            break
+
+        # Jacobians from MjSimState (name-based, uses correct underlying pointers)
+        Jp_full = sim.data.get_site_jacp(eef_name)   # (3, nv)
+        Jr_full = sim.data.get_site_jacr(eef_name)   # (3, nv)
+
+        # select arm DoFs
+        J = np.vstack([Jp_full[:, dof_indices], Jr_full[:, dof_indices]])  # (6, n_dof)
+        err = np.hstack([dp, dr])
+
+        # damped least squares
+        A = J @ J.T + lam * np.eye(6)
+        dq_sel = J.T @ np.linalg.solve(A, err)       # (n_dof,)
+        dq_sel = np.clip(dq_sel, -step_clip, step_clip)
+
+        # hinge/slide arms: qpos indices align with qvel columns
+        q[dof_indices] += dq_sel
+
+    return q
+
+
+def compute_automatic_grasp_prefix(
+    env,
+    first_key,
+    eef_site_id: int,
+    nut_site_id: int,
+    arm_dof_indices: list[int],      # <- use qvel indices
+    gripper_qpos_idx: np.ndarray,
+    dof_hint: int | None = None,
+    approach_height: float = 0.06,
+    approach_xy_offset: tuple[float,float] = (0.0, 0.0),
+    grasp_down_offset: float = 0.0,
+    align_to_nut: bool = True,
+    pre_pause_steps: int = 0,
+    g_open_val: float = -1.0,
+    g_close_val: float = +1.0,
+) -> np.ndarray:
+    sim = env.sim
+    q0 = sim.data.qpos.copy()
+    q0 = np.concatenate([q0[arm_dof_indices], np.zeros(2)])
+
+    # target poses
+    p_nut = sim.data.site_xpos[nut_site_id].copy()
+    R_nut = sim.data.site_xmat[nut_site_id].reshape(3,3).copy()
+
+    p_pre = p_nut.copy()
+    p_pre[0] += approach_xy_offset[0]
+    p_pre[1] += approach_xy_offset[1]
+    p_pre[2] += max(0.0, approach_height)
+
+    if align_to_nut:
+        R_pre = R_nut; R_grasp = R_nut
+    else:
+        R_cur = sim.data.site_xmat[eef_site_id].reshape(3,3).copy()
+        R_pre = R_cur; R_grasp = R_cur
+
+    # IK with DoF indices    
+    p_g   = p_nut.copy(); p_g[2] -= grasp_down_offset
+    q_gr  = _ee_ik_solve_by_dof(sim, eef_site_id, first_key, p_g, R_grasp, arm_dof_indices)
+    q_pre = _ee_ik_solve_by_dof(sim, eef_site_id, q_gr, p_pre, R_pre, arm_dof_indices)
+
+    # choose steps adaptively by limiting per-joint increment
+    dq_max = 0.01  # ~0.02 rad (or meters for prismatic) per step; tweak if needed
+    n_pre  = int(np.clip(np.ceil(np.max(np.abs(q_pre - q0)) / dq_max), 2, 300))
+    n_gr   = int(np.clip(np.ceil(np.max(np.abs(q_gr - q_pre)) / dq_max), 2, 300))
+    n_post = int(np.clip(np.ceil(np.max(np.abs(first_key - q_pre)) / dq_max), 2, 300))
+
+    # linear segments (avoid duplicating q_pre)
+    seg1 = np.linspace(q0,    q_pre, n_pre, endpoint=False)  # open
+    seg2 = np.linspace(q_pre, q_gr,  n_gr,  endpoint=True)   # open
+    seg3 = np.vstack([seg2[-1]] * 50) # close
+    seg4 = np.linspace(first_key, q_pre, n_post, endpoint=True) # close
+
+    QQ = np.vstack([seg1, seg2, seg3, seg4])  # (n_pre + n_gr, dof)
+
+    # optional pause at the end of hover (before closing)
+    if pre_pause_steps > 0:
+        hover = np.repeat(QQ[n_pre-1:n_pre], pre_pause_steps, axis=0)
+        QQ = np.vstack([QQ[:n_pre], hover, QQ[n_pre:]])
+        n_pre += pre_pause_steps  # shift split for gripper labeling
+
+    # set gripper values along the trajectory
+    if gripper_qpos_idx is not None and len(gripper_qpos_idx) > 0:
+        gripper_qpos_idx = np.asarray(gripper_qpos_idx, dtype=int)
+        # open during first segment (up to last hover frame), close afterwards
+        QQ[:(n_pre + n_gr),  gripper_qpos_idx] = g_open_val
+        QQ[(n_pre + n_gr):, gripper_qpos_idx] = g_close_val
+
+    return QQ
+
 # Wrapper for compute_smooth_trajectory_{gripper type}
 def compute_smooth_trajectory(
     env_r,
@@ -463,7 +675,7 @@ def compute_smooth_trajectory(
     if task_name == "wipe":
         q_high = compute_smooth_trajectory_wipper(
             q_keys,
-            control_freq=control_freq/15,
+            control_freq=control_freq/20,
             render_freq=control_freq/2,
         )
     elif task_name == "nut":
@@ -472,10 +684,11 @@ def compute_smooth_trajectory(
             gripper_ids=gripper_ids,
             control_freq=control_freq/15,
             render_freq=control_freq/2,
-            closure_steps=1,
-            closure_insertion=5,
-            rest_steps=10,
             open_after_end=True,
+            closure_steps=1,
+            closure_insertion=0,
+            automatic_grasp=False,
+            env=env_r,
         )
     elif task_name == "door":
         q_high = compute_smooth_trajectory_gripper(
@@ -493,9 +706,92 @@ def compute_smooth_trajectory(
             control_freq=control_freq/15,
             render_freq=control_freq/2,
             closure_steps=1,
-            closure_insertion=5
+            closure_insertion=9 # changed!!
         )
     
+    return q_high
+
+
+def compute_smooth_trajectory_with_q0(
+    env_r,
+    task_name,
+    q_keys: np.ndarray,
+    control_freq: int,
+    q0: np.ndarray,
+    approach_duration: float = 20.0,   # seconds; tweak as you like
+    pause_steps: int = 50,            # number of frames to pause at first key
+):
+    """
+    Prepend a linear interpolation from q0 -> q_keys[0] to the trajectory produced by
+    compute_smooth_trajectory(...). Uses joint-position lerp only.
+
+    Args:
+        env_r: robosuite env (passed through to compute_smooth_trajectory)
+        task_name: task selector for your internal logic
+        q_keys: (T_low, D) or (D,) key poses
+        control_freq: controller/sim stepping frequency (Hz)
+        q0: (D,) starting joint configuration
+        approach_duration: duration (s) for the initial linear segment
+
+    Returns:
+        q_high: (T_high, D) full trajectory starting from q0 and moving smoothly
+                into the first keyframe, then following the smoothed plan.
+    """
+    q_keys = np.asarray(q_keys, dtype=float)
+    q0     = np.asarray(q0,     dtype=float)
+
+    # Normalize shapes
+    if q_keys.ndim == 1:
+        q_keys = q_keys[None, :]  # (1, D)
+
+    # Basic shape checks
+    assert q0.ndim == 1, "q0 must be shape (D,)"
+    assert q_keys.ndim == 2, "q_keys must be shape (T, D) or (D,)"
+    D = q_keys.shape[1]
+    assert q0.shape[0] == D, f"Dim mismatch: q0 has {q0.shape[0]} dims, q_keys has {D}"
+
+    # If already at the first key pose, skip the approach
+    first_key = q_keys[0]
+    if np.allclose(q0, first_key, atol=1e-9, rtol=0.0) or (approach_duration <= 0):
+        return compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
+
+    # 1) Linear prefix from q0 -> q_keys[0]
+    #    We drop the last sample to avoid duplicating the first frame of the main segment.
+    t_app, Q_app = _plan_linear(q0, first_key, duration=float(approach_duration), hz=int(control_freq))
+    if Q_app.shape[0] > 1:
+        Q_prefix = Q_app[:-1]
+    else:
+        Q_prefix = Q_app  # degenerate (very short) case
+
+    # 2) Main segment (your existing builder)
+    Q_main = compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
+
+    if pause_steps > 0:
+        pause_block = np.repeat(first_key[None, :], pause_steps, axis=0)
+    else:
+        pause_block = np.empty((0, D), dtype=float)
+
+    if task_name in ["door", "two_arm"]:
+        gripper_ids = [
+            env_r.sim.model.get_joint_qpos_addr(joint_name)
+            for robot in env_r.robots
+            for gripper in robot.gripper.values()
+            for joint_name in gripper.joints
+        ]
+        Q_prefix[:, gripper_ids] = -1.0
+        pause_block[:, gripper_ids] = -1.0
+    elif task_name == "nut":
+        gripper_ids = [
+            env_r.sim.model.get_joint_qpos_addr(joint_name)
+            for robot in env_r.robots
+            for gripper in robot.gripper.values()
+            for joint_name in gripper.joints
+        ]
+        Q_prefix[:, gripper_ids] = 1.0
+        pause_block[:, gripper_ids] = 1.0
+
+    # Concatenate
+    q_high = np.vstack([Q_prefix, pause_block, Q_main])
     return q_high
 
 
@@ -508,6 +804,8 @@ def compute_smooth_trajectory_gripper(
     closure_insertion: int = 5,
     rest_steps: int = 0,
     open_after_end: bool = False,
+    automatic_grasp: bool = False,
+    env = None,
 ) -> np.ndarray:
     """
     Upsample sparse joint keyframes to a higher rate using cubic splines for tasks with single gipper,
@@ -524,7 +822,8 @@ def compute_smooth_trajectory_gripper(
     Returns:
         q_high: (T_high, dof) high-rate trajectory.
     """
-    
+    # print(control_freq, render_freq)
+
     dof    = joint_keys.shape[1]
     dt_low = 1.0 / control_freq
     dt_high= 1.0 / render_freq
@@ -534,8 +833,8 @@ def compute_smooth_trajectory_gripper(
     t_low = np.arange(N) * dt_low
 
     # closure insertion
-    t_cl = t_low[closure_insertion - 1] + np.arange(1, closure_steps+1)*dt_low
-    q_cl = np.tile((joint_keys[closure_insertion-1,:]), (closure_steps,1))
+    t_cl = t_low[closure_insertion] + np.arange(0, closure_steps)*dt_low
+    q_cl = np.tile((joint_keys[max(0, closure_insertion-1),:]), (closure_steps,1))
 
     t_low_after = closure_steps * dt_low + t_low[closure_insertion:]
     t_ext = np.concatenate([t_low[:closure_insertion], t_cl, t_low_after])
@@ -553,6 +852,37 @@ def compute_smooth_trajectory_gripper(
     if rest_steps:
         prefix = np.vstack([q_high[0]] * rest_steps)                # also (rest_steps, dof)
         q_high = np.vstack([prefix, q_high])                       # same result
+
+    if automatic_grasp and (env is not None):
+        robot = env.robots[0]
+        arm_joints  = robot.robot_model.joints
+        grip_joints = robot.gripper["right"].joints
+        all_joints  = arm_joints + grip_joints
+
+        model = env.sim.model
+        arm_dof_idx = [model.get_joint_qvel_addr(n) for n in arm_joints]
+        grip_qpos_idx = np.array([model.get_joint_qpos_addr(n) for n in grip_joints], dtype=int)
+
+        eef_id         = list(robot.eef_site_id.values())[0]
+        nut_handle_id  = env.object_site_ids[0]
+
+        grasp_prefix = compute_automatic_grasp_prefix(
+            env,
+            first_key=joint_keys[0],
+            eef_site_id=eef_id,
+            nut_site_id=nut_handle_id,
+            arm_dof_indices=arm_dof_idx,
+            gripper_qpos_idx=grip_qpos_idx,
+            dof_hint=len(env.sim.data.qpos),   # or joint_keys.shape[1]
+            approach_height=0.06,
+            grasp_down_offset=-0.015,
+            align_to_nut=True,
+            pre_pause_steps=50,
+        )
+
+        print(2)
+        print(grasp_prefix.shape)
+        q_high = np.vstack([grasp_prefix, q_high])
 
     # open after end
     if open_after_end:
@@ -614,6 +944,7 @@ def render_trajectory(
     fps: int = 60,
     camera_name: str = "frontview",
     hold_init: bool = False,
+    set_init: bool = True,
 ) -> List[np.ndarray]:
     """
     Replay a high-rate joint trajectory in the environment and capture rendered frames.
@@ -637,25 +968,26 @@ def render_trajectory(
     """
     
     # restore robot + door
-    offset = 0
-    for robot in env.robots:
-        # collect this robot's joint names
-        arm_names  = robot.robot_model.joints
-        grip_names = next(iter(robot.gripper.values())).joints
-        names      = arm_names + grip_names
+    if set_init:
+        offset = 0
+        for robot in env.robots:
+            # collect this robot's joint names
+            arm_names  = robot.robot_model.joints
+            grip_names = next(iter(robot.gripper.values())).joints
+            names      = arm_names + grip_names
 
-        # how many values to pull from initial_pose
-        n = len(names)
+            # how many values to pull from initial_pose
+            n = len(names)
 
-        # look up their indices in qpos
-        idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in names]
+            # look up their indices in qpos
+            idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in names]
 
-        # copy the slice of initial_pose into sim.data.qpos
-        env.sim.data.qpos[idx] = initial_pose[offset:offset + n]
-        env.sim.data.qvel[:] = 0
+            # copy the slice of initial_pose into sim.data.qpos
+            env.sim.data.qpos[idx] = initial_pose[offset:offset + n]
+            env.sim.data.qvel[:] = 0
 
-        offset += n
-    env.sim.forward()
+            offset += n
+        env.sim.forward()
 
     if hold_init:
         for _ in range(100):

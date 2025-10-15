@@ -183,7 +183,7 @@ if (__name__ == "__main__"):
     sample_sizes = list(map(int,
                         (input("Enter sample sizes (comma separated, default 500,1000,2000,4000,8000,16000): ")
                         .strip() or "500,1000,2000,4000,8000,16000").split(",")))
-    repeats = int(input("Number of trials per config (default 5): ") or 5)
+    repeats = int(input("Number of trials per config (default 10): ") or 10)
     seed = int(input("Input the seed (default 1000): ") or 1000)
 
     # 2) experiment setup

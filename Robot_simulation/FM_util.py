@@ -92,7 +92,6 @@ state restoration, trajectory smoothing, and rendering are provided by
 
 import numpy as np
 import random
-import time
 import os
 import copy
 import torch
@@ -113,8 +112,9 @@ robosuite_logger.setLevel(logging.ERROR)
 robosuite_logger.propagate = False        
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
+from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
 
-from Robot_simulation.heuristics_util import make_env, compute_smooth_trajectory, render_trajectory, write_grid_video
+from Robot_simulation.heuristics_util import make_env, compute_smooth_trajectory_with_q0, render_trajectory, write_grid_video, step_towards, save_mj_state, restore_mj_state
 
 import torch
 import torch.nn as nn
@@ -618,86 +618,6 @@ def _get_environment_params(
     return environment_parameters
 
 
-def _set_robot_qpos(env, q_first: np.ndarray, task_name: str):
-    """Teleport the robot to the first pose and synchronize actuators.
-
-    This writes joint positions (and zeros velocities) for each robot body
-    part driven by the task, then attempts to align actuator control targets
-    with the new state to avoid an initial snap when stepping the environment.
-
-    Args:
-        env: RoboSuite environment (must expose `sim.model`, `sim.data`).
-        q_first: (D,) first joint vector of the planned trajectory.
-        task_name: Task key to determine how many joints belong to each robot.
-
-    Notes:
-        - Calls `env.sim.forward()` at the end to refresh kinematics.
-        - If actuator mapping is unavailable, control sync is skipped.
-    """
-    model = env.sim.model
-    data  = env.sim.data
-
-    offset = 0
-    written_joint_ids = []   # joints we modify (for actuator sync)
-
-    for ridx, robot in enumerate(env.robots):
-        arm_names  = robot.robot_model.joints                    # 7 hinge joints
-        grip_names = next(iter(robot.gripper.values())).joints   # 2 hinge joints (if present)
-
-        # Decide which entries are available in q_first for this robot
-        remaining = q_first.shape[0] - offset
-        if remaining >= len(arm_names) + len(grip_names):
-            names = arm_names + grip_names         # door/nut or two_arm
-        elif remaining >= len(arm_names):
-            names = arm_names                      # wipe (no finger values in q_first)
-        else:
-            raise ValueError(
-                f"q_first too short: got {q_first.shape[0]} dims, "
-                f"offset {offset}, robot {ridx} needs ≥{len(arm_names)}"
-            )
-
-        n = len(names)
-
-        # Write positions (hinge/slide ⇒ 1-dim per joint) and zero velocities
-        qpos_addrs = []
-        dof_addrs  = []
-        for nm in names:
-            j_id = model.joint_name2id(nm)
-            written_joint_ids.append(j_id)
-
-            qpos_adr = model.jnt_qposadr[j_id]    # index into qpos
-            dof_adr  = model.jnt_dofadr[j_id]     # index into qvel (hinge ⇒ +1 DOF)
-            qpos_addrs.append(qpos_adr)
-            dof_addrs.append(dof_adr)
-
-        data.qpos[qpos_addrs] = q_first[offset:offset + n]
-        data.qvel[dof_addrs]  = 0.0
-
-        offset += n
-
-    # Zero the rest to be conservative
-    data.qacc[:] = 0.0
-    # Align actuator targets for actuators that drive the joints we just set.
-    # (Most robosuite joint-position controllers end up as JOINT actuators.)
-    try:
-        # 0 == JOINT transmission in MuJoCo
-        trn_is_joint = (model.actuator_trntype == 0)
-        for a in range(model.nu):
-            if not trn_is_joint[a]:
-                continue
-            j_id = int(model.actuator_trnid[a, 0])
-            if j_id in written_joint_ids:
-                qpos_adr = model.jnt_qposadr[j_id]
-                # position actuators: set target == current qpos
-                data.ctrl[a] = float(data.qpos[qpos_adr])
-    except Exception:
-        # If anything about actuator mapping is unavailable, just skip syncing ctrl.
-        pass
-
-    # Recompute kinematics after the teleportion + ctrl sync
-    env.sim.forward()
-
-
 def _to_action_from_q(q, task_name):
     """Pack a joint vector into the action format expected by the controller.
 
@@ -729,6 +649,7 @@ def _rollout_batch(
     task_name: str,
     q_low_batch: np.ndarray,          # (m, T, D) float32 on CPU
     env_settings: List[dict],         # length m
+    print_true: bool
 ) -> Tuple[int, float, list, list]:
     """Worker: restore envs from settings, upsample to controller rate, roll out CPU-only."""
     successes, reward_sum = 0, 0.0
@@ -739,22 +660,36 @@ def _rollout_batch(
 
     for i in range(m):
         setting = env_settings[i]
+        if print_true:
+            print("1:", setting["qpos"][:10])
         env = make_env(task_name,
                        use_joint_control=True,
-                       environment_setting=setting)
+                       environment_setting=setting,
+                       training=True)
+        if print_true:
+            print("2:", env.sim.data.qpos[:10])
         # plan at low rate -> smooth to control rate
         q_low  = q_low_batch[i]
-        q_high = compute_smooth_trajectory(env, task_name, q_low, env.control_freq)
+        
+        full_qpos = env.sim.data.qpos.copy()
 
-        # align sim to first pose and brief hold
-        q0 = q_high[0].copy()
-        _set_robot_qpos(env, q0, task_name)
-        a0 = _to_action_from_q(q0, task_name)
-        for _ in range(100):
-            env.step(a0)
+        if task_name in ["door", "nut"]:
+            # 7 arm + 2 gripper finger joints
+            q0 = np.concatenate([full_qpos[:7], full_qpos[7:9]])
+        elif task_name == "wipe":
+            # only arm joints
+            q0 = full_qpos[:7]
+        else:  # two_arm
+            # 2 x (7 arm + 2 gripper) = 18
+            q0 = np.concatenate([full_qpos[0:9], full_qpos[9:18]])
 
-        for q in q_high[1:]:
+        q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)        
+
+        for i, q in enumerate(q_high):            
             env.step(_to_action_from_q(q, task_name))
+            if i % 10 == 0 and i < 200:
+                if print_true:
+                    print(env.sim.data.qpos[:10])
 
         if env._check_success():
             successes += 1
@@ -866,6 +801,7 @@ def eval_model(
                 task_name,
                 q_low_all[s:e],                 # numpy slice (copies view to child)
                 env_settings_all[s:e],
+                s == 0
             ))
         for fut in futs:
             succ, rew, info_s, info_f = fut.result()
@@ -879,6 +815,9 @@ def eval_model(
                 take = min(render_width*render_width - render_num - f_count, len(info_f))
                 failure_info += info_f[:take]; f_count += take
 
+    success_rate = total_success / trials
+    mean_reward  = total_reward  / trials
+
     # ---- (optional) render sample grid (unchanged) ----
     episode_frames = []
     s_left = min(s_count, render_num)
@@ -889,13 +828,15 @@ def eval_model(
                          has_offscreen_renderer=True,
                          use_camera_obs=False,
                          use_joint_control=True,
-                         environment_setting=success_info[s_left - 1]["setting"])
+                         environment_setting=success_info[s_left - 1]["setting"],
+                         training=True)
         frames = render_trajectory(env_r,
                                    task_name,
                                    success_info[s_left - 1]["traj"],
                                    success_info[s_left - 1]["traj"][0, :],
                                    camera_name="frontview",
-                                   hold_init=True)
+                                   hold_init=True,
+                                   set_init=False)
         episode_frames.append(frames)
         env_r.close()
         s_left -= 1
@@ -905,13 +846,15 @@ def eval_model(
                          has_offscreen_renderer=True,
                          use_camera_obs=False,
                          use_joint_control=True,
-                         environment_setting=failure_info[f_left - 1]["setting"])
+                         environment_setting=failure_info[f_left - 1]["setting"],
+                         training=True)
         frames = render_trajectory(env_r,
                                    task_name,
                                    failure_info[f_left - 1]["traj"],
                                    failure_info[f_left - 1]["traj"][0, :],
                                    camera_name="frontview",
-                                   hold_init=True)
+                                   hold_init=True,
+                                   set_init=False)
         episode_frames.append(frames)
         env_r.close()
         f_left -= 1
@@ -921,8 +864,6 @@ def eval_model(
         write_grid_video(episode_frames, grid_path,
                          grid_shape=(render_width, render_width))
 
-    success_rate = total_success / trials
-    mean_reward  = total_reward  / trials
     return success_rate, mean_reward
 
 
@@ -1122,6 +1063,7 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
 
     if total_var <= 1e-12 or Xp.shape[0] < 2:
         # Degenerate cluster: no usable variance. Use a fixed fallback basis.
+        print("Degenerate cluster!")
         n_comp = min(d_x, Dx)
         Bx = np.zeros((Dx, n_comp), dtype=np.float32)
         for j in range(n_comp):
@@ -1156,6 +1098,7 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
 
     # pad with orthonormal columns in the complement subspace:
     if Bx.shape[1] < d_x:
+        print(f"Missing {d_x - Bx.shape[1]} axes")
         k = d_x - Bx.shape[1]
         pad = np.zeros((Dx, k), dtype=np.float32)
         for j in range(k):
@@ -1232,6 +1175,119 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
     return mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights
 
 
+def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
+    # ---------- helper for recording ----------
+    def record_q():
+        return
+
+    for peg_body in (env.peg1_body_id, env.peg2_body_id):        
+        env.sim.model.body_pos[peg_body][0] -= delta_x
+        env.sim.data.body_xpos[peg_body][0] -= delta_x
+        env.sim.model.body_pos[peg_body][2] += delta_z
+        env.sim.data.body_xpos[peg_body][2] += delta_z
+    robot = env.robots[0]
+    # arm+gripper
+    arm_joints  = robot.robot_model.joints
+    grip_joints = robot.gripper["right"].joints
+    all_joints  = arm_joints + grip_joints
+    joint_idx   = [env.sim.model.get_joint_qpos_addr(n) for n in all_joints]
+    # eef & square peg & nut handle
+    eef_id      = list(robot.eef_site_id.values())[0]
+    peg_id      = env.peg1_body_id
+    nut_handle_id = env.object_site_ids[0]
+    adim        = env.action_dim
+
+    init_qpos = env.sim.data.qpos[joint_idx].copy()
+
+    nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
+    nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
+
+    peg_pos = env.sim.data.body_xpos[peg_id].copy()
+
+    R0       = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
+    quat0    = mat2quat(R0)
+    for axis, ang in [(R0[:,0], np.pi), (R0[:, 2], -np.pi/2)]:
+        axis = axis / np.linalg.norm(axis)
+        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
+        quat0 = quat_multiply(q_rot, quat0)
+    # calculate minimum shift in orientation
+    q_cur = mat2quat(env.sim.data.site_xmat[eef_id].reshape(3,3))
+    q_rel = quat_multiply(quat_inverse(q_cur), quat0)
+    angle = 2 * np.arccos(np.clip(q_rel[3], -1.0, 1.0))
+    if angle > np.pi/2 and angle < np.pi*3/2:
+        axis, ang = (R0[:, 2], np.pi)
+        axis = axis / np.linalg.norm(axis)
+        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
+        quat0 = quat_multiply(q_rot, quat0)
+
+    # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
+    pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
+    step_towards(env, eef_id, adim, record_q,
+                 target_pos=pre_grasp,
+                 target_quat=quat0,
+                 steps=100,
+                 gripper_val=-1)    
+    # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
+    grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
+    step_towards(env, eef_id, adim, record_q,
+                 target_pos=grasp_height,
+                 target_quat=quat0,
+                 steps=20,
+                 gripper_val=-1)
+    # ---------- PHASE2: 10‑step grasping handle ----------
+    for _ in range(10):
+        a = np.zeros(adim); a[6] = 1.0
+        obs, _, _, _ = env.step(a)
+    # ---------- record environment setting (to record after nuts drop) ----------
+    # environment_setting = save_mj_state(env) # save full mujoco settings
+    environment_setting = {
+        "qpos":     env.sim.data.qpos.copy(),
+        "qvel":     env.sim.data.qvel.copy(),
+        "body_pos": env.sim.model.body_pos.copy(),
+        "body_quat":env.sim.model.body_quat.copy(),
+        "act": env.sim.data.act.copy(),
+        "ctrl": env.sim.data.ctrl.copy(),
+        "mocap_pos": env.sim.data.mocap_pos.copy(),
+        "mocap_quat": env.sim.data.mocap_quat.copy()
+    }
+    yaw = np.arctan2(R0[1,0], R0[0,0])
+    environment_parameters = (nut_pos[0], nut_pos[1], yaw)
+    return environment_setting, environment_parameters
+
+
+def _generate_val_env(task_name, val_trials):
+    env_params_list: List[np.ndarray] = []
+    env_settings_all: List[dict] = []
+
+    if (task_name == "nut"):
+        for i in range(val_trials):
+            env = make_env(task_name)
+            env.reset()
+
+            env_setting, env_param = _align_handle_to_nut(env)
+            env_settings_all.append(env_setting)
+            env_params_list.append(env_param)
+
+            env.close()        
+    else:
+        for i in range(val_trials):
+            env = make_env(task_name, use_joint_control=True)
+            env.reset()
+
+            env_settings_all.append({
+                "qpos":      env.sim.data.qpos.copy(),
+                "qvel":      env.sim.data.qvel.copy(),
+                "body_pos":  env.sim.model.body_pos.copy(),
+                "body_quat": env.sim.model.body_quat.copy(),
+            })
+            env_params_list.append(_get_environment_params(env, task_name))
+            
+            env.close()
+    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+
+    return env_settings_all, val_params
+
+
 def train_uniform_FM(
     model,
     optimizer,
@@ -1285,27 +1341,14 @@ def train_uniform_FM(
     N = target_trajectories.shape[0]
     best_avg_reward = 0.0
     best_success_rate = 0.0
-    best_model = None
+    best_model = copy.deepcopy(model)
     success_rate_recs = {}
     stop_count = 0
 
     # ---- Build environments sequentially for validation and close them ----
-    env_params_list: List[np.ndarray] = []
-    env_settings_all: List[dict] = []
-    for _ in range(val_trials):
-        env = make_env(task_name, use_joint_control=True)
-        env.reset()
+    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
 
-        env_settings_all.append({
-            "qpos":      env.sim.data.qpos.copy(),
-            "qvel":      env.sim.data.qvel.copy(),
-            "body_pos":  env.sim.model.body_pos.copy(),
-            "body_quat": env.sim.model.body_quat.copy(),
-        })
-        env_params_list.append(_get_environment_params(env, task_name))
-        env.close()
-    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
-
+    # start training
     try: 
         model = model.to(device)
         target_trajectories = target_trajectories.to(device)
@@ -1410,26 +1453,12 @@ def train_shifted_FM(
     N = target_trajectories.shape[0]
     best_avg_reward = 0.0
     best_success_rate = 0.0
-    best_model = None
+    best_model = copy.deepcopy(model)
     success_rate_recs = {}
     stop_count = 0
 
     # ---- Build environments sequentially for validation and close them ----
-    env_params_list: List[np.ndarray] = []
-    env_settings_all: List[dict] = []
-    for _ in range(val_trials):
-        env = make_env(task_name, use_joint_control=True)
-        env.reset()
-
-        env_settings_all.append({
-            "qpos":      env.sim.data.qpos.copy(),
-            "qvel":      env.sim.data.qvel.copy(),
-            "body_pos":  env.sim.model.body_pos.copy(),
-            "body_quat": env.sim.model.body_quat.copy(),
-        })
-        env_params_list.append(_get_environment_params(env, task_name))
-        env.close()
-    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
 
     try: 
         model = model.to(device)
@@ -1591,26 +1620,12 @@ def train_DGFM(
     global_N = mf * N
     best_avg_reward = 0.0
     best_success_rate = 0.0
-    best_model = None
+    best_model = copy.deepcopy(model)
     success_rate_recs = {}
     stop_count = 0
 
     # ---- Build environments sequentially for validation and close them ----
-    env_params_list: List[np.ndarray] = []
-    env_settings_all: List[dict] = []
-    for _ in range(val_trials):
-        env = make_env(task_name, use_joint_control=True)
-        env.reset()
-
-        env_settings_all.append({
-            "qpos":      env.sim.data.qpos.copy(),
-            "qvel":      env.sim.data.qvel.copy(),
-            "body_pos":  env.sim.model.body_pos.copy(),
-            "body_quat": env.sim.model.body_quat.copy(),
-        })
-        env_params_list.append(_get_environment_params(env, task_name))
-        env.close()
-    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
 
     try:
         model = model.to(device)
@@ -1738,3 +1753,4 @@ def train_DGFM(
         tqdm.write("Training interrupted by user. Returning best model so far...")
 
     return best_model, model, success_rate_recs
+

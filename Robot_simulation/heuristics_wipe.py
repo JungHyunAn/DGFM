@@ -91,7 +91,8 @@ def generate_wipe_trajectory(
         step_towards(env, eef_id, adim, record_q,
                         target_pos=pos, target_quat=quat, steps=steps,
                         render=render, frames=frames)
-        return env._check_success()
+        return False
+        # return env._check_success() # DO NOT CHECK FOR NOW
 
     # ---------- begin recording ----------
     record_q()
@@ -146,8 +147,8 @@ def generate_wipe_trajectory(
     # ---------- PHASE2: start wiping until the dirt is gone ----------
     for xo in x_offsets:
         # endpoints along y with direction
-        p_start = np.array([cx + xo, y0, wipe_z])
-        p_end   = np.array([cx + xo, y1, wipe_z])
+        p_start = np.array([cx + xo, cy - np.sqrt(wy**2 - xo**2), wipe_z])
+        p_end   = np.array([cx + xo, cy + np.sqrt(wy**2 - xo**2), wipe_z])
         if not forward:
             p_start, p_end = p_end, p_start
 

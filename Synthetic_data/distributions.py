@@ -187,7 +187,7 @@ class Quadratic_Unimodal(Distribution):
         patience_counter = 0
 
         # gradient descent to find z_hat that minimizes the error
-        for _ in range(num_steps):
+        for i in range(num_steps):
             optimizer.zero_grad()
             # linear term
             lin = z_hat @ self.A.T 
@@ -209,11 +209,23 @@ class Quadratic_Unimodal(Distribution):
                 if patience_counter >= patience:
                     break
 
+            if (i == num_steps - 1):
+                print("Reached Max Iteration for geometric alignment error!!")
+
         # compute final error
         with torch.no_grad():
             lin  = z_hat @ self.A.T
             quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
             err  = ((lin + quad - x) ** 2).mean().item()
+            print("Error by gradient descent: ", err)
+            
+            """
+            c     = x @ torch.linalg.pinv(self.A).T          # (n, latent_dim)
+            recon = torch.matmul(c, self.A.T)   # (n, ambient_dim)
+            res   = x - recon             # (n, ambient_dim)
+            proj_err = res.pow(2).mean().item()
+            print("Error by projection: ", proj_err)
+            """
 
         return err
     
@@ -278,7 +290,7 @@ class Quadratic_Multimodal(Distribution):
         patience_counter = 0
 
         # gradient descent to find z_hat that minimizes the error
-        for _ in range(num_steps):
+        for i in range(num_steps):
             optimizer.zero_grad()
             # linear term
             lin = z_hat @ self.A.T 
@@ -299,6 +311,9 @@ class Quadratic_Multimodal(Distribution):
                 patience_counter += 1
                 if patience_counter >= patience:
                     break
+
+            if (i == num_steps - 1):
+                print("Reached Max Iteration for geometric alignment error!!")
 
         # compute final error
         with torch.no_grad():
@@ -453,7 +468,7 @@ class SwissRoll(Distribution):
         """
         Estimate latent coordinates via gradient descent to minimize:
             || x - A v(z) ||^2
-        where v(z) = [t1 cos(t1), t1 sin(t1), z2...z_latent_dim].
+        where v(z) = [t1 cos(4*pi*t1), t1 sin(4*pi*t1), z2...z_latent_dim].
         Returns the mean squared error over the batch.
         """
         x = x.to(self.device)
@@ -467,14 +482,14 @@ class SwissRoll(Distribution):
         z_hat = z_init[:, :self.latent_dim].clone().detach()
         z_hat.requires_grad_(True)
 
-        optimizer = optim.Adam([z_hat], lr=1e-2)
+        optimizer = optim.Adam([z_hat], lr=2e-1)
 
         best_loss = float('inf')
         patience = 10
         patience_counter = 0
-        num_steps = 5000
+        num_steps = 100000
 
-        for _ in range(num_steps):
+        for i in range(num_steps):
             optimizer.zero_grad()
             t1 = torch.sigmoid(z_hat[:, 0])  # (n,), within [0, 1]
 
@@ -498,6 +513,9 @@ class SwissRoll(Distribution):
                 patience_counter += 1
                 if patience_counter >= patience:
                     break
+            
+            if (i == num_steps - 1):
+                print("Reached Max Iteration for geometric alignment error!!")
 
         # final MSE
         with torch.no_grad():

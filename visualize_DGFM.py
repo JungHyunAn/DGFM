@@ -3,9 +3,9 @@ import matplotlib.pyplot as plt
 
 # Define the 2D manifold in 3D space
 def manifold(u, v):
-    x = u
-    y = v
-    z = np.sin(u) * np.cos(v)
+    x = 1.5*u
+    y = 1.5*v
+    z = 2*np.sin(u) * np.cos(v)
     return x, y, z
 
 # Define a distribution over the 2D manifold (e.g., a Gaussian bump centered at (0, 0))
@@ -37,6 +37,10 @@ ax.set_title("2D Manifold in 3D Space with Distribution", fontsize=14)
 ax.set_xlabel('X')
 ax.set_ylabel('Y')
 ax.set_zlabel('Z')
+
+ax.set_xlim([-3, 3])
+ax.set_ylim([-3, 3])
+ax.set_zlim([-2.5, 2.5])
 
 ax.view_init(elev=30, azim=150)
 

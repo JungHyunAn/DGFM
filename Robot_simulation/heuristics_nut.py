@@ -113,7 +113,7 @@ def generate_nut_trajectory(
         quat0 = quat_multiply(q_rot, quat0)
 
     # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
-    pre_grasp = nut_pos + np.array([0.0, 0.0, 0.03], dtype=np.float32) # 3cm above the nut
+    pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
     step_towards(env, eef_id, adim, record_q,
                  target_pos=pre_grasp,
                  target_quat=quat0,
