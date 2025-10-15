@@ -660,14 +660,12 @@ def _rollout_batch(
 
     for i in range(m):
         setting = env_settings[i]
-        if print_true:
-            print("1:", setting["qpos"][:10])
+
         env = make_env(task_name,
                        use_joint_control=True,
                        environment_setting=setting,
                        training=True)
-        if print_true:
-            print("2:", env.sim.data.qpos[:10])
+
         # plan at low rate -> smooth to control rate
         q_low  = q_low_batch[i]
         
@@ -685,11 +683,8 @@ def _rollout_batch(
 
         q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)        
 
-        for i, q in enumerate(q_high):            
+        for q in q_high:            
             env.step(_to_action_from_q(q, task_name))
-            if i % 10 == 0 and i < 200:
-                if print_true:
-                    print(env.sim.data.qpos[:10])
 
         if env._check_success():
             successes += 1

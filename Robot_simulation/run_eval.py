@@ -162,7 +162,7 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
     # per-worker seeds for determinism
     np.random.seed(seed); random.seed(seed); torch.manual_seed(seed)
 
-    env = make_env(task_name, use_joint_control=True)
+    env = make_env(task_name)
     if task_name == "nut":
         env.reset()
         setting, params = _align_handle_to_nut(env)
