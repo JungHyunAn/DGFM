@@ -556,6 +556,19 @@ class MixtureSampler:
 
 @torch.no_grad()
 def run_flow(model, x, c, device, n_steps=1000):
+    """Generates samples by transporting noisy samples through the given vector field
+
+    Uses RK2 method to integrate the neural vector field v(x, c).
+
+    Args:
+        model: Neural vector field model.
+        x: Samples from the base distribution.
+        c: Environment parameters.
+        n_steps: number of steps for RK2.
+
+    Returns:
+        output x with same size as input x
+    """
     dt = 1.0 / n_steps
     for i in range(n_steps):
         t  = torch.full((x.shape[0], 1), i*dt, device=device)
@@ -645,9 +658,119 @@ def _to_action_from_q(q, task_name):
         return np.concatenate([arm1, [grip1], arm2, [grip2]])
 
 
+def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
+    def record_q(): # helper for recording, empty
+        return
+
+    for peg_body in (env.peg1_body_id, env.peg2_body_id):        
+        env.sim.model.body_pos[peg_body][0] -= delta_x
+        env.sim.data.body_xpos[peg_body][0] -= delta_x
+        env.sim.model.body_pos[peg_body][2] += delta_z
+        env.sim.data.body_xpos[peg_body][2] += delta_z
+    robot = env.robots[0]
+    # arm+gripper
+    arm_joints  = robot.robot_model.joints
+    grip_joints = robot.gripper["right"].joints
+    all_joints  = arm_joints + grip_joints
+    joint_idx   = [env.sim.model.get_joint_qpos_addr(n) for n in all_joints]
+    # eef & square peg & nut handle
+    eef_id      = list(robot.eef_site_id.values())[0]
+    peg_id      = env.peg1_body_id
+    nut_handle_id = env.object_site_ids[0]
+    adim        = env.action_dim
+
+    init_qpos = env.sim.data.qpos[joint_idx].copy()
+
+    nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
+    nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
+
+    peg_pos = env.sim.data.body_xpos[peg_id].copy()
+
+    R0       = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
+    quat0    = mat2quat(R0)
+    for axis, ang in [(R0[:,0], np.pi), (R0[:, 2], -np.pi/2)]:
+        axis = axis / np.linalg.norm(axis)
+        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
+        quat0 = quat_multiply(q_rot, quat0)
+    # calculate minimum shift in orientation
+    q_cur = mat2quat(env.sim.data.site_xmat[eef_id].reshape(3,3))
+    q_rel = quat_multiply(quat_inverse(q_cur), quat0)
+    angle = 2 * np.arccos(np.clip(q_rel[3], -1.0, 1.0))
+    if angle > np.pi/2 and angle < np.pi*3/2:
+        axis, ang = (R0[:, 2], np.pi)
+        axis = axis / np.linalg.norm(axis)
+        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
+        quat0 = quat_multiply(q_rot, quat0)
+
+    # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
+    pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
+    step_towards(env, eef_id, adim, record_q,
+                 target_pos=pre_grasp,
+                 target_quat=quat0,
+                 steps=100,
+                 gripper_val=-1)    
+    # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
+    grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
+    step_towards(env, eef_id, adim, record_q,
+                 target_pos=grasp_height,
+                 target_quat=quat0,
+                 steps=20,
+                 gripper_val=-1)
+    # ---------- PHASE2: 10‑step grasping handle ----------
+    for _ in range(10):
+        a = np.zeros(adim); a[6] = 1.0
+        obs, _, _, _ = env.step(a)
+    # ---------- record environment setting (to record after nuts drop) ----------
+    # environment_setting = save_mj_state(env) # save full mujoco settings
+    environment_setting = {
+        "qpos":     env.sim.data.qpos.copy(),
+        "qvel":     env.sim.data.qvel.copy(),
+        "body_pos": env.sim.model.body_pos.copy(),
+        "body_quat":env.sim.model.body_quat.copy(),
+        "act": env.sim.data.act.copy(),
+        "ctrl": env.sim.data.ctrl.copy(),
+        "mocap_pos": env.sim.data.mocap_pos.copy(),
+        "mocap_quat": env.sim.data.mocap_quat.copy()
+    }
+    yaw = np.arctan2(R0[1,0], R0[0,0])
+    environment_parameters = (nut_pos[0], nut_pos[1], yaw)
+    return environment_setting, environment_parameters
+def _generate_val_env(task_name, val_trials):
+    env_params_list: List[np.ndarray] = []
+    env_settings_all: List[dict] = []
+
+    if (task_name == "nut"):
+        for i in range(val_trials):
+            env = make_env(task_name)
+            env.reset()
+
+            env_setting, env_param = _align_handle_to_nut(env)
+            env_settings_all.append(env_setting)
+            env_params_list.append(env_param)
+
+            env.close()        
+    else:
+        for i in range(val_trials):
+            env = make_env(task_name, use_joint_control=True)
+            env.reset()
+
+            env_settings_all.append({
+                "qpos":      env.sim.data.qpos.copy(),
+                "qvel":      env.sim.data.qvel.copy(),
+                "body_pos":  env.sim.model.body_pos.copy(),
+                "body_quat": env.sim.model.body_quat.copy(),
+            })
+            env_params_list.append(_get_environment_params(env, task_name))
+            
+            env.close()
+    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
+
+    return env_settings_all, val_params
+
+
 def _rollout_batch(
     task_name: str,
-    q_low_batch: np.ndarray,          # (m, T, D) float32 on CPU
+    q_low_batch: np.ndarray,          # (m, T, D) on CPU
     env_settings: List[dict],         # length m
     print_true: bool
 ) -> Tuple[int, float, list, list]:
@@ -696,8 +819,6 @@ def _rollout_batch(
         env.close()
 
     return successes, reward_sum, success_info, fail_info
-
-
 def eval_model(
     model,
     model_class,                 # kept for signature compatibility (not used here)
@@ -718,8 +839,30 @@ def eval_model(
     base_seed: int = 123,
     gpu_chunk_size: int | None = None,  # NEW: set to chunk the single GPU forward if memory-bound
 ) -> Tuple[float, float]:
-    """
-    New evaluation pipeline:
+    """ Evaluates a flow model on given environments.
+
+    Multiprocessing is used by calling _rollout_batch to evaluate multiple environments in parallel.
+
+    Args:
+        model: Neural vector field model to evaluate.
+        task_name: Name of task, within {"door", "two arm", "nut", "wipe (currently unimplemented)"}
+        trials: number of evaluation environments
+        val_params: (trials, ) environment parameters of the evaluation environments
+        env_settings_all: (trials, ) list of dicts to restore evaluation environments
+        render_num: number of successful trajectories to render
+        render_width: length of width/height for the rendered grid video (render_width^2 - render_num failed trajectories rendered)
+        gpu_chunk_size: In case of multiple neural inference
+
+    Pipeline:
+        1) Environments are formed outside the function
+        2) Environment parameters are passed to run the flow in a chunk on GPU (if available)
+        3) Workers restore envs, upsample, and roll out on CPU
+        4) For rendering, trajectory is replayed and saved to "render_dir/{task_name}_grid_{video_name}.mp4"
+
+    Returns:
+        Success rate and mean reward
+
+    Evaluation pipeline:
       1) Parent makes envs sequentially, saves settings/params, then closes.
       2) Parent runs ONE GPU forward (optionally chunked) to get all q_low.
       3) Workers restore envs, upsample, and roll out on CPU (no GPU in workers).
@@ -877,8 +1020,6 @@ def _standardize_cols(A, eps=1e-8):
     sd = A.std(axis=0, keepdims=True)
     sd = np.where(sd < eps, 1.0, sd)
     return (A - mu) / sd, (mu, sd)
-
-
 def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
                          standardize=True, scale_x=1.0, scale_c=1.0):
     """Greedy set-cover style clustering on joint features [X | C].
@@ -1121,8 +1262,6 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
     weight = Xi_c.shape[0] / X.shape[0]
 
     return mu_x, mu_c, Bx, Sig_zz, Sig_zc, Sig_cc, weight
-
-
 def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
                                    eps=1e-3, outlier_q=0.9,
                                    max_pca_samples=2000, n_jobs=-1):
@@ -1168,119 +1307,6 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
     Sig_cc = np.stack(Sig_cc, axis=0)             # (K, Dc, Dc)
     weights = np.array(weights, dtype=np.float32) # (K,)
     return mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights
-
-
-def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
-    # ---------- helper for recording ----------
-    def record_q():
-        return
-
-    for peg_body in (env.peg1_body_id, env.peg2_body_id):        
-        env.sim.model.body_pos[peg_body][0] -= delta_x
-        env.sim.data.body_xpos[peg_body][0] -= delta_x
-        env.sim.model.body_pos[peg_body][2] += delta_z
-        env.sim.data.body_xpos[peg_body][2] += delta_z
-    robot = env.robots[0]
-    # arm+gripper
-    arm_joints  = robot.robot_model.joints
-    grip_joints = robot.gripper["right"].joints
-    all_joints  = arm_joints + grip_joints
-    joint_idx   = [env.sim.model.get_joint_qpos_addr(n) for n in all_joints]
-    # eef & square peg & nut handle
-    eef_id      = list(robot.eef_site_id.values())[0]
-    peg_id      = env.peg1_body_id
-    nut_handle_id = env.object_site_ids[0]
-    adim        = env.action_dim
-
-    init_qpos = env.sim.data.qpos[joint_idx].copy()
-
-    nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
-    nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
-
-    peg_pos = env.sim.data.body_xpos[peg_id].copy()
-
-    R0       = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
-    quat0    = mat2quat(R0)
-    for axis, ang in [(R0[:,0], np.pi), (R0[:, 2], -np.pi/2)]:
-        axis = axis / np.linalg.norm(axis)
-        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
-        quat0 = quat_multiply(q_rot, quat0)
-    # calculate minimum shift in orientation
-    q_cur = mat2quat(env.sim.data.site_xmat[eef_id].reshape(3,3))
-    q_rel = quat_multiply(quat_inverse(q_cur), quat0)
-    angle = 2 * np.arccos(np.clip(q_rel[3], -1.0, 1.0))
-    if angle > np.pi/2 and angle < np.pi*3/2:
-        axis, ang = (R0[:, 2], np.pi)
-        axis = axis / np.linalg.norm(axis)
-        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
-        quat0 = quat_multiply(q_rot, quat0)
-
-    # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
-    pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
-    step_towards(env, eef_id, adim, record_q,
-                 target_pos=pre_grasp,
-                 target_quat=quat0,
-                 steps=100,
-                 gripper_val=-1)    
-    # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
-    grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
-    step_towards(env, eef_id, adim, record_q,
-                 target_pos=grasp_height,
-                 target_quat=quat0,
-                 steps=20,
-                 gripper_val=-1)
-    # ---------- PHASE2: 10‑step grasping handle ----------
-    for _ in range(10):
-        a = np.zeros(adim); a[6] = 1.0
-        obs, _, _, _ = env.step(a)
-    # ---------- record environment setting (to record after nuts drop) ----------
-    # environment_setting = save_mj_state(env) # save full mujoco settings
-    environment_setting = {
-        "qpos":     env.sim.data.qpos.copy(),
-        "qvel":     env.sim.data.qvel.copy(),
-        "body_pos": env.sim.model.body_pos.copy(),
-        "body_quat":env.sim.model.body_quat.copy(),
-        "act": env.sim.data.act.copy(),
-        "ctrl": env.sim.data.ctrl.copy(),
-        "mocap_pos": env.sim.data.mocap_pos.copy(),
-        "mocap_quat": env.sim.data.mocap_quat.copy()
-    }
-    yaw = np.arctan2(R0[1,0], R0[0,0])
-    environment_parameters = (nut_pos[0], nut_pos[1], yaw)
-    return environment_setting, environment_parameters
-
-
-def _generate_val_env(task_name, val_trials):
-    env_params_list: List[np.ndarray] = []
-    env_settings_all: List[dict] = []
-
-    if (task_name == "nut"):
-        for i in range(val_trials):
-            env = make_env(task_name)
-            env.reset()
-
-            env_setting, env_param = _align_handle_to_nut(env)
-            env_settings_all.append(env_setting)
-            env_params_list.append(env_param)
-
-            env.close()        
-    else:
-        for i in range(val_trials):
-            env = make_env(task_name, use_joint_control=True)
-            env.reset()
-
-            env_settings_all.append({
-                "qpos":      env.sim.data.qpos.copy(),
-                "qvel":      env.sim.data.qvel.copy(),
-                "body_pos":  env.sim.model.body_pos.copy(),
-                "body_quat": env.sim.model.body_quat.copy(),
-            })
-            env_params_list.append(_get_environment_params(env, task_name))
-            
-            env.close()
-    val_params = np.asarray(env_params_list, dtype=np.float32)         # (N, Dc)
-
-    return env_settings_all, val_params
 
 
 def train_uniform_FM(
