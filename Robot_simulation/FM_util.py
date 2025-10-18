@@ -12,24 +12,23 @@ What this module provides
 - **MixtureSampler**: a low-rank conditional Gaussian mixture over trajectories
   and environment parameters used by **Dimension-Guided FM (DGFM)** to provide
   intermediate (interpolated) samples.
-- **Trainers**: `train_uniform_FM`, `train_shifted_FM`, `train_DGFM`—each returns
-  `(best_model, last_model, records)` with validation metrics over epochs.
-- **Evaluation**: `eval_model` runs many parallel rollouts in RoboSuite,
+- **Trainers**: 'train_uniform_FM', 'train_shifted_FM', train_DGFM'; each returns
+  '(best_model, last_model, records)' with validation metrics over epochs.
+- **Evaluation**: 'eval_model' runs many parallel rollouts in RoboSuite,
   reports success rate / average reward, and (optionally) renders a grid video.
-- **Utilities**: lightweight helpers like `run_flow` for integrating the learned
-  vector field from t=0→1.
+- **Utilities**: helpers like 'run_flow' for integrating the learned vector field from t=0→1.
 
 Key design choices & assumptions
 --------------------------------
 1) **Shapes & conventions**
-   - Trajectories are `(B, T, D)` = (batch, seq_len, dof).
-   - Environment parameters are `(B, P)`.
-   - Times `t ∈ [0, 1]`.
+   - Trajectories are '(B, T, D)' = (batch, seq_len, dof).
+   - Environment parameters are '(B, P)'.
+   - Times 't ∈ [0, 1]'.
    - For gripper DoF, models can ignore (mask) those joints during training.
 
 2) **DGFM's low-rank mixture (used only when training DGFM)**
    - Per mixture component *k* we model:
-       x = μ_x^k + B^k z,  with  z|c ~ N(μ_{z|c}^k, Σ_{z|c}^k),   and   c ~ N(μ_c^k, Σ_cc^k)
+       x = μ_x^k + B^k z,  with  z|c ~ N(μ_{z|c}^k, Σ_{z|c}^k),  and  c ~ N(μ_c^k, Σ_cc^k)
      where B^k ∈ R^{D x d} is a PCA basis (d < D). We precompute for each cluster:
        Σ_zz^k, Σ_zc^k, Σ_cc^k and Cholesky factors; responsibilities use p(c|k) only.
    - Conditioning uses standard Gaussian identities:
@@ -42,52 +41,25 @@ Key design choices & assumptions
 
 3) **Trainers**
    - **UniformFM**: sample t ~ Uniform[0,1], regress v_t (standard FM).
-   - **ShiftedFM**: shift / warp t to emphasize early (or late) time steps.
+   - **ShiftedFM**: shift / warp t to emphasize early (or late) time steps via Beta distribution.
    - **DGFM**: use the mixture to define intermediate targets (configurable via `mf`, 
      `cluster_d`, `cluster_size`, `n_t_global`, `n_t_local`).
    - Schedules: cosine with warmup; Adam optimizer; early stopping supported.
 
 4) **Evaluation loop**
-   - For each trial: build env, extract env params c, sample a trajectory by
-     integrating the vector field (via `run_flow`), upsample / smooth externally,
-     replay, then compute success / reward. Multiprocessing is used for speed.
+   - Before training: build env, extract env params c
+   - For each trial: restore env, sample a trajectory by integrating the vector field (via `run_flow`), 
+     upsample / smooth externally, replay, then compute success / reward. 
+     Multiprocessing is used for speed.
    - Rendering (optional) uses the external utilities from
-     `Robot_simulation.heuristics_util` (not defined here).
-
-Interfaces at a glance
-----------------------
-- `VectorField(seq_len, dof, param_len, gripper_idx=None)`
-- `MixtureSampler(mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights, device='cpu', reg=1e-6, orth_sigma=0.0)`
-    - `.sample_cond(c_in, deterministic_component=False, truncated=False, trunc=(-1.5,1.5), pis=None)`
-    - `.sample_joint(M, truncated=False, trunc=(-1.5,1.5), pis=None)`
-- `train_uniform_FM(model, optimizer, scheduler, task_name, target_trajectories, environment_parameters, ..., early_stopping, ...)`
-- `train_shifted_FM(...)`
-- `train_DGFM(..., mf, n_t_global, n_t_local, cluster_d, cluster_size, ...)`
-- `eval_model(model, model_class, task_name, seq_len, dof, param_len, gripper_idx, device, trials, render_dir=..., ...)`
-- `run_flow(model, x0, env_param, device, n_steps=500)`
-
-Outputs & metrics
------------------
-- Trainers return: `best_model`, `last_model`, and a `records` dict per epoch
-  (e.g., validation success rate).
-- `eval_model` returns: `(success_rate, mean_reward)` and can save a grid video.
-
-Gotchas / tips
---------------
-- Ensure environment parameter dimension `P` matches the trained model; mixture
-  responsibilities depend on `Σ_cc`.
-- If Cholesky fails or produces NaNs, increase `reg` (Tikhonov) or check for
-  degenerate clusters / too few inliers during PCA statistics.
-- When forcing components (`pis`) in `.sample_cond`, responsibilities are skipped
-  (weights return `None`), which is useful for ablating mixture selection.
-- If you mask grippers during training, be sure the downstream replay / rendering
-  logic reconstructs or clamps gripper channels consistently.
+     'Robot_simulation.heuristics_util' (not defined here).
 
 Note
 ----
 This module focuses on learning and evaluation. Environment construction,
 state restoration, trajectory smoothing, and rendering are provided by
-`Robot_simulation.heuristics_util` and task-specific heuristic generators.
+'Robot_simulation.heuristics_util'.
+For nut assembly task, grasping the nut is ensured by lifting the nut in '_align_handle_to_nut'
 """
 
 import numpy as np
@@ -114,7 +86,7 @@ for h in list(robosuite_logger.handlers):
     robosuite_logger.removeHandler(h)
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
 
-from Robot_simulation.heuristics_util import make_env, compute_smooth_trajectory_with_q0, render_trajectory, write_grid_video, step_towards, save_mj_state, restore_mj_state
+from Robot_simulation.heuristics_util import make_env, compute_smooth_trajectory_with_q0, render_trajectory, write_grid_video, step_towards
 
 import torch
 import torch.nn as nn
@@ -708,7 +680,7 @@ def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
                  target_pos=pre_grasp,
                  target_quat=quat0,
                  steps=100,
-                 gripper_val=-1)    
+                 gripper_val=-1)
     # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
     grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
     step_towards(env, eef_id, adim, record_q,
@@ -720,6 +692,7 @@ def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
     for _ in range(10):
         a = np.zeros(adim); a[6] = 1.0
         obs, _, _, _ = env.step(a)
+
     # ---------- record environment setting (to record after nuts drop) ----------
     # environment_setting = save_mj_state(env) # save full mujoco settings
     environment_setting = {
@@ -734,23 +707,38 @@ def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
     }
     yaw = np.arctan2(R0[1,0], R0[0,0])
     environment_parameters = (nut_pos[0], nut_pos[1], yaw)
-    return environment_setting, environment_parameters
+
+    # ---------- PHASE3: 20‑step lift to check grasp ----------
+    check_grasp = False
+    step_towards(env, eef_id, adim, record_q,
+                 target_pos=pre_grasp,
+                 target_quat=quat0,
+                 steps=20,
+                 gripper_val=1)
+    if (env.sim.data.site_xpos[nut_handle_id][2] > nut_pos[2] + 0.02):
+        check_grasp = True
+
+    return environment_setting, environment_parameters, check_grasp
 def _generate_val_env(task_name, val_trials):
     env_params_list: List[np.ndarray] = []
     env_settings_all: List[dict] = []
 
     if (task_name == "nut"):
-        for i in range(val_trials):
-            env = make_env(task_name)
-            env.reset()
+        for _ in range(val_trials):
+            for i in range(100):
+                env = make_env(task_name)
+                env.reset()
+                env_setting, env_param, check_grasp = _align_handle_to_nut(env)
+                env.close()  
 
-            env_setting, env_param = _align_handle_to_nut(env)
-            env_settings_all.append(env_setting)
-            env_params_list.append(env_param)
-
-            env.close()        
+                if check_grasp:
+                    env_settings_all.append(env_setting)
+                    env_params_list.append(env_param)
+                    break
+                if i == 99:
+                    print("Nut environment failed grasping!")
     else:
-        for i in range(val_trials):
+        for _ in range(val_trials):
             env = make_env(task_name, use_joint_control=True)
             env.reset()
 

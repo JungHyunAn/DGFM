@@ -161,12 +161,21 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
 
     # per-worker seeds for determinism
     np.random.seed(seed); random.seed(seed); torch.manual_seed(seed)
-
-    env = make_env(task_name)
+    setting, params = None, None
+    
     if task_name == "nut":
-        env.reset()
-        setting, params = _align_handle_to_nut(env)
+        for i in range(100):
+            env = make_env(task_name)
+            env.reset()
+            setting, params, check_grasp = _align_handle_to_nut(env)
+            env.close()
+            if check_grasp:
+                break
+            if i == 99:
+                print("Nut environment failed grasping!")
+
     else:
+        env = make_env(task_name)
         env.reset()
         setting = {
             "qpos":      env.sim.data.qpos.copy(),
@@ -175,8 +184,7 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
             "body_quat": env.sim.model.body_quat.copy(),
         }
         params = np.asarray(_get_environment_params(env, task_name), dtype=np.float32)  # (Dc,)
-    
-    env.close()
+        env.close()
     return idx, setting, params
         
 
