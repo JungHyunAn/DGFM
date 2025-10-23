@@ -435,7 +435,7 @@ def write_grid_video(
     Stitch multiple episode videos (lists of RGB frames) into a single grid video.
 
     Args:
-        episodes_frames: Outer list = episodes, inner list = frames (H×W×3 uint8).
+        episodes_frames: Outer list = episodes, inner list = frames (H*W*3).
         path: Output .mp4 file path.
         grid_shape: (rows, cols) layout of the grid.
         fps: Frames per second for the output video.
@@ -469,35 +469,6 @@ def write_grid_video(
         grid_frames.append(np.concatenate(rows_imgs, axis=0))
 
     imageio.mimsave(path, grid_frames, fps=fps)
-
-
-def _plan_linear(q0, q1, duration, hz):
-    """
-    Linear interpolation in joint space.
-    Returns:
-      t: (T,) timestamps in [0, duration]
-      q: (T, D) waypoints with q[0]=q0, q[-1]=q1
-    """
-    q0 = np.asarray(q0, dtype=float)
-    q1 = np.asarray(q1, dtype=float)
-    assert q0.shape == q1.shape, "q0 and q1 must have same shape"
-    D = q0.shape[0]
-
-    if duration <= 0 or hz <= 0:
-        # Degenerate: just return the target
-        return np.array([0.0]), np.asarray(q1, dtype=float).reshape(1, D)
-
-    # +1 to include both endpoints; ~1/hz spacing
-    T = max(int(np.round(duration * hz)) + 1, 2)
-    t = np.linspace(0.0, duration, T, endpoint=True)
-
-    alpha = (t / duration)[:, None]  # (T, 1)
-    q = (1.0 - alpha) * q0 + alpha * q1
-
-    # Numerical safety
-    q[0]  = q0
-    q[-1] = q1
-    return t, q
 
 
 # Wrapper for compute_smooth_trajectory_{gripper type}
@@ -545,92 +516,9 @@ def compute_smooth_trajectory(
             control_freq=control_freq/15,
             render_freq=control_freq/2,
             closure_steps=1,
-            closure_insertion=9 # changed!!
+            closure_insertion=9
         )
     
-    return q_high
-
-
-def compute_smooth_trajectory_with_q0(
-    env_r,
-    task_name,
-    q_keys: np.ndarray,
-    control_freq: int,
-    q0: np.ndarray,
-    approach_duration: float = 20.0,   # seconds; tweak as you like
-    pause_steps: int = 50,            # number of frames to pause at first key
-):
-    """
-    Prepend a linear interpolation from q0 -> q_keys[0] to the trajectory produced by
-    compute_smooth_trajectory(...). Uses joint-position lerp only.
-
-    Args:
-        env_r: robosuite env (passed through to compute_smooth_trajectory)
-        task_name: task selector for your internal logic
-        q_keys: (T_low, D) or (D,) key poses
-        control_freq: controller/sim stepping frequency (Hz)
-        q0: (D,) starting joint configuration
-        approach_duration: duration (s) for the initial linear segment
-
-    Returns:
-        q_high: (T_high, D) full trajectory starting from q0 and moving smoothly
-                into the first keyframe, then following the smoothed plan.
-    """
-    q_keys = np.asarray(q_keys, dtype=float)
-    q0     = np.asarray(q0,     dtype=float)
-
-    # Normalize shapes
-    if q_keys.ndim == 1:
-        q_keys = q_keys[None, :]  # (1, D)
-
-    # Basic shape checks
-    assert q0.ndim == 1, "q0 must be shape (D,)"
-    assert q_keys.ndim == 2, "q_keys must be shape (T, D) or (D,)"
-    D = q_keys.shape[1]
-    assert q0.shape[0] == D, f"Dim mismatch: q0 has {q0.shape[0]} dims, q_keys has {D}"
-
-    # If already at the first key pose, skip the approach
-    first_key = q_keys[0]
-    if np.allclose(q0, first_key, atol=1e-9, rtol=0.0) or (approach_duration <= 0):
-        return compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
-
-    # 1) Linear prefix from q0 -> q_keys[0]
-    #    We drop the last sample to avoid duplicating the first frame of the main segment.
-    t_app, Q_app = _plan_linear(q0, first_key, duration=float(approach_duration), hz=int(control_freq))
-    if Q_app.shape[0] > 1:
-        Q_prefix = Q_app[:-1]
-    else:
-        Q_prefix = Q_app  # degenerate (very short) case
-
-    # 2) Main segment (your existing builder)
-    Q_main = compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
-
-    if pause_steps > 0:
-        pause_block = np.repeat(first_key[None, :], pause_steps, axis=0)
-    else:
-        pause_block = np.empty((0, D), dtype=float)
-
-    if task_name in ["door", "two_arm"]:
-        gripper_ids = [
-            env_r.sim.model.get_joint_qpos_addr(joint_name)
-            for robot in env_r.robots
-            for gripper in robot.gripper.values()
-            for joint_name in gripper.joints
-        ]
-        Q_prefix[:, gripper_ids] = -1.0
-        pause_block[:, gripper_ids] = -1.0
-    elif task_name == "nut":
-        gripper_ids = [
-            env_r.sim.model.get_joint_qpos_addr(joint_name)
-            for robot in env_r.robots
-            for gripper in robot.gripper.values()
-            for joint_name in gripper.joints
-        ]
-        Q_prefix[:, gripper_ids] = 1.0
-        pause_block[:, gripper_ids] = 1.0
-
-    # Concatenate
-    q_high = np.vstack([Q_prefix, pause_block, Q_main])
     return q_high
 
 
@@ -726,8 +614,118 @@ def compute_smooth_trajectory_wipper(
     return q_high
 
 
+def _plan_linear(q0, q1, duration, hz):
+    """
+    Linear interpolation in joint space.
+    Returns:
+      t: (T,) timestamps in [0, duration]
+      q: (T, D) waypoints with q[0]=q0, q[-1]=q1
+    """
+    q0 = np.asarray(q0, dtype=float)
+    q1 = np.asarray(q1, dtype=float)
+    assert q0.shape == q1.shape, "q0 and q1 must have same shape"
+    D = q0.shape[0]
+
+    if duration <= 0 or hz <= 0:
+        # Degenerate: just return the target
+        return np.array([0.0]), np.asarray(q1, dtype=float).reshape(1, D)
+
+    # +1 to include both endpoints; ~1/hz spacing
+    T = max(int(np.round(duration * hz)) + 1, 2)
+    t = np.linspace(0.0, duration, T, endpoint=True)
+
+    alpha = (t / duration)[:, None]  # (T, 1)
+    q = (1.0 - alpha) * q0 + alpha * q1
+
+    # Numerical safety
+    q[0]  = q0
+    q[-1] = q1
+    return t, q
+def compute_smooth_trajectory_with_q0(
+    env_r,
+    task_name,
+    q_keys: np.ndarray,
+    control_freq: int,
+    q0: np.ndarray,
+    approach_duration: float = 20.0,   # seconds; tweak as you like
+    pause_steps: int = 50,            # number of frames to pause at first key
+):
+    """
+    Prepend a linear interpolation from q0 -> q_keys[0] to the trajectory produced by
+    compute_smooth_trajectory(...). Uses joint-position lerp only.
+
+    Args:
+        env_r: robosuite env (passed through to compute_smooth_trajectory)
+        task_name: task selector for your internal logic
+        q_keys: (T_low, D) or (D,) key poses
+        control_freq: controller/sim stepping frequency (Hz)
+        q0: (D,) starting joint configuration
+        approach_duration: duration (s) for the initial linear segment
+
+    Returns:
+        q_high: (T_high, D) full trajectory starting from q0 and moving smoothly
+                into the first keyframe, then following the smoothed plan.
+    """
+    q_keys = np.asarray(q_keys, dtype=float)
+    q0     = np.asarray(q0,     dtype=float)
+
+    # Normalize shapes
+    if q_keys.ndim == 1:
+        q_keys = q_keys[None, :]  # (1, D)
+
+    # Basic shape checks
+    assert q0.ndim == 1, "q0 must be shape (D,)"
+    assert q_keys.ndim == 2, "q_keys must be shape (T, D) or (D,)"
+    D = q_keys.shape[1]
+    assert q0.shape[0] == D, f"Dim mismatch: q0 has {q0.shape[0]} dims, q_keys has {D}"
+
+    # If already at the first key pose, skip the approach
+    first_key = q_keys[0]
+    if np.allclose(q0, first_key, atol=1e-9, rtol=0.0) or (approach_duration <= 0):
+        return compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
+
+    # 1) Linear prefix from q0 -> q_keys[0]
+    #    We drop the last sample to avoid duplicating the first frame of the main segment.
+    t_app, Q_app = _plan_linear(q0, first_key, duration=float(approach_duration), hz=int(control_freq))
+    if Q_app.shape[0] > 1:
+        Q_prefix = Q_app[:-1]
+    else:
+        Q_prefix = Q_app  # degenerate (very short) case
+
+    # 2) Main segment (your existing builder)
+    Q_main = compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
+
+    if pause_steps > 0:
+        pause_block = np.repeat(first_key[None, :], pause_steps, axis=0)
+    else:
+        pause_block = np.empty((0, D), dtype=float)
+
+    if task_name in ["door", "two_arm"]:
+        gripper_ids = [
+            env_r.sim.model.get_joint_qpos_addr(joint_name)
+            for robot in env_r.robots
+            for gripper in robot.gripper.values()
+            for joint_name in gripper.joints
+        ]
+        Q_prefix[:, gripper_ids] = -1.0
+        pause_block[:, gripper_ids] = -1.0
+    elif task_name == "nut":
+        gripper_ids = [
+            env_r.sim.model.get_joint_qpos_addr(joint_name)
+            for robot in env_r.robots
+            for gripper in robot.gripper.values()
+            for joint_name in gripper.joints
+        ]
+        Q_prefix[:, gripper_ids] = 1.0
+        pause_block[:, gripper_ids] = 1.0
+
+    # Concatenate
+    q_high = np.vstack([Q_prefix, pause_block, Q_main])
+    return q_high
+
+
 def _to_action_from_q(q, task_name):
-    """Match exactly the action packing you already use in env.step(...)."""
+    """Match exactly the action packing in env.step(...)."""
     if task_name in ["door", "nut"]:
         arm_q   = q[:7]
         grip_sc = float((q[7] + q[8]) / 2.0)   # your current compression
@@ -759,9 +757,11 @@ def render_trajectory(
         initial_pose: (dof,) joint configuration to reset the robot before replay.
         fps: Rendered video FPS (used only for consistency when saving later).
         camera_name: Name of the MuJoCo camera to render.
+        hold_init: For stability, hold for 100 steps before execution.
+        set_init: Force mujoco states (NOT IMPLEMENTED WELL)
 
     Returns:
-        frames: List of RGB images (H×W×3 uint8), one per step.
+        frames: List of RGB images (H*W*3), one per step.
 
     Notes:
         - Joint indices are resolved once, then we set `env.sim.data.qpos[joint_idx]`.
