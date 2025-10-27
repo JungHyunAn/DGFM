@@ -798,8 +798,22 @@ def _rollout_batch(
             env.step(_to_action_from_q(q, task_name))
 
         if env._check_success():
-            successes += 1
-            success_info.append({"traj": q_high, "setting": setting})
+            if task_name == "nut": # check grasp for two_arm
+                (g0, g1) = (
+                    (env.robots[0].gripper["right"], env.robots[0].gripper["left"])
+                    if env.env_configuration == "single-robot"
+                    else (env.robots[0].gripper, env.robots[1].gripper)
+                )
+
+                if env._check_grasp(gripper=g0, object_geoms=env.pot.handle0_geoms) and \
+                   env._check_grasp(gripper=g1, object_geoms=env.pot.handle1_geoms):
+                    successes += 1
+                    success_info.append({"traj": q_high, "setting": setting})
+                else:
+                    fail_info.append({"traj": q_high, "setting": setting})
+            else:
+                successes += 1
+                success_info.append({"traj": q_high, "setting": setting})
         else:
             fail_info.append({"traj": q_high, "setting": setting})
 

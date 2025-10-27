@@ -296,7 +296,8 @@ def train_and_eval_FM(
             cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
             cluster_size = max(int(N/5), cluster_d + 5)
         elif task_name == "two_arm":
-            cluster_d = seq_len * 6 + 3 # 150 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
+            # cluster_d = seq_len * 6 + 3 # 153 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
+            cluster_d = seq_len * 3 + 3 # 78
             cluster_size = max(int(N/5), cluster_d + 5)
         elif task_name == "nut":
             cluster_d = int(seq_len * 3.2)     # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
