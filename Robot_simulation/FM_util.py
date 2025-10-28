@@ -798,7 +798,7 @@ def _rollout_batch(
             env.step(_to_action_from_q(q, task_name))
 
         if env._check_success():
-            if task_name == "nut": # check grasp for two_arm
+            if task_name == "two_arm": # check grasp for two_arm
                 (g0, g1) = (
                     (env.robots[0].gripper["right"], env.robots[0].gripper["left"])
                     if env.env_configuration == "single-robot"
