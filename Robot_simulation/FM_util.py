@@ -799,14 +799,10 @@ def _rollout_batch(
 
         if env._check_success():
             if task_name == "two_arm": # check grasp for two_arm
-                (g0, g1) = (
-                    (env.robots[0].gripper["right"], env.robots[0].gripper["left"])
-                    if env.env_configuration == "single-robot"
-                    else (env.robots[0].gripper, env.robots[1].gripper)
-                )
+                z0 = env._handle0_xpos[2]
+                z1 = env._handle1_xpos[2]
 
-                if env._check_grasp(gripper=g0, object_geoms=env.pot.handle0_geoms) and \
-                   env._check_grasp(gripper=g1, object_geoms=env.pot.handle1_geoms):
+                if abs(z1 - z0) < 0.05:
                     successes += 1
                     success_info.append({"traj": q_high, "setting": setting})
                 else:

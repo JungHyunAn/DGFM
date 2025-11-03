@@ -516,7 +516,7 @@ def compute_smooth_trajectory(
             control_freq=control_freq/15,
             render_freq=control_freq/2,
             closure_steps=1,
-            closure_insertion=9
+            closure_insertion=12 # new insertion
         )
     
     return q_high

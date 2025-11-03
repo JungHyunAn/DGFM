@@ -147,11 +147,11 @@ KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
                                    (105, 110, 1), # approaching
                                    (110, 115, 1), # approaching
                                    (115, 120, 1), # approaching
-                                   (120, 123, 1), # approaching                            
-                                   (123, 126, 1), # approaching                            
-                                   (126, 130, 1), # approaching      
+                                   (120, 123, 2), # approaching                            
+                                   (123, 126, 2), # approaching                            
+                                   (126, 130, 2), # approaching      
                                    (130, 133, 2), # hovering on handles
-                                   (140, -1, 16)],# lifting
+                                   (140, -1, 13)],# lifting
 
                       "nut"     : [(130, 140, 2), # carrying to peg end
                                    (140, 150, 2), # carrying to peg end
