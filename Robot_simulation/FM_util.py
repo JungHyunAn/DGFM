@@ -542,12 +542,22 @@ def run_flow(model, x, c, device, n_steps=1000):
         output x with same size as input x
     """
     dt = 1.0 / n_steps
+
+    # reusable buffers
+    t = torch.empty((x.shape[0], 1), device=device, dtype=x.dtype)
+    x_mid = torch.empty_like(x)
+
     for i in range(n_steps):
-        t  = torch.full((x.shape[0], 1), i*dt, device=device)
-        v1 = model(x, t, c)
-        x_mid = x + v1 * dt
-        v2 = model(x_mid, t + dt, c)
-        x  = x + 0.5 * (v1 + v2) * dt  # Heun (RK2)
+        t.fill_(i * dt)
+
+        v = model(x, t, c)
+        torch.add(x, v, alpha=dt, out=x_mid)
+        x.add_(v, alpha=0.5 * dt)
+        
+        t.add_(dt)
+        v = model(x_mid, t, c)
+        x.add_(v, alpha=0.5 * dt)
+
     return x
 
 
