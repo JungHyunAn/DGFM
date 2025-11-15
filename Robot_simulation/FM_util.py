@@ -875,9 +875,7 @@ def eval_model(
       2) Parent runs ONE GPU forward (optionally chunked) to get all q_low.
       3) Workers restore envs, upsample, and roll out on CPU (no GPU in workers).
     """
-    rng = np.random.RandomState(base_seed)
-    torch.manual_seed(base_seed)
-    random.seed(base_seed)
+    np_rng = np.random.RandomState(base_seed)
 
     # ---- (2) One GPU forward (optionally chunked) to produce all q_low ----
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
@@ -891,7 +889,7 @@ def eval_model(
 
     if gpu_chunk_size is None or gpu_chunk_size <= 0:
         # single shot (ensure it fits!)
-        x0 = torch.from_numpy(rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
+        x0 = torch.from_numpy(np_rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
         c  = torch.from_numpy(val_params).to(device)
         if use_cuda:
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
@@ -908,7 +906,7 @@ def eval_model(
         for s in range(0, N, gpu_chunk_size):
             e = min(N, s + gpu_chunk_size)
             bs = e - s
-            x0 = torch.from_numpy(rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
+            x0 = torch.from_numpy(np_rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
             c  = torch.from_numpy(val_params[s:e]).to(device)
             if use_cuda:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
