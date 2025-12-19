@@ -99,7 +99,7 @@ class FiLM(nn.Module):
     Applies a per-channel affine transform conditioned on a context vector.
 
     Args:
-    in_channels: Number of channels in the feature map to be modulated.
+    in_channels: Number of channels in the feature map to be modulated. (C)
     condition_dim: Dimensionality of the conditioning vector.
 
     Forward Args:
@@ -1022,7 +1022,7 @@ def _standardize_cols(A, eps=1e-8):
         A_std: Standardized array with zero mean / unit variance per column.
         stats: Tuple (mean[1,D], std[1,D]) used for the transform.
     """
-    mu = A.mean(axis=0, keepdims=True)
+    mu = A.mean(axis=0, keepdims=True) # (D, )
     sd = A.std(axis=0, keepdims=True)
     sd = np.where(sd < eps, 1.0, sd)
     return (A - mu) / sd, (mu, sd)
@@ -1333,7 +1333,7 @@ def train_uniform_FM(
     val_period=5,
     early_stopping=True,
     stop_criteria=3,
-    val_trials=100,
+    val_trials=25,
 ):
     """Train vanilla Flow Matching with uniform `t`.
 
@@ -1417,7 +1417,7 @@ def train_uniform_FM(
             scheduler.step()
 
             if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device)                
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)                
                 success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                 if success_rate < best_success_rate:
                     tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
@@ -1462,7 +1462,7 @@ def train_shifted_FM(
     stop_criteria=3,
     beta_a = 1.5,
     beta_b = 1,
-    val_trials =100,
+    val_trials =25,
 ):
     """Train Flow Matching with Beta-biased time sampling ("Shifted FM").
 
@@ -1531,7 +1531,7 @@ def train_shifted_FM(
             scheduler.step()
 
             if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device)
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
                 
                 if not torch.is_grad_enabled():
                     torch.set_grad_enabled(True)
@@ -1571,7 +1571,7 @@ def train_DGFM(
     dof,
     param_len,
     gripper_idx,
-    mf,                   # global multiplier (how many synthetic global batches)
+    mf,                   # global augmentation ratio (multiplication factor)
     n_t_local,
     n_t_global,
     cluster_size,
@@ -1584,7 +1584,7 @@ def train_DGFM(
     stop_criteria=3,
     scale_x=1.0,
     scale_c=1.0,
-    val_trials=100,
+    val_trials=25,
 ):
     """Train Dimension-Guided Flow Matching (DGFM, conditional).
 
@@ -1662,7 +1662,7 @@ def train_DGFM(
         for epoch in tqdm(range(1, max_epochs + 1), desc=f"DGFM_mf{mf} Training", unit="epoch"):
             model.train()
 
-            # ===== Global FM: t ∈ [0, 0.5] (scale factor 2) =====
+            # ===== Global FM: t ∈ [0, 0.5] (scale factor mf) =====
             g_loss_sum = 0.0
             for i in range(0, global_N, batch_size):
                 m = min(batch_size, global_N - i)
@@ -1743,7 +1743,7 @@ def train_DGFM(
             # ===== Validation / early stopping =====
             if epoch % val_period == 0:
                 model.eval()
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device)
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
                 
                 if not torch.is_grad_enabled():
                     torch.set_grad_enabled(True)
