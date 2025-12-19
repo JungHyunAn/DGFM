@@ -13,3 +13,12 @@ The core idea of DGFM is to incorporate **explicit dimensional guidance through 
   Robot simulation experiments evaluating DGFM on manipulation tasks in physics-based environments, including trajectory generation and quantitative rollouts.
 
 Each subdirectory includes its own README with detailed instructions for running experiments and reproducing results.
+
+## Environment setup
+
+Create and activate a Conda environment named `DGFM` with Python 3.13.5, then install the required dependencies:
+
+```bash
+conda create -n DGFM python=3.13.5
+conda activate DGFM
+pip install -r requirements.txt
