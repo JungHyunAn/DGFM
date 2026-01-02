@@ -25,7 +25,7 @@ case "$TASK_NAME" in
     N_LIST=(1000 500 250)
     ;;
   nut)
-    DATASET_PATH="Robot_simulation/heuristic_dataset/nut_dataset_20000.hdf5"
+    DATASET_PATH="Robot_simulation/heuristic_dataset/nut_dataset_20002.hdf5"
     RESULTS_PATH="Robot_simulation/eval_results/nut"
     N_LIST=(1000 500 250)
     ;;

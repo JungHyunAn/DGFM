@@ -151,7 +151,8 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
-def _spawn_env_once(task_name: str, seed: int, idx: int):
+def _spawn_env_once(task_name: str, seed: int, idx: int,
+                    use_vision: bool = False, camera_name: str = "frontview"):
     # keep workers single-threaded & headless
     os.environ.setdefault("OMP_NUM_THREADS", "1")
     os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -161,14 +162,17 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
 
     # per-worker seeds for determinism
     np.random.seed(seed); random.seed(seed); torch.manual_seed(seed)
-    setting, params = None, None
+    setting, params, vision = None, None, None
     
     if task_name == "nut":
         for i in range(100):
-            env = make_env(task_name)
+            env = make_env(task_name, has_offscreen_renderer=use_vision)
             env.reset()
-            setting, params, check_grasp = _align_handle_to_nut(env)
+
+            setting, params, check_grasp, vision = _align_handle_to_nut(env, use_vision=use_vision, camera_name=camera_name)
+            
             env.close()
+            
             if check_grasp:
                 break
             if i == 99:
@@ -177,6 +181,7 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
     else:
         env = make_env(task_name)
         env.reset()
+
         setting = {
             "qpos":      env.sim.data.qpos.copy(),
             "qvel":      env.sim.data.qvel.copy(),
@@ -184,8 +189,14 @@ def _spawn_env_once(task_name: str, seed: int, idx: int):
             "body_quat": env.sim.model.body_quat.copy(),
         }
         params = np.asarray(_get_environment_params(env, task_name), dtype=np.float32)  # (Dc,)
+        if (use_vision):
+            vision = env.sim.render(640, 480, camera_name=camera_name)
+        else:
+            vision = None
+
         env.close()
-    return idx, setting, params
+
+    return idx, setting, params, vision
         
 
 def train_and_eval_FM(
@@ -259,6 +270,7 @@ def train_and_eval_FM(
         gripper_idx = [7, 8, 16, 17]      
 
     # define models
+    print("parameter length: ", param_len)
     model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-6)
     scheduler = get_cosine_schedule_with_warmup(
@@ -300,8 +312,8 @@ def train_and_eval_FM(
             cluster_d = seq_len * 3 + 3 # 78
             cluster_size = max(int(N/5), cluster_d + 5)
         elif task_name == "nut":
-            cluster_d = int(seq_len * 3.2)     # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
-                                               #     for the rest 0.6 portion, end effector stays on 1=dimension path
+            cluster_d = int(seq_len * 3.2)  # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
+                                            #      for the rest 0.6 portion, end effector stays on 1=dimension path
             cluster_size = max(int(N/5), cluster_d + 5)
         else:
             cluster_d = None
@@ -347,7 +359,7 @@ def train_and_eval_FM(
     with ProcessPoolExecutor(max_workers=ENV_WORKERS, mp_context=ctx) as ex:
         futs = [ex.submit(_spawn_env_once, task_name, seed + i, i) for i in range(evaluation_samples)]
         for fut in as_completed(futs):
-            idx, setting, params = fut.result()
+            idx, setting, params, _ = fut.result() # vision not used for training+evaluation
             env_settings_all[idx] = setting
             env_params_list[idx]  = params
 

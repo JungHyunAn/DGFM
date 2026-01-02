@@ -9,7 +9,6 @@ from Robot_simulation.heuristics_util import step_towards
 
 def generate_nut_trajectory(
     env,
-    delta_x: float = 0.05,
     delta_z: float = 0.1,
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
@@ -62,12 +61,29 @@ def generate_nut_trajectory(
 
     # ---------- reset & joint indices ----------
     env.reset()
-    # shift the pegs closer to the robot (delta_x) & upward with the table (delta_z)
-    for peg_body in (env.peg1_body_id, env.peg2_body_id):        
-        env.sim.model.body_pos[peg_body][0] -= delta_x
-        env.sim.data.body_xpos[peg_body][0] -= delta_x
-        env.sim.model.body_pos[peg_body][2] += delta_z
-        env.sim.data.body_xpos[peg_body][2] += delta_z
+
+    # randomize peg x and y coordinates & shift upward with the table (delta_z)
+    """
+    delta_x_range = [-0.015, 0.015]
+    delta_y_range = [-0.015, 0.015]
+    delta_x = np.random.uniform(delta_x_range[0], delta_x_range[1])
+    delta_y = np.random.uniform(delta_y_range[0], delta_y_range[1])
+    """
+
+    # fixed peg position for now
+    delta_x = -0.05
+    delta_y = 0
+
+    env.sim.model.body_pos[env.peg1_body_id][0] += delta_x
+    env.sim.data.body_xpos[env.peg1_body_id][0] += delta_x
+    env.sim.model.body_pos[env.peg1_body_id][1] += delta_y
+    env.sim.data.body_xpos[env.peg1_body_id][1] += delta_y
+    env.sim.model.body_pos[env.peg1_body_id][2] += delta_z
+    env.sim.data.body_xpos[env.peg1_body_id][2] += delta_z
+
+    env.sim.model.body_pos[env.peg2_body_id][2] = 0
+    env.sim.data.body_xpos[env.peg2_body_id][2] = 0
+
     robot = env.robots[0]
     # arm+gripper
     arm_joints  = robot.robot_model.joints
@@ -95,6 +111,8 @@ def generate_nut_trajectory(
     nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
 
     peg_pos = env.sim.data.body_xpos[peg_id].copy()
+    # print(peg_id, peg_pos)
+    # print(env.peg2_body_id, env.sim.data.body_xpos[3])
 
     R0       = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
     quat0    = mat2quat(R0)
@@ -130,6 +148,7 @@ def generate_nut_trajectory(
         "body_quat":env.sim.model.body_quat.copy(),
     }
     yaw = np.arctan2(R0[1,0], R0[0,0])
+    # environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1]) # for peg variation
     environment_parameters = (nut_pos[0], nut_pos[1], yaw)
 
     # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
@@ -225,7 +244,6 @@ if __name__ == "__main__":
         render_camera=None,   # not used when offscreen
         control_freq=20,
     )
-    delta_x = 0.05 
     delta_z = 0.1
     
     env.table_offset[2] += delta_z
@@ -233,7 +251,6 @@ if __name__ == "__main__":
     
     traj, success, _, init_qpos, env_state, env_param = generate_nut_trajectory(
         env,
-        delta_x,
         delta_z,
         render=True,
         video_folder="Robot_simulation/videos",

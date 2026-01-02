@@ -273,8 +273,16 @@ class VectorField(nn.Module):
             nn.Linear(32, 32)
         )
 
+        # additional encoding if needed
+        """
+        self.param_embed = nn.Sequential(
+            nn.Linear(param_len, 16), nn.ReLU(),
+            nn.Linear(16, 16)
+        )
+        """
+
         # Condition dimension = param_len + time embedding dim
-        condition_dim = param_len + 32
+        condition_dim = 32 + param_len
 
         # 1D U-Net for sequence modeling
         self.unet = UNet1D(dof=len(arm_idx), condition_dim=condition_dim)
@@ -304,9 +312,11 @@ class VectorField(nn.Module):
 
         # Encode timestep
         t_embed = self.time_embed(t)
+        # p_embed = self.param_embed(env_params_norm) # in cased of additional encoding
+        p_embed = env_params_norm # without environment parameter encoding
 
         # Create conditioning vector
-        condition = torch.cat([env_params_norm, t_embed], dim=-1)  # (B, cond_dim)
+        condition = torch.cat([p_embed, t_embed], dim=-1)  # (B, cond_dim)
 
         # ------ select arm channels only ------
         # (B, seq_len, n_arm) -> (B, n_arm, seq_len) for Conv1d
@@ -585,7 +595,7 @@ def _get_environment_params(
     """
     assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
     if task_name == "door":
-        handle_id = env.door_handle_site_id
+        handle_id  = env.door_handle_site_id
         handle_pos = env._handle_xpos.copy()
         R_handle   = env.sim.data.site_xmat[handle_id].reshape(3,3)
         yaw = np.arctan2(R_handle[1,0], R_handle[0,0])
@@ -608,7 +618,10 @@ def _get_environment_params(
         nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
         R0 = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
         yaw = np.arctan2(R0[1,0], R0[0,0])
-        environment_parameters = (nut_pos[0], nut_pos[1], yaw)
+
+        peg_id  = env.peg1_body_id
+        peg_pos = env.sim.data.body_xpos[peg_id].copy()
+        environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1])
 
     return environment_parameters
 
@@ -640,15 +653,34 @@ def _to_action_from_q(q, task_name):
         return np.concatenate([arm1, [grip1], arm2, [grip2]])
 
 
-def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
+def _align_handle_to_nut(env, 
+                         delta_x: float = 0.05, delta_z: float = 0.1, 
+                         use_vision: bool = False, camera_name: str = "frontview"):
     def record_q(): # helper for recording, empty
         return
 
-    for peg_body in (env.peg1_body_id, env.peg2_body_id):        
-        env.sim.model.body_pos[peg_body][0] -= delta_x
-        env.sim.data.body_xpos[peg_body][0] -= delta_x
-        env.sim.model.body_pos[peg_body][2] += delta_z
-        env.sim.data.body_xpos[peg_body][2] += delta_z
+    # randomize peg x and y coordinates & shift upward with the table (delta_z)
+    """
+    delta_x_range = [-0.015, 0.015]
+    delta_y_range = [-0.015, 0.015]
+    delta_x = np.random.uniform(delta_x_range[0], delta_x_range[1])
+    delta_y = np.random.uniform(delta_y_range[0], delta_y_range[1])
+    """
+
+    # fixed peg position for now
+    delta_x = -delta_x
+    delta_y = 0
+    
+    env.sim.model.body_pos[env.peg1_body_id][0] += delta_x
+    env.sim.data.body_xpos[env.peg1_body_id][0] += delta_x
+    env.sim.model.body_pos[env.peg1_body_id][1] += delta_y
+    env.sim.data.body_xpos[env.peg1_body_id][1] += delta_y
+    env.sim.model.body_pos[env.peg1_body_id][2] += delta_z
+    env.sim.data.body_xpos[env.peg1_body_id][2] += delta_z
+
+    env.sim.model.body_pos[env.peg2_body_id][2] = 0
+    env.sim.data.body_xpos[env.peg2_body_id][2] = 0
+    
     robot = env.robots[0]
     # arm+gripper
     arm_joints  = robot.robot_model.joints
@@ -716,7 +748,12 @@ def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
         "mocap_quat": env.sim.data.mocap_quat.copy()
     }
     yaw = np.arctan2(R0[1,0], R0[0,0])
+    # environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1]) # for peg variation
     environment_parameters = (nut_pos[0], nut_pos[1], yaw)
+    if (use_vision):
+        vision = env.sim.render(640, 480, camera_name=camera_name)
+    else:
+        vision = None
 
     # ---------- PHASE3: 20‑step lift to check grasp ----------
     check_grasp = False
@@ -728,7 +765,7 @@ def _align_handle_to_nut(env, delta_x: float = 0.05, delta_z: float = 0.1):
     if (env.sim.data.site_xpos[nut_handle_id][2] > nut_pos[2] + 0.02):
         check_grasp = True
 
-    return environment_setting, environment_parameters, check_grasp
+    return environment_setting, environment_parameters, check_grasp, vision
 def _generate_val_env(task_name, val_trials):
     env_params_list: List[np.ndarray] = []
     env_settings_all: List[dict] = []

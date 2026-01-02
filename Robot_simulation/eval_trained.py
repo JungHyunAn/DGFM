@@ -3,6 +3,11 @@ import torch
 import numpy as np
 from Robot_simulation.FM_util import VectorField, run_flow, compute_smooth_trajectory, _get_environment_params
 from Robot_simulation.heuristics_util import make_env, write_grid_video, render_trajectory
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
+
+from Robot_simulation.FM_util import eval_model
+from Robot_simulation.run_eval import _spawn_env_once
 
 
 def run_trained(
@@ -14,6 +19,10 @@ def run_trained(
     param_len: int,
     device: torch.device,
     render_dir: str,
+    evaluation_samples: int = 100,
+    use_vision: bool = False,
+    vision_encoder_path: str = None,
+    vision_encoder_class = None,
     video_name: str = "run",
     seed: int = 42,
 ):
@@ -32,56 +41,101 @@ def run_trained(
         video_name: Filename (without extension) for the rendered video.
         seed: Random seed for reproducibility.
     """
+    if (use_vision):
+        print("evaluating model ", model_pt_path, f" with {evaluation_samples} samples, vision encoder is used\n")
+    else:
+        print("evaluating model ", model_pt_path, f" with {evaluation_samples} samples, vision encoder isn't used\n")
+    
     # 1) Load model
     model = model_class(seq_len, dof, param_len).to(device)
     state = torch.load(model_pt_path, map_location=device)
     model.load_state_dict(state)
     model.eval()
 
+    if use_vision:
+        vision_encoder = vision_encoder_class.to(device)
+        vision_encoder_state = torch.load(vision_encoder_path, map_location=device)
+        vision_encoder.load_state_dict(vision_encoder_state)
+        vision_encoder.eval()
+
     # 2) Set random seed
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # 3) Create environment with renderer
-    env = make_env(
-        task_name,
-        has_offscreen_renderer=True,
-        use_camera_obs=False,
-        use_joint_control=True
+    # 3) Parallel ENV generation 
+    # obtain gripper indexes
+    gripper_idx = None
+    if task_name in ["door", "nut"]:
+        gripper_idx = [7, 8]
+    elif task_name == "two_arm":
+        gripper_idx = [7, 8, 16, 17]      
+
+    env_params_list: list[np.ndarray] = [None] * evaluation_samples
+    env_settings_all: list[dict]      = [None] * evaluation_samples
+    env_vision_list: list[np.ndarray] = [None] * evaluation_samples
+
+    # choose worker count (env creation is CPU-bound)
+    ENV_WORKERS = min(
+        evaluation_samples,
+        max(1, (os.cpu_count() or 4) - 2),
+        int(os.getenv("EVAL_ENV_WORKERS", "10"))
     )
 
-    # 4) Capture environment parameters
-    env_param = _get_environment_params(env, task_name)
-    env_param = torch.tensor(env_param, dtype=torch.float32, device=device).unsqueeze(0)
+    ctx = get_context("spawn")  # safe with MuJoCo/OpenGL
+    with ProcessPoolExecutor(max_workers=ENV_WORKERS, mp_context=ctx) as ex:
+        futs = [ex.submit(_spawn_env_once, task_name, seed + i, i) for i in range(evaluation_samples)]
+        for fut in as_completed(futs):
+            idx, setting, params, vision = fut.result()
+            env_settings_all[idx] = setting
+            env_params_list[idx]  = params
+            env_vision_list[idx]  = vision
 
-    # 5) Sample and run flow to generate low-frequency trajectory
-    x0 = torch.randn(1, seq_len, dof, device=device)
-    with torch.no_grad():
-        q_low = run_flow(model, x0, env_param, device)
-    q_low = q_low.cpu().numpy()[0]
+    # stack to (N, Dc) float32 (order matches idx)
+    eval_params = np.asarray(env_params_list, dtype=np.float32)
 
-    # 6) Upsample to high-frequency trajectory
-    q_high = compute_smooth_trajectory(env, task_name, q_low, env.control_freq)
-    print(q_high)
+    if (use_vision):
+        eval_visions = np.asarray(env_vision_list, dtype=np.float32)
+        v = torch.from_numpy(eval_visions)
 
-    # 7) Render trajectory frames
-    # First argument: environment, second: task name, third: trajectory, fourth: initial pose, fifth: camera
-    frames = render_trajectory(
-        env,
-        task_name,
-        q_high,
-        q_high[0, :],
-        camera_name="frontview"
-    )
+        # If data is NHWC, convert to NCHW (common for PyTorch encoders).
+        if v.ndim == 4 and v.shape[-1] in (1, 3, 4):  # NHWC
+            v = v.permute(0, 3, 1, 2).contiguous()
+        v = v.to(device, non_blocking=True)
 
-    # 8) Write video (single cell grid)
-    os.makedirs(render_dir, exist_ok=True)
-    out_path = os.path.join(render_dir, f"{task_name}_{video_name}_rendered.mp4")
-    write_grid_video([frames], out_path, grid_shape=(1, 1))
-    print(f"[Saved rendered video to {out_path}]")
+        VISION_BS = int(os.getenv("EVAL_VISION_BS", "64"))
+        outs = []
+        with torch.no_grad():
+            for s in range(0, v.shape[0], VISION_BS):
+                vb = v[s : s + VISION_BS]
+                z = vision_encoder(vb)   # z: (B, D) or similar
+                # If encoder returns a tuple/dict, adapt here.
+                if isinstance(z, (tuple, list)):
+                    z = z[0]
+                outs.append(z.detach().cpu())
 
-    env.close()
-    return out_path
+        eval_params = torch.cat(outs, dim=0).numpy().astype(np.float32) # overwrite eval_params to vision-based conditions
+
+    # 4) Run evaluation 
+    render_dir = render_dir + '/' + model_pt_path[-20:-1]
+    success_rate_best, avg_reward_best = eval_model(model=model,
+                                                model_class=model_class,
+                                                task_name=task_name,
+                                                seq_len=seq_len,
+                                                dof=dof,
+                                                param_len=param_len,
+                                                gripper_idx=gripper_idx,
+                                                render_dir=render_dir,
+                                                video_name=video_name,
+                                                val_params=eval_params,
+                                                env_settings_all=env_settings_all,
+                                                device=device,
+                                                trials=evaluation_samples,
+                                                render_width=4,
+                                                render_num=8,
+                                                base_seed=seed)
+    print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
+
+    return
 
 
 if __name__ == "__main__":
@@ -97,11 +151,15 @@ if __name__ == "__main__":
                         help="Degrees of freedom of the robot")
     parser.add_argument("--param_len", type=int, required=True,
                         help="Length of environment parameter vector")
-    parser.add_argument("--render_dir", type=str, default="./renders",
+    parser.add_argument("--render_dir", type=str, default="./render_trained",
                         help="Directory to save rendered videos")
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run the model on, e.g., 'cpu' or 'cuda'")
-    parser.add_argument("--seed", type=int, default=42,
+    parser.add_argument("--eval_samples", type=int, default=100)
+    parser.add_argument("--use_vision", action="store_true")
+    parser.add_argument("--vision_encoder_path", type=str, default=None)
+    parser.add_argument("--vision_encoder_class", type=str, default=None)
+    parser.add_argument("--seed", type=int, default=1000,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
 
@@ -121,6 +179,9 @@ if __name__ == "__main__":
         param_len=args.param_len,
         device=device,
         render_dir=args.render_dir,
-        video_name="single",
+        evaluation_samples=args.eval_samples,
+        use_vision=args.use_vision,
+        vision_encoder_path=args.vision_encoder_path,
+        vision_encoder_class=args.vision_encoder_class,
         seed=args.seed
     )
