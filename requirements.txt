@@ -1,10 +1,4 @@
 # DGFM (Dimension-Guided Flow Matching) — requirements.txt
-# Python 3.10–3.12 recommended.
-# Install PyTorch first (CPU or a CUDA build matching your system) from https://pytorch.org/get-started/ ,
-# THEN run: pip install -r requirements.txt
-#
-# Explicitly excludes rlkit and torchrl per project needs.
-
 # --- Core compute ---
 torch>=2.3,<2.8          # install the right CUDA/CPU wheel yourself first
 numpy>=1.26,<3.0
