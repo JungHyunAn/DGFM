@@ -1,3 +1,4 @@
+import os
 import time
 import random
 import numpy as np
@@ -19,14 +20,16 @@ from Synthetic_data.FM_utils import VectorField, \
                                     train_uniform_FM, \
                                     train_shifted_FM, \
                                     train_dgfm, \
+                                    train_gfm,  \
+                                    train_lfm,  \
                                     run_flow
 
-NUM_WORKERS = 5  # Number of parallel workers for training DGFM
+NUM_WORKERS = 1  # Number of parallel workers for training DGFM
 
 
 def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
                   total_n_t, global_n_t, local_n_t, max_epochs, batch_size, early_stopping,
-                  mf_list, test_size, device):
+                  mf_list, test_size, device, noise_std=1e-4):
     """
     Runs one trial of both Vanilla FM and DGFM (for each mf in mf_list)
     on sample size n, returns a dict mapping method names to their
@@ -38,17 +41,17 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     np.random.seed(seed)
 
     if dist_name == "Normal":
-        dist = NormalDistribution(ambient_dim, device)
+        dist = NormalDistribution(ambient_dim, device, noise_std=noise_std)
     elif dist_name == "Quadratic_Uniform":
-        dist = Quadratic_Uniform(ambient_dim, device, latent_dim)
+        dist = Quadratic_Uniform(ambient_dim, device, latent_dim, noise_std=noise_std)
     elif dist_name == "Quadratic_Unimodal":
-        dist = Quadratic_Unimodal(ambient_dim, device, latent_dim)
+        dist = Quadratic_Unimodal(ambient_dim, device, latent_dim, noise_std=noise_std)
     elif dist_name == "Quadratic_Multimodal":
-        dist = Quadratic_Multimodal(ambient_dim, device, latent_dim)
+        dist = Quadratic_Multimodal(ambient_dim, device, latent_dim, noise_std=noise_std)
     elif dist_name == "Linear_Branched":
-        dist = Linear_Branched(ambient_dim, device, latent_dim)
+        dist = Linear_Branched(ambient_dim, device, latent_dim, noise_std=noise_std)
     elif dist_name == "SwissRoll":
-        dist = SwissRoll(ambient_dim, device, latent_dim)
+        dist = SwissRoll(ambient_dim, device, latent_dim, noise_std=noise_std)
     else:
         raise ValueError(f"Unknown distribution: {dist_name}")
     
@@ -123,7 +126,8 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     trial_results["ShiftedFM"] = recs_shiftedFM
 
 
-    # ----- DGFM (one entry per mf) -----
+    cluster_size = int(n/5)
+    # 5) train DGFM (one entry per mf)
     for mf in mf_list:
         key_dg    = f"DGFM-{mf}"
         model_dg  = VectorField(ambient_dim).to(device)
@@ -141,7 +145,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
             n_t_local=local_n_t,
             epochs=max_epochs,
             batch_size=batch_size,
-            cluster_size=int(n/20),
+            cluster_size=cluster_size,
             cluster_d=latent_dim,
             early_stopping=early_stopping
         )
@@ -161,6 +165,77 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         })
 
         trial_results[key_dg] = recs_dg
+
+    # 6) train GFM only
+    model_GFM       = VectorField(ambient_dim).to(device)
+    opt_GFM         = optim.Adam(model_shifted.parameters(), lr=1e-3)
+    time_GFM        = 0.0
+    mixture_sampler = None
+
+    t0 = time.thread_time()
+    mixture_sampler, epoch, _, recs_GFM, best_model_GFM = train_gfm(
+        model_GFM, opt_GFM, X_train,
+        ambient_dim, device,
+        mixture_sampler=mixture_sampler,
+        n_t_global=global_n_t,
+        epochs=max_epochs,
+        batch_size=batch_size,
+        cluster_size=cluster_size,
+        cluster_d=latent_dim,
+        early_stopping=early_stopping
+    )
+    time_GFM += time.thread_time() - t0
+
+    # eval
+    X0   = np.random.randn(test_size, ambient_dim)
+    Xgen = run_flow(best_model_GFM, X0, device)
+    w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
+    geo  = dist.geometric_alignment(Xgen)
+
+    recs_GFM.append({
+        "final_epoch": epoch,
+        "train_time": time_GFM,
+        "eval_wasserstein2": w2,
+        "eval_geometric_alignment": geo
+    })
+
+    trial_results["GFM"] = recs_GFM
+
+    # 7) train LFM only
+    model_LFM       = VectorField(ambient_dim).to(device)
+    opt_LFM         = optim.Adam(model_shifted.parameters(), lr=1e-3)
+    time_LFM        = 0.0
+    mixture_sampler = None
+
+    t0 = time.thread_time()
+    mixture_sampler, epoch, _, recs_LFM, best_model_LFM = train_lfm(
+        model_LFM, opt_LFM, X_train,
+        ambient_dim, device,
+        mixture_sampler=mixture_sampler,
+        n_t_local=local_n_t,
+        epochs=max_epochs,
+        batch_size=batch_size,
+        cluster_size=cluster_size,
+        cluster_d=latent_dim,
+        early_stopping=early_stopping
+    )
+    time_LFM += time.thread_time() - t0
+
+    # eval
+    X0, _ = mixture_sampler.truncated_sample(test_size)
+    Xgen  = run_flow(best_model_LFM, X0, device)
+    w2    = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
+    geo   = dist.geometric_alignment(Xgen)
+
+    recs_LFM.append({
+        "final_epoch": epoch,
+        "train_time": time_LFM,
+        "eval_wasserstein2": w2,
+        "eval_geometric_alignment": geo
+    })
+
+    trial_results["LFM"] = recs_LFM
+
 
     return trial_idx, trial_results
 
@@ -187,20 +262,22 @@ if (__name__ == "__main__"):
     seed = int(input("Input the seed (default 1000): ") or 1000)
 
     # 2) experiment setup
-    ambient_dim   = int(input("Ambient dimension (default 40): ") or 40)
-    latent_dim    = int(input("Latent dimension (default 10): ") or 10)
-    total_epochs  = int(input("Maximum number of epochs (default 100): ") or 100)
-    batch_size    = int(input("Minimum Batch size (default 100): ") or 100)
-    batch_num     = int(input("Number of batches per epoch (default 10): ") or 10)
+    ambient_dim    = int(input("Ambient dimension (default 40): ") or 40)
+    latent_dim     = int(input("Latent dimension (default 10): ") or 10)
+    total_epochs   = int(input("Maximum number of epochs (default 100): ") or 100)
+    batch_size     = int(input("Minimum Batch size (default 100): ") or 100)
+    batch_num      = int(input("Number of batches per epoch (default 10): ") or 10)
     beta_a, beta_b = list(map(float,
                         (input("Beta parameters for shifted FM (comma separated, default 1.5,1): ")
                         .strip() or "1.5,1").split(",")))
-    mf_list       = list(map(int,
+    mf_list        = list(map(int,
                         (input("DGFM multiplier for global FM (comma separated, default 2,4): ")
                         .strip() or "2,4").split(",")))
-    total_n_t     = int(input("Number of timesteps per sample for vanilla FM (default 4): ") or 4)
-    global_n_t     = int(input("Number of timesteps per sample for DGFM global FM (default 4): ") or 4)
-    local_n_t     = int(input("Number of timesteps per sample for DGFM local FM (default 4): ") or 4)
+    total_n_t      = int(input("Number of timesteps per sample for vanilla FM (default 1): ") or 1)
+    global_n_t     = int(input("Number of timesteps per sample for DGFM global FM (default 1): ") or 1)
+    local_n_t      = int(input("Number of timesteps per sample for DGFM local FM (default 1): ") or 1)
+    noise_std      = float(input("Noise level of distribution (default 1e-4): ") or 1e-4)
+
     early_stopping = input("Use early stopping if validation loss doesn't improve for three epochs? (y/n, default y): ").strip().lower() != 'n'
 
     # 3) pick distribution
@@ -246,7 +323,7 @@ if (__name__ == "__main__"):
                     ambient_dim, latent_dim, beta_a, beta_b,
                     total_n_t, global_n_t, local_n_t,
                     total_epochs, max(batch_size, int(n/batch_num)), early_stopping,
-                    mf_list, test_size, device
+                    mf_list, test_size, device, noise_std
                 ): trial
                 for trial in range(repeats)
             }
@@ -325,10 +402,14 @@ if (__name__ == "__main__"):
                 "eval_geometric_alignment_std":  float(np.std(geos))
             }
 
-    fname = f"Synthetic_data/eval_results/eval_{dist_name}_{datetime.now(ZoneInfo("Asia/Seoul")).isoformat()}.json"
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    fname = f"Synthetic_data/eval_results/eval_{dist_name}_{timestamp}.json"
+
+    os.makedirs(os.path.dirname(fname), exist_ok=True)
+
     with open(fname, 'w') as f:
         json.dump({
-            "datetime" : datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+            "datetime" : timestamp,
             "seed" : seed,
             "distribution": dist_name,
             "ambient_dim": ambient_dim,

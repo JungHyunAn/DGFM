@@ -197,7 +197,7 @@ def plot_beta(beta_a, beta_b, out_dir):
 
 
 def main():
-    input_dir = os.path.expanduser("~/DGFM/Synthetic_data/eval_results")
+    input_dir = "Synthetic_data/eval_results"
 
     files = list_json_files(input_dir)
     if not files:
@@ -208,7 +208,7 @@ def main():
     with open(selected, 'r') as f:
         data = json.load(f)
 
-    output_dir = os.path.expanduser(f"~/DGFM/Synthetic_data/eval_graphs/{os.path.basename(selected)}")
+    output_dir = os.path.expanduser(f"Synthetic_data/eval_graphs/{os.path.basename(selected)}")
     os.makedirs(output_dir, exist_ok=True)
 
     dist_name = data.get("distribution", os.path.splitext(os.path.basename(selected))[0]).replace("_", " ")

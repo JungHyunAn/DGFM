@@ -22,6 +22,8 @@ from Synthetic_data.FM_utils import VectorField, \
                                     train_uniform_FM, \
                                     train_shifted_FM, \
                                     train_dgfm, \
+                                    train_gfm,  \
+                                    train_lfm,  \
                                     run_flow
 
 
@@ -43,7 +45,7 @@ def _instantiate_dist(dist_name, ambient_dim, latent_dim, device):
 
 
 def _run_single_trial(seed, dist, X_train, ambient_dim, device,
-                      mf, cluster_d, global_n_t, local_n_t, max_epochs, batch_size, early_stopping,
+                      mf, cluster_d, global_n_t, local_n_t, max_epochs, batch_size, cluster_size, early_stopping,
                       test_size):
     # Per-trial seeds
     torch.manual_seed(seed)
@@ -64,7 +66,7 @@ def _run_single_trial(seed, dist, X_train, ambient_dim, device,
         n_t_local=local_n_t,
         epochs=max_epochs,
         batch_size=batch_size,
-        cluster_size=int(X_train.shape[0]/10),
+        cluster_size=cluster_size,
         cluster_d=int(cluster_d),
         early_stopping=early_stopping
     )
@@ -83,6 +85,86 @@ def _run_single_trial(seed, dist, X_train, ambient_dim, device,
     }
 
 
+def _run_single_trial_GFM(seed, dist, X_train, ambient_dim, device,
+                      cluster_d, global_n_t, max_epochs, batch_size, cluster_size, early_stopping,
+                      test_size):
+    # Per-trial seeds
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    model = VectorField(ambient_dim).to(device)
+    opt   = optim.Adam(model.parameters(), lr=1e-3)
+    mixture_sampler = None
+
+    t0 = time.thread_time()
+    mixture_sampler, epoch, _, recs_dg, best_model = train_gfm(
+        model, opt,
+        X_train, ambient_dim,
+        device,
+        mixture_sampler=mixture_sampler,
+        n_t_global=global_n_t,
+        epochs=max_epochs,
+        batch_size=batch_size,
+        cluster_size=cluster_size,
+        cluster_d=int(cluster_d),
+        early_stopping=early_stopping
+    )
+    train_time = time.thread_time() - t0
+
+    X0   = np.random.randn(test_size, ambient_dim)
+    Xgen = run_flow(best_model, X0, device)
+    w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
+    geo  = dist.geometric_alignment(Xgen)
+
+    return {
+        "final_epoch": int(epoch),
+        "train_time": float(train_time),
+        "w2": float(w2),
+        "geo": float(geo),
+    }
+
+
+def _run_single_trial_LFM(seed, dist, X_train, ambient_dim, device,
+                      cluster_d, local_n_t, max_epochs, batch_size, cluster_size, early_stopping,
+                      test_size):
+    # Per-trial seeds
+    torch.manual_seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    model = VectorField(ambient_dim).to(device)
+    opt   = optim.Adam(model.parameters(), lr=1e-3)
+    mixture_sampler = None
+
+    t0 = time.thread_time()
+    mixture_sampler, epoch, _, recs_dg, best_model = train_lfm(
+        model, opt,
+        X_train, ambient_dim,
+        device,
+        mixture_sampler=mixture_sampler,
+        n_t_local=local_n_t,
+        epochs=max_epochs,
+        batch_size=batch_size,
+        cluster_size=cluster_size,
+        cluster_d=int(cluster_d),
+        early_stopping=early_stopping
+    )
+    train_time = time.thread_time() - t0
+
+    X0, _ = mixture_sampler.truncated_sample(test_size)
+    Xgen  = run_flow(best_model, X0, device)
+    w2    = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
+    geo   = dist.geometric_alignment(Xgen)
+
+    return {
+        "final_epoch": int(epoch),
+        "train_time": float(train_time),
+        "w2": float(w2),
+        "geo": float(geo),
+    }
+
+
 def _flow_states_at_times(model, X0_np, device, t_list, steps_per_interval=50):
     """
     Returns dict {t: torch.Tensor(N,D)} by either:
@@ -92,7 +174,13 @@ def _flow_states_at_times(model, X0_np, device, t_list, steps_per_interval=50):
     Assumes model eval mode and that model(x, t_tensor) or model(x, scalar_t) works.
     """
     model.eval()
-    x = torch.as_tensor(X0_np, device=device, dtype=torch.float32)
+
+    if torch.is_tensor(X0_np):
+        x = X0_np.detach().clone().to(device=device, dtype=torch.float32)
+    else:
+        # numpy/list -> tensor
+        x = torch.as_tensor(X0_np, dtype=torch.float32, device=device).clone()
+
     out = {t_list[0]: x.clone()} # zero
     t_prev = t_list[0]
     for t in t_list[1:]:
@@ -137,10 +225,14 @@ def run_dimension_analysis(n, repeats, seed, dist_name, ambient_dim, latent_dim,
     random.seed(seed)
     np.random.seed(seed)
 
-    dist = _instantiate_dist(dist_name, ambient_dim, latent_dim, device)
+    cluster_size = int(n/5)
+
+    dist    = _instantiate_dist(dist_name, ambient_dim, latent_dim, device)
     X_train = dist.sample(n)
 
-    results = {mf: {} for mf in mf_list}
+    results        = {f"DGFM-{mf}": dict() for mf in mf_list}
+    results["GFM"] = dict()
+    results["LFM"] = dict()
 
     for mf in mf_list:
         for dim in dim_list:
@@ -161,6 +253,7 @@ def run_dimension_analysis(n, repeats, seed, dist_name, ambient_dim, latent_dim,
                     local_n_t=local_n_t,
                     max_epochs=max_epochs,
                     batch_size=batch_size,
+                    cluster_size=cluster_size,
                     early_stopping=early_stopping,
                     test_size=test_size
                 )
@@ -172,7 +265,7 @@ def run_dimension_analysis(n, repeats, seed, dist_name, ambient_dim, latent_dim,
             eps  = np.array([m["final_epoch"] for m in trial_metrics], dtype=float)
             tps  = np.array([m["train_time"] for m in trial_metrics], dtype=float)
 
-            results[mf][int(dim)] = {
+            results[f"DGFM-{mf}"][int(dim)] = {
                 "trials": trial_metrics,
                 "summary": {
                     "w2_mean":  float(w2s.mean()),  "w2_std":  float(w2s.std(ddof=0)),
@@ -181,6 +274,80 @@ def run_dimension_analysis(n, repeats, seed, dist_name, ambient_dim, latent_dim,
                     "train_time_mean": float(tps.mean()),  "train_time_std":  float(tps.std(ddof=0)),
                 }
             }
+    
+    for dim in dim_list:
+        trial_metrics_GFM = []
+        trial_metrics_LFM = []
+
+        print(f"[GFM] cluster_d={dim}: running {repeats} trial(s)…")
+        for t in tqdm(range(repeats), desc=f"Trials (GFM, d={dim})"):
+            trial_seed = seed + t
+            m = _run_single_trial_GFM(
+                seed=trial_seed,
+                dist=dist,
+                X_train=X_train,
+                ambient_dim=ambient_dim,
+                device=device,
+                cluster_d=dim,
+                global_n_t=global_n_t,
+                max_epochs=max_epochs,
+                batch_size=batch_size,
+                cluster_size=cluster_size,
+                early_stopping=early_stopping,
+                test_size=test_size
+            )
+            trial_metrics_GFM.append(m)
+
+        # Aggregate stats
+        w2s  = np.array([m["w2"] for m in trial_metrics_GFM], dtype=float)
+        geos = np.array([m["geo"] for m in trial_metrics_GFM], dtype=float)
+        eps  = np.array([m["final_epoch"] for m in trial_metrics_GFM], dtype=float)
+        tps  = np.array([m["train_time"] for m in trial_metrics_GFM], dtype=float)
+
+        results["GFM"][int(dim)] = {
+            "trials": trial_metrics_GFM,
+            "summary": {
+                "w2_mean":  float(w2s.mean()),  "w2_std":  float(w2s.std(ddof=0)),
+                "geo_mean": float(geos.mean()), "geo_std": float(geos.std(ddof=0)),
+                "final_epoch_mean": float(eps.mean()), "final_epoch_std": float(eps.std(ddof=0)),
+                "train_time_mean": float(tps.mean()),  "train_time_std":  float(tps.std(ddof=0)),
+            }
+        }
+
+        print(f"[LFM] cluster_d={dim}: running {repeats} trial(s)…")
+        for t in tqdm(range(repeats), desc=f"Trials (LFM, d={dim})"):
+            trial_seed = seed + t
+            m = _run_single_trial_LFM(
+                seed=trial_seed,
+                dist=dist,
+                X_train=X_train,
+                ambient_dim=ambient_dim,
+                device=device,
+                cluster_d=dim,
+                local_n_t=local_n_t,
+                max_epochs=max_epochs,
+                batch_size=batch_size,
+                cluster_size=cluster_size,
+                early_stopping=early_stopping,
+                test_size=test_size
+            )
+            trial_metrics_LFM.append(m)
+
+        # Aggregate stats
+        w2s  = np.array([m["w2"] for m in trial_metrics_LFM], dtype=float)
+        geos = np.array([m["geo"] for m in trial_metrics_LFM], dtype=float)
+        eps  = np.array([m["final_epoch"] for m in trial_metrics_LFM], dtype=float)
+        tps  = np.array([m["train_time"] for m in trial_metrics_LFM], dtype=float)
+
+        results["LFM"][int(dim)] = {
+            "trials": trial_metrics_LFM,
+            "summary": {
+                "w2_mean":  float(w2s.mean()),  "w2_std":  float(w2s.std(ddof=0)),
+                "geo_mean": float(geos.mean()), "geo_std": float(geos.std(ddof=0)),
+                "final_epoch_mean": float(eps.mean()), "final_epoch_std": float(eps.std(ddof=0)),
+                "train_time_mean": float(tps.mean()),  "train_time_std":  float(tps.std(ddof=0)),
+            }
+        }
 
     return results
 
@@ -212,6 +379,8 @@ def run_convergence_analysis(n, repeats, seed, dist_name, ambient_dim, latent_di
 
     results = {}
 
+    # latent_dim -= 3 # for dimension misspec.
+
     def _train_uniform(X_train):
         model = VectorField(ambient_dim).to(device)
         opt   = optim.Adam(model.parameters(), lr=1e-3)
@@ -220,7 +389,7 @@ def run_convergence_analysis(n, repeats, seed, dist_name, ambient_dim, latent_di
             n_t=total_n_t, epochs=max_epochs, batch_size=batch_size,
             early_stopping=early_stopping,
         )
-        return best_model
+        return best_model, None
 
     def _train_shifted(X_train):
         model = VectorField(ambient_dim).to(device)
@@ -230,9 +399,9 @@ def run_convergence_analysis(n, repeats, seed, dist_name, ambient_dim, latent_di
             n_t=total_n_t, epochs=max_epochs, batch_size=batch_size,
             early_stopping=early_stopping, beta_a=beta_a, beta_b=beta_b
         )
-        return best_model
+        return best_model, None
 
-    def _train_dgfm(X_train, mf):
+    def _train_dgfm(X_train, mf, cluster_size):
         model = VectorField(ambient_dim).to(device)
         opt   = optim.Adam(model.parameters(), lr=1e-3)
         ms, epoch, _, _, best_model = train_dgfm(
@@ -240,14 +409,43 @@ def run_convergence_analysis(n, repeats, seed, dist_name, ambient_dim, latent_di
             mixture_sampler=None,
             n_t_global=global_n_t, n_t_local=local_n_t,
             epochs=max_epochs, batch_size=batch_size,
-            cluster_size=int(X_train.shape[0]/10), cluster_d=int(latent_dim),
+            cluster_size=cluster_size, cluster_d=int(latent_dim),
             early_stopping=early_stopping
         )
-        return best_model
+        return best_model, None
 
+    def _train_gfm(X_train, cluster_size):
+        model = VectorField(ambient_dim).to(device)
+        opt   = optim.Adam(model.parameters(), lr=1e-3)
+        ms, epoch, _, _, best_model = train_gfm(
+            model, opt, X_train, ambient_dim, device,
+            mixture_sampler=None,
+            n_t_global=global_n_t,
+            epochs=max_epochs, batch_size=batch_size,
+            cluster_size=cluster_size, cluster_d=int(latent_dim),
+            early_stopping=early_stopping
+        )
+        return best_model, None
+    
+    def _train_lfm(X_train, cluster_size):
+        model = VectorField(ambient_dim).to(device)
+        opt   = optim.Adam(model.parameters(), lr=1e-3)
+        ms, epoch, _, _, best_model = train_lfm(
+            model, opt, X_train, ambient_dim, device,
+            mixture_sampler=None,
+            n_t_local=local_n_t,
+            epochs=max_epochs, batch_size=batch_size,
+            cluster_size=cluster_size, cluster_d=int(latent_dim),
+            early_stopping=early_stopping
+        )
+        return best_model, ms
+
+    cluster_size = int(n/5)
     method_specs = [("UniformFM",  _train_uniform),
                     ("ShiftedFM",  _train_shifted)] + \
-                   [(f"DGFM_mf{mf}", lambda Xtr, mf=mf: _train_dgfm(Xtr, mf)) for mf in mf_list]
+                   [(f"DGFM-{mf}", lambda Xtr, mf=mf, cluster_size=cluster_size: _train_dgfm(Xtr, mf, cluster_size)) for mf in mf_list] + \
+                   [("GFM", lambda Xtr, cluster_size=cluster_size: _train_gfm(Xtr, cluster_size)),
+                    ("LFM", lambda Xtr, cluster_size=cluster_size: _train_lfm(Xtr, cluster_size))]
 
     # Initialize storage
     for mname, _ in method_specs:
@@ -258,12 +456,18 @@ def run_convergence_analysis(n, repeats, seed, dist_name, ambient_dim, latent_di
 
     # Train each method once
     trained = {}
+    ms      = None
     for mname, trainer in method_specs:
-        trained[mname] = trainer(X_train)
+        if mname == "LFM":
+            trained[mname], ms = trainer(X_train)
+        else:
+            trained[mname], _ = trainer(X_train)
 
     # Evaluate along t_list
     X0 = np.random.randn(test_size, ambient_dim)
     for mname in trained:
+        if (mname == "LFM"):
+            X0, _ = ms.truncated_sample(test_size)
         states = _flow_states_at_times(trained[mname], X0, device, t_list, steps_per_interval=50)
 
         for t in t_list:  # make sure t_list = [float(...), ...]
@@ -307,12 +511,12 @@ if __name__ == "__main__":
     mf_list       = list(map(int,
                         (input("DGFM multiplier for global FM (comma separated, default 2,4): ")
                         .strip() or "2,4").split(",")))
-    total_n_t   = int(input("Timesteps per sample for Uniform/Shifted FM (default 4): ") or 4)
+    total_n_t   = int(input("Timesteps per sample for Uniform/Shifted FM (default 1): ") or 1)
     beta_a, beta_b = list(map(float,
                     (input("Beta parameters for shifted FM (comma separated, default 1.5,1): ")
                     .strip() or "1.5,1").split(",")))
-    global_n_t    = int(input("Number of timesteps per sample for DGFM global FM (default 4): ") or 4)
-    local_n_t     = int(input("Number of timesteps per sample for DGFM local FM (default 4): ") or 4)
+    global_n_t    = int(input("Number of timesteps per sample for DGFM global FM (default 1): ") or 1)
+    local_n_t     = int(input("Number of timesteps per sample for DGFM local FM (default 1): ") or 1)
     early_stopping = input("Use early stopping if validation loss doesn't improve for three epochs? (y/n, default y): ").strip().lower() != 'n'
 
     print("\nChoose test:")
@@ -352,7 +556,7 @@ if __name__ == "__main__":
     if test_choice == "1":
 
         # ----------- Misspecification setup -----------
-        deltas = [-0.75, -0.5, 0.0, 0.5, 1]
+        deltas = [-0.1, 0.0, 0.1]
         raw_dims = [max(1, int(round(latent_dim * (1 + d)))) for d in deltas]
         dim_list = sorted(sorted(set(raw_dims)))  # unique + sorted
 
@@ -402,7 +606,7 @@ if __name__ == "__main__":
 
         dims = dim_list
         x = np.arange(len(dims), dtype=float)
-        G = len(mf_list)
+        G = len(results.keys())
         width = min(0.8 / max(G, 1), 0.28)  # grouped bar width
 
         plt.figure(figsize=(11, 8))
@@ -412,14 +616,14 @@ if __name__ == "__main__":
         w2_means_all = []
         w2_stds_all  = []
 
-        for i, mf in enumerate(mf_list):
-            means = [results[mf][d]["summary"]["w2_mean"] for d in dims]
-            stds  = [results[mf][d]["summary"]["w2_std"]  for d in dims]
+        for i, name in enumerate(results.keys()):
+            means = [results[name][d]["summary"]["w2_mean"] for d in dims]
+            stds  = [results[name][d]["summary"]["w2_std"]  for d in dims]
             xpos  = x + (i - (G-1)/2) * width
-            ax1.bar(xpos, means, width=width, yerr=stds, capsize=4, label=f"DGFM (mf={mf})")
+            ax1.bar(xpos, means, width=width, yerr=stds, capsize=4, label=name)
 
-            w2_means_all += [results[mf][d]["summary"]["w2_mean"] for d in dims]
-            w2_stds_all  += [results[mf][d]["summary"]["w2_std"]  for d in dims]
+            w2_means_all += [results[name][d]["summary"]["w2_mean"] for d in dims]
+            w2_stds_all  += [results[name][d]["summary"]["w2_std"]  for d in dims]
 
         w2_means_all = np.array(w2_means_all, dtype=float)
         w2_stds_all  = np.array(w2_stds_all, dtype=float)
@@ -451,14 +655,14 @@ if __name__ == "__main__":
         geo_means_all = []
         geo_stds_all  = []
 
-        for i, mf in enumerate(mf_list):
-            means = [results[mf][d]["summary"]["geo_mean"] for d in dims]
-            stds  = [results[mf][d]["summary"]["geo_std"]  for d in dims]
+        for i, name in enumerate(results.keys()):
+            means = [results[name][d]["summary"]["geo_mean"] for d in dims]
+            stds  = [results[name][d]["summary"]["geo_std"]  for d in dims]
             xpos  = x + (i - (G-1)/2) * width
-            ax2.bar(xpos, means, width=width, yerr=stds, capsize=4, label=f"DGFM (mf={mf})")
+            ax2.bar(xpos, means, width=width, yerr=stds, capsize=4, label=name)
 
-            geo_means_all += [results[mf][d]["summary"]["geo_mean"] for d in dims]
-            geo_stds_all  += [results[mf][d]["summary"]["geo_std"]  for d in dims]
+            geo_means_all += [results[name][d]["summary"]["geo_mean"] for d in dims]
+            geo_stds_all  += [results[name][d]["summary"]["geo_std"]  for d in dims]
 
         if latent_dim in dims:
             ax2.axvline(x=np.where(np.array(dims) == latent_dim)[0][0],
@@ -538,7 +742,7 @@ if __name__ == "__main__":
         plt.figure(figsize=(11, 8))
 
         # Build consistent color/linestyle order
-        method_order = ["UniformFM", "ShiftedFM"] + [f"DGFM_mf{mf}" for mf in mf_list]
+        method_order = ["UniformFM", "ShiftedFM"] + [f"DGFM-{mf}" for mf in mf_list] + ["GFM", "LFM"]
 
         # --- Subplot 1: W2 vs t
         ax3 = plt.subplot(2, 1, 1)

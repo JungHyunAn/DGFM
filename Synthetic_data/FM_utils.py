@@ -451,10 +451,11 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
         perm_t = torch.randperm(X_train.shape[0], device=device)
         for i in range(0, split, batch_size):
             idx = perm_t[i:min(i+batch_size, split)]
+
             x1 = X_train[idx]
             x0 = torch.randn(len(idx), dim, device=device) # standard Gaussian base distribution
             t  = Beta(beta_a, beta_b).sample((len(idx)*n_t,)).to(device)  # Beta t sampling
-            t = torch.ones_like(t).to(device) - t
+            t  = torch.ones_like(t).to(device) - t
 
             x0r = x0.unsqueeze(1).repeat(1,n_t,1).view(-1,dim)
             x1r = x1.unsqueeze(1).repeat(1,n_t,1).view(-1,dim)            
@@ -494,7 +495,7 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
 
 def train_dgfm(model, optimizer, X_target, dim, mf, device,
                mixture_sampler=None,
-               n_t_global=5, n_t_local=1,
+               n_t_global=1, n_t_local=1,
                epochs=5, batch_size=256,    
                cluster_size=50, cluster_d=3,
                early_stopping=True, tol=1e-3,
@@ -502,12 +503,14 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
     
     # 0) Clustering & Form intermediate distribution
     base_sampler = lambda x: torch.randn(x, dim, device=device)
-    N = X_target.shape[0]
-    perm = np.random.permutation(N)
-    M = N - min(int(0.1*N), 2000) # training set size (validation set cannot exceed 2000 by numItermax of pot)
+    N            = X_target.shape[0]
+    perm         = np.random.permutation(N)
+    M            = N - min(int(0.1*N), 2000) # training set size (validation set cannot exceed 2000 by numItermax of pot)
+    
     idx_train, idx_val = perm[:M], perm[M:] # split into train and validation sets
-    X_train = X_target[idx_train]
-    X_val   = X_target[idx_val]
+    X_train            = X_target[idx_train]
+    X_val              = X_target[idx_val]
+    
     stop_criteria = 0
 
     if mixture_sampler is None:
@@ -526,26 +529,30 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
         mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
         
 
-    best_w2 = float("inf")
+    best_w2    = float("inf")
     best_model = None
-    recs = []
+    recs       = []
 
     global_M = M * mf
     for epoch in range(epochs):
+        perm_t = torch.randperm(X_train.shape[0], device=device)
+
         # 1) global FM
         t0 = time.thread_time()
         for i in range(0, global_M, batch_size):
-            m = min(batch_size, global_M-i) # batch size
-            x0_t = base_sampler(m)
-            x1_t, _ = mixture_sampler.truncated_sample(m)
-            t  = torch.rand(m*n_t_global, device=device)  # t sampling for global FM
+            m       = min(batch_size, global_M-i) # batch size
 
-            x0r = x0_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
-            x1r = x1_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
-            xt  = (1-t.unsqueeze(1))*x0r + t.unsqueeze(1)*x1r
+            x0_t    = base_sampler(m)
+            x1_t, _ = mixture_sampler.truncated_sample(m)
+            t       = torch.rand(m*n_t_global, device=device)  # t sampling for global FM
+            x0r     = x0_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
+            x1r     = x1_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
+            xt      = (1-t.unsqueeze(1))*x0r + t.unsqueeze(1)*x1r
+            
             target_v = 2*(x1r - x0r)
             pred_v   = model(xt, 0.5*t)
-            loss = ((pred_v - target_v)**2).mean()
+            loss     = ((pred_v - target_v)**2).mean()
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -554,26 +561,21 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
         # 2) local FM
         t0 = time.thread_time()
         for i in range(0, M, batch_size):
-            m = min(batch_size, M-i)            
+            m   = min(batch_size, M-i)
+            idx = perm_t[i:i+m]            
             
-            # Option1: Match within clusters
+            # Match within clusters
             inv_cluster = mixture_sampler.inv_cluster
-            pis_np = np.array([ np.random.choice(inv_cluster[j]) for j in range(i, i+m) ], dtype=np.int64)
+            pis_np = np.array([ np.random.choice(inv_cluster[int(j.item())]) for j in idx ], dtype=np.int64)
             pis = torch.tensor(pis_np, device=device)
 
             x0, _ = mixture_sampler.truncated_sample(m, pis=pis)
-            x1 = X_train[i:i+m]            
-            '''
-            # Option2: Match with random samples from the training set
-            x0, pis = mixture_sampler.truncated_sample(m)
-            idxs = [int(np.random.choice(list(clusters[pi]))) for pi in pis]
-            x1 = X_train[idxs]
-            '''
-            t = torch.rand(m * n_t_local, device=device) # t sampling for local FM
- 
-            x0r = x0.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
-            x1r = x1.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
-            xt = (1 - t.unsqueeze(1)) * x0r + t.unsqueeze(1) * x1r
+            x1    = X_train[idx]            
+            t     = torch.rand(m * n_t_local, device=device) # t sampling for local FM 
+            x0r   = x0.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
+            x1r   = x1.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
+            xt    = (1 - t.unsqueeze(1)) * x0r + t.unsqueeze(1) * x1r
+
             target_v = 2*(x1r - x0r)
             pred_v = model(xt, 0.5*t+0.5)
             loss = ((pred_v - target_v) ** 2).mean()
@@ -608,12 +610,201 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
     return mixture_sampler, epoch, best_w2, recs, best_model
 
 
+def train_gfm(model, optimizer, X_target, dim, device,
+              mixture_sampler=None,
+              n_t_global=1,
+              epochs=5, batch_size=256,    
+              cluster_size=50, cluster_d=3,
+              early_stopping=True, tol=1e-3,
+              approx_cluster=False, fast_PCA=True):
+    
+    # Clustering & Form intermediate distribution
+    base_sampler = lambda x: torch.randn(x, dim, device=device)
+    N            = X_target.shape[0]
+    perm         = np.random.permutation(N)
+    M            = N - min(int(0.1*N), 2000) # training set size (validation set cannot exceed 2000 by numItermax of pot)
+    
+    idx_train, idx_val = perm[:M], perm[M:] # split into train and validation sets
+    X_train            = X_target[idx_train]
+    X_val              = X_target[idx_val]
+
+    stop_criteria = 0
+
+    if mixture_sampler is None:
+        t0 = time.thread_time()
+        if approx_cluster:
+            clusters, inv_cluster = cluster_points_annoy(X_train.detach().cpu().numpy(), cluster_size)
+        else:
+            clusters, inv_cluster  = cluster_points(X_train.detach().cpu().numpy(), cluster_size)
+        # print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
+        t0 = time.thread_time()
+        if fast_PCA:
+            mus, covs, weights = compute_cluster_pca_fast(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
+        else:
+            mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
+        # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
+        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
+        
+
+    best_w2    = float("inf")
+    best_model = None
+    recs       = []
+
+    for epoch in range(epochs):
+        # global FM only
+        t0 = time.thread_time()
+        for i in range(0, M, batch_size):
+            m       = min(batch_size, M-i) # batch size
+
+            x0_t    = base_sampler(m)
+            x1_t, _ = mixture_sampler.truncated_sample(m)
+            t       = torch.rand(m*n_t_global, device=device)  # t sampling for global FM
+            x0r     = x0_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
+            x1r     = x1_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
+            xt      = (1-t.unsqueeze(1))*x0r + t.unsqueeze(1)*x1r # OT interpolant
+
+            target_v = x1r - x0r # target velocity
+            pred_v   = model(xt, t)
+            loss     = ((pred_v - target_v)**2).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        # print(f"Global FM epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
+
+        # Validation
+        t0 = time.thread_time()
+        with torch.no_grad():
+            X0   = np.random.randn(len(idx_val), dim)
+            Xgen = run_flow(model, X0, device)
+        w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
+        # print(f"Validation epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
+
+        # Early stopping
+        if early_stopping and ((best_w2 - w2) < tol):
+            stop_criteria += 1
+            if stop_criteria >= 3:  # stop after 3 epochs without improvement
+                break
+        else:
+            stop_criteria = 0
+            best_w2 = w2
+            best_model = model
+
+        # Record results
+        recs.append(
+            { "epoch": epoch, 
+              "validation_w2": w2, 
+              "train_loss": loss.item() }
+        ) 
+    return mixture_sampler, epoch, best_w2, recs, best_model
+
+
+def train_lfm(model, optimizer, X_target, dim, device,
+              mixture_sampler=None,
+              n_t_local=1,
+              epochs=5, batch_size=256,    
+              cluster_size=50, cluster_d=3,
+              early_stopping=True, tol=1e-3,
+              approx_cluster=False, fast_PCA=True):
+    
+    # 0) Clustering & Form intermediate distribution
+    N            = X_target.shape[0]
+    perm         = np.random.permutation(N)
+    M            = N - min(int(0.1*N), 2000) # training set size (validation set cannot exceed 2000 by numItermax of pot)
+    
+    idx_train, idx_val = perm[:M], perm[M:] # split into train and validation sets
+    X_train            = X_target[idx_train]
+    X_val              = X_target[idx_val]
+    
+    stop_criteria = 0
+
+    if mixture_sampler is None:
+        t0 = time.thread_time()
+        if approx_cluster:
+            clusters, inv_cluster = cluster_points_annoy(X_train.detach().cpu().numpy(), cluster_size)
+        else:
+            clusters, inv_cluster  = cluster_points(X_train.detach().cpu().numpy(), cluster_size)
+        # print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
+        t0 = time.thread_time()
+        if fast_PCA:
+            mus, covs, weights = compute_cluster_pca_fast(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
+        else:
+            mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
+        # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
+        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
+    
+    best_w2    = float("inf")
+    best_model = None
+    recs       = []
+
+    for epoch in range(epochs):
+        perm_t = torch.randperm(X_train.shape[0], device=device)
+
+        # local FM only
+        t0 = time.thread_time()
+        for i in range(0, M, batch_size):
+            m   = min(batch_size, M-i)
+            idx = perm_t[i:i+m]
+            
+            inv_cluster = mixture_sampler.inv_cluster
+            pis_np      = np.array([ np.random.choice(inv_cluster[int(j.item())]) for j in idx ], dtype=np.int64)
+            pis         = torch.tensor(pis_np, device=device)
+
+            x0, _ = mixture_sampler.truncated_sample(m, pis=pis)
+            x1    = X_train[idx]            
+            t     = torch.rand(m * n_t_local, device=device) # t sampling for local FM
+            x0r   = x0.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
+            x1r   = x1.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
+            xt    = (1 - t.unsqueeze(1)) * x0r + t.unsqueeze(1) * x1r
+
+            target_v = x1r - x0r
+            pred_v   = model(xt, t)
+            loss     = ((pred_v - target_v) ** 2).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        # print(f"Local FM epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
+
+        # Validation
+        t0 = time.thread_time()
+        with torch.no_grad():
+            X0, _ = mixture_sampler.truncated_sample(len(idx_val))
+            Xgen  = run_flow(model, X0, device)
+        w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
+        # print(f"Validation epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
+
+        # Early stopping
+        if early_stopping and ((best_w2 - w2) < tol):
+            stop_criteria += 1
+            if stop_criteria >= 3:  # stop after 3 epochs without improvement
+                break
+        else:
+            stop_criteria = 0
+            best_w2 = w2
+            best_model = model
+
+        # Record results
+        recs.append(
+            { "epoch": epoch, 
+              "validation_w2": w2, 
+              "train_loss": loss.item() }
+        ) 
+    return mixture_sampler, epoch, best_w2, recs, best_model
+
+
 def run_flow(model, x0, device, n_steps=100):
-    x = torch.tensor(x0, device=device, dtype=torch.float32)
-    dt = 1/n_steps
+    # Robust input handling: x0 can be torch.Tensor, numpy.ndarray, list, etc.
+    if torch.is_tensor(x0):
+        x = x0.detach().clone().to(device=device, dtype=torch.float32)
+    else:
+        # numpy/list -> tensor
+        x = torch.as_tensor(x0, dtype=torch.float32, device=device).clone()
+
+    dt = 1 / n_steps
     with torch.no_grad():
         for i in range(n_steps):
-            t = torch.full((x.shape[0],), i*dt, device=device)
+            t = torch.full((x.shape[0],), i * dt, device=device, dtype=torch.float32)
             v = model(x, t)
-            x = x + v*dt
+            x = x + v * dt
     return x

@@ -217,7 +217,7 @@ class Quadratic_Unimodal(Distribution):
             lin  = z_hat @ self.A.T
             quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
             err  = ((lin + quad - x) ** 2).mean().item()
-            print("Error by gradient descent: ", err)
+            # print("Error by gradient descent: ", err)
             
             """
             c     = x @ torch.linalg.pinv(self.A).T          # (n, latent_dim)
