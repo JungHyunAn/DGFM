@@ -24,7 +24,7 @@ from Synthetic_data.FM_utils import VectorField, \
                                     train_lfm,  \
                                     run_flow
 
-NUM_WORKERS = 1  # Number of parallel workers for training DGFM
+NUM_WORKERS = 5  # Number of parallel workers for training DGFM
 
 
 def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
@@ -168,7 +168,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
     # 6) train GFM only
     model_GFM       = VectorField(ambient_dim).to(device)
-    opt_GFM         = optim.Adam(model_shifted.parameters(), lr=1e-3)
+    opt_GFM         = optim.Adam(model_GFM.parameters(), lr=1e-3)
     time_GFM        = 0.0
     mixture_sampler = None
 
@@ -203,7 +203,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
     # 7) train LFM only
     model_LFM       = VectorField(ambient_dim).to(device)
-    opt_LFM         = optim.Adam(model_shifted.parameters(), lr=1e-3)
+    opt_LFM         = optim.Adam(model_LFM.parameters(), lr=1e-3)
     time_LFM        = 0.0
     mixture_sampler = None
 
@@ -256,23 +256,23 @@ if (__name__ == "__main__"):
 
     # 1) pick sample size & trials & seed
     sample_sizes = list(map(int,
-                        (input("Enter sample sizes (comma separated, default 500,1000,2000,4000,8000,16000): ")
-                        .strip() or "500,1000,2000,4000,8000,16000").split(",")))
-    repeats = int(input("Number of trials per config (default 10): ") or 10)
+                        (input("Enter sample sizes (comma separated, default 250,1000,4000,16000): ")
+                        .strip() or "250,1000,4000,16000").split(",")))
+    repeats = int(input("Number of trials per config (default 5): ") or 5)
     seed = int(input("Input the seed (default 1000): ") or 1000)
 
     # 2) experiment setup
-    ambient_dim    = int(input("Ambient dimension (default 40): ") or 40)
-    latent_dim     = int(input("Latent dimension (default 10): ") or 10)
+    ambient_dim    = int(input("Ambient dimension (default 80): ") or 80)
+    latent_dim     = int(input("Latent dimension (default 20): ") or 20)
     total_epochs   = int(input("Maximum number of epochs (default 100): ") or 100)
-    batch_size     = int(input("Minimum Batch size (default 100): ") or 100)
+    batch_size     = int(input("Minimum Batch size (default 125): ") or 125)
     batch_num      = int(input("Number of batches per epoch (default 10): ") or 10)
     beta_a, beta_b = list(map(float,
                         (input("Beta parameters for shifted FM (comma separated, default 1.5,1): ")
                         .strip() or "1.5,1").split(",")))
     mf_list        = list(map(int,
-                        (input("DGFM multiplier for global FM (comma separated, default 2,4): ")
-                        .strip() or "2,4").split(",")))
+                        (input("DGFM multiplier for global FM (comma separated, default 4,8): ")
+                        .strip() or "4,8").split(",")))
     total_n_t      = int(input("Number of timesteps per sample for vanilla FM (default 1): ") or 1)
     global_n_t     = int(input("Number of timesteps per sample for DGFM global FM (default 1): ") or 1)
     local_n_t      = int(input("Number of timesteps per sample for DGFM local FM (default 1): ") or 1)

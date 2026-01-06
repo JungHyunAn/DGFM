@@ -22,6 +22,8 @@ class Distribution(ABC):
         self.name        = name or self.__class__.__name__
         self.device      = device
 
+        print(f"Distribution {self.name} has n = {self.ambient_dim}, d = {self.latent_dim}, equation is {self.equation}")
+
     def wasserstein2_distance(self, x: np.array, n_samples: int) -> float:
         """
         Computes the Wasserstein-2 distance between this distribution and another.
@@ -190,12 +192,13 @@ class Quadratic_Unimodal(Distribution):
         for i in range(num_steps):
             optimizer.zero_grad()
             # linear term
-            lin = z_hat @ self.A.T 
+            lin   = z_hat @ self.A.T 
             # quadratic term
-            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            quad  = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
             # prediction
             x_hat = lin + quad
-            loss = ((x_hat - x) ** 2).mean()
+
+            loss  = ((x_hat - x) ** 2).mean()
             loss.backward()
             optimizer.step()
 
@@ -214,9 +217,10 @@ class Quadratic_Unimodal(Distribution):
 
         # compute final error
         with torch.no_grad():
-            lin  = z_hat @ self.A.T
-            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
-            err  = ((lin + quad - x) ** 2).mean().item()
+            lin   = z_hat @ self.A.T
+            quad  = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            x_hat = lin + quad
+            err   = ((x_hat - x) ** 2).mean().item()
             # print("Error by gradient descent: ", err)
             
             """
@@ -293,12 +297,12 @@ class Quadratic_Multimodal(Distribution):
         for i in range(num_steps):
             optimizer.zero_grad()
             # linear term
-            lin = z_hat @ self.A.T 
+            lin   = z_hat @ self.A.T 
             # quadratic term
-            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            quad  = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
             # prediction
             x_hat = lin + quad
-            loss = ((x_hat - x) ** 2).mean()
+            loss  = ((x_hat - x) ** 2).mean()
             loss.backward()
             optimizer.step()
 
@@ -317,9 +321,10 @@ class Quadratic_Multimodal(Distribution):
 
         # compute final error
         with torch.no_grad():
-            lin  = z_hat @ self.A.T
-            quad = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
-            err  = ((lin + quad - x) ** 2).mean().item()
+            lin   = z_hat @ self.A.T
+            quad  = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+            x_hat = lin + quad
+            err   = ((x_hat - x) ** 2).mean().item()
 
         return err
     
@@ -364,10 +369,9 @@ class Linear_Branched(Distribution):
         )  # sample branch indices
         
         # Sample latent vector from truncated normal
-        z = torch.randn(n, self.latent_dim, device=self.device)
-
+        z      = torch.randn(n, self.latent_dim, device=self.device)
         # Map onto branched manifold
-        A_sel = self.branches[pis] # Select the appropriate branch basis
+        A_sel  = self.branches[pis] # Select the appropriate branch basis
         linear = torch.bmm(A_sel, z.unsqueeze(-1)).squeeze(-1)  # Linear transformation with branch basis and offset
 
         return linear + self.noise_std * torch.randn_like(linear)

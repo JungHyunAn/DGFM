@@ -483,7 +483,7 @@ def run_convergence_analysis(n, repeats, seed, dist_name, ambient_dim, latent_di
             results[mname]["per_t"][float(t)]["trials"] = [{"w2": float(w2), "geo": float(geo)}]
             results[mname]["per_t"][float(t)]["summary"] = {
                 "w2_mean": float(w2), "w2_std": 0.0,
-                "geo_mean": float(geo), "geo_std": 0.0,
+                "geo_mean": float(geo), "geo_std":  0.0,
             }
 
     return results
