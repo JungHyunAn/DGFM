@@ -32,13 +32,15 @@ class MixtureSampler:
     # ----------------------------
     # Intermediate Mixture of Gaussians sampler
     # ----------------------------
-    def __init__(self, mus, covs, weights, clusters, inv_cluster, device='cpu'):
-        self.device = device
-        self.mus = torch.tensor(mus, dtype=torch.float32, device=device) # (k, d)
-        self.covs = torch.tensor(covs, dtype=torch.float32, device=device) # (k, d, d)
-        self.weights = torch.tensor(weights/weights.sum(),dtype=torch.float32, device=device)  # normalize weights
-        self.clusters = clusters
+    def __init__(self, mus, covs, weights, clusters, inv_cluster, truncation=1.5, device='cpu'):
+        self.mus         = torch.tensor(mus, dtype=torch.float32, device=device) # (k, d)
+        self.covs        = torch.tensor(covs, dtype=torch.float32, device=device) # (k, d, d)
+        self.weights     = torch.tensor(weights/weights.sum(),dtype=torch.float32, device=device)  # normalize weights
+        self.clusters    = clusters
         self.inv_cluster = inv_cluster
+        self.truncation  = truncation
+        self.device      = device
+
         self.Ls = torch.linalg.cholesky(self.covs)
         self.k, self.d = self.mus.shape
 
@@ -73,7 +75,7 @@ class MixtureSampler:
             pis = torch.multinomial(self.weights, M, replacement=True).to(self.device)
 
         # use truncnorm to sample from truncated normal distribution
-        z = truncnorm.rvs(-1.5, 1.5, size=(M, self.d), random_state=None).astype(np.float32)
+        z = truncnorm.rvs(-self.truncation, self.truncation, size=(M, self.d), random_state=None).astype(np.float32)
         eps = torch.from_numpy(z).to(self.device)
 
         L_sel  = self.Ls[pis]
@@ -498,6 +500,7 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
                n_t_global=1, n_t_local=1,
                epochs=5, batch_size=256,    
                cluster_size=50, cluster_d=3,
+               truncation=1.5,
                early_stopping=True, tol=1e-3,
                approx_cluster=False, fast_PCA=True):
     
@@ -526,7 +529,7 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
         else:
             mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
         # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
-        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
+        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, truncation=truncation, device=device)
         
 
     best_w2    = float("inf")
@@ -615,6 +618,7 @@ def train_gfm(model, optimizer, X_target, dim, device,
               n_t_global=1,
               epochs=5, batch_size=256,    
               cluster_size=50, cluster_d=3,
+              truncation=1.5,
               early_stopping=True, tol=1e-3,
               approx_cluster=False, fast_PCA=True):
     
@@ -643,7 +647,7 @@ def train_gfm(model, optimizer, X_target, dim, device,
         else:
             mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
         # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
-        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
+        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, truncation=truncation, device=device)
         
 
     best_w2    = float("inf")
@@ -704,6 +708,7 @@ def train_lfm(model, optimizer, X_target, dim, device,
               n_t_local=1,
               epochs=5, batch_size=256,    
               cluster_size=50, cluster_d=3,
+              truncation=1.5,
               early_stopping=True, tol=1e-3,
               approx_cluster=False, fast_PCA=True):
     
@@ -731,7 +736,7 @@ def train_lfm(model, optimizer, X_target, dim, device,
         else:
             mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
         # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
-        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, device=device)
+        mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, truncation=truncation, device=device)
     
     best_w2    = float("inf")
     best_model = None

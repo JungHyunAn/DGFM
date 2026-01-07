@@ -1,9 +1,11 @@
 import os
 import glob
 import json
-from matplotlib import ticker
+import shutil
 import numpy as np
 import matplotlib.pyplot as plt
+
+from matplotlib import ticker
 from scipy.special import beta
 
 
@@ -216,6 +218,10 @@ def main():
     plot_summary(data, output_dir, dist_name)
     plot_comparison(data, output_dir, dist_name)
     plot_beta(data["beta_a"], data["beta_b"], output_dir)
+
+    # ---- MOVE JSON FILE INTO OUTPUT DIRECTORY ----
+    dst_json = os.path.join(output_dir, os.path.basename(selected))
+    shutil.move(selected, dst_json)
 
     print(f"Graphs saved in {output_dir}")
 
