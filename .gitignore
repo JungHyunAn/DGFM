@@ -16,3 +16,5 @@ prompts.txt
 MUJOCO_LOG.TXT
 vision_encoder/
 Miniconda3-latest-Linux-x86_64.sh
+Synthetic_configs/
+synth_eval.log

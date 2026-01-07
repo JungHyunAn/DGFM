@@ -28,7 +28,7 @@ NUM_WORKERS = 5  # Number of parallel workers for training DGFM
 
 
 def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
-                  total_n_t, global_n_t, local_n_t, max_epochs, batch_size, truncation, cluster_num,
+                  total_n_t, global_n_t, local_n_t, max_steps, batch_size, truncation, cluster_num,
                   early_stopping, mf_list, test_size, device, noise_std=1e-4):
     """
     Runs one trial of both Vanilla FM and DGFM (for each mf in mf_list)
@@ -72,7 +72,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         model_van, opt_van, X_train,
         ambient_dim, device,
         n_t=total_n_t,
-        epochs=max_epochs,
+        epochs=int(max_steps * batch_size * 10 / n / 9),
         batch_size=batch_size,
         early_stopping=early_stopping,
     )
@@ -103,7 +103,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         model_shifted, opt_shifted, X_train,
         ambient_dim, device,
         n_t=total_n_t,
-        epochs=max_epochs,  
+        epochs=int(max_steps * batch_size * 10 / n / 9),  
         batch_size=batch_size,
         early_stopping=early_stopping,
         beta_a=beta_a, beta_b=beta_b
@@ -126,7 +126,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     trial_results["ShiftedFM"] = recs_shiftedFM
 
 
-    cluster_size = int(n/cluster_num)
+    cluster_size = min(int(n/cluster_num), latent_dim+5)
 
     # 5) train DGFM (one entry per mf)
     for mf in mf_list:
@@ -144,7 +144,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
             mixture_sampler=mixture_sampler,
             n_t_global=global_n_t,
             n_t_local=local_n_t,
-            epochs=max_epochs,
+            epochs=int(max_steps * batch_size * 10 / n / 9 / (1+mf)),
             batch_size=batch_size,
             cluster_size=cluster_size,
             cluster_d=latent_dim,
@@ -180,7 +180,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         ambient_dim, device,
         mixture_sampler=mixture_sampler,
         n_t_global=global_n_t,
-        epochs=max_epochs,
+        epochs=int(max_steps * batch_size * 10 / n / 9),
         batch_size=batch_size,
         cluster_size=cluster_size,
         cluster_d=latent_dim,
@@ -216,7 +216,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         ambient_dim, device,
         mixture_sampler=mixture_sampler,
         n_t_local=local_n_t,
-        epochs=max_epochs,
+        epochs=int(max_steps * batch_size * 10 / n / 9),
         batch_size=batch_size,
         cluster_size=cluster_size,
         cluster_d=latent_dim,
@@ -272,17 +272,17 @@ if (__name__ == "__main__"):
 
     # 1) pick sample size & trials & seed
     sample_sizes = list(map(int,
-                        (input("Enter sample sizes (comma separated, default 250,500,1000,2000,4000,8000): ")
-                        .strip() or "250,500,1000,2000,4000,8000").split(",")))
+                        (input("Enter sample sizes (comma separated, default 250,500,1000,2000,4000): ")
+                        .strip() or "250,500,1000,2000,4000").split(",")))
     repeats      = int(input("Number of trials per config (default 5): ") or 5)
     seed         = int(input("Input the seed (default 1000): ")           or 1000)
 
     # 2) experiment setup
-    ambient_dim    = int(input("Ambient dimension (default 80): ")           or 80)
-    latent_dim     = int(input("Latent dimension (default 20): ")            or 20)
-    total_epochs   = int(input("Maximum number of epochs (default 100): ")   or 100)
-    batch_size     = int(input("Minimum Batch size (default 125): ")         or 125)
-    batch_num      = int(input("Number of batches per epoch (default 8): ")  or 8)
+    ambient_dim    = int(input("Ambient dimension (default 80): ")              or 80)
+    latent_dim     = int(input("Latent dimension (default 20): ")               or 20)
+    total_steps    = int(input("Maximum number of opt. steps (default 2880): ") or 2880)
+    batch_size     = int(input("Minimum Batch size (default 64): ")             or 64)
+    batch_num      = int(input("Number of batches per epoch (default 8): ")     or 8)
     beta_a, beta_b = list(map(float,
                         (input("Beta parameters for shifted FM (comma separated, default 1.5,1): ")
                         .strip() or "1.5,1").split(",")))
@@ -295,9 +295,9 @@ if (__name__ == "__main__"):
     local_n_t      = int(input("Number of timesteps per sample for DGFM local FM (default 1): ")  or 1)
     noise_std      = float(input("Noise level of distribution (default 1e-4): ")                  or 1e-4)
     truncation     = float(input("Truncation of GMM (default 1.5): ")                             or 1.5)
-    cluster_num    = int(input("Number of expected clusters (default 5): ")                       or 5)
+    cluster_num    = int(input("Number of expected clusters (default 8): ")                       or 8)
 
-    early_stopping = input("Use early stopping if validation loss doesn't improve for three epochs? (y/n, default y): ").strip().lower() != 'n'
+    early_stopping = input("Use early stopping if validation loss doesn't improve for three epochs? (y/n, default n): ").strip().lower() == 'y'
 
     # 3) pick distribution
     print("Choose target distribution:")
@@ -339,7 +339,7 @@ if (__name__ == "__main__"):
             futures = {
                 executor.submit(
                     run_one_trial, n, seed + trial, trial, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
-                    total_n_t, global_n_t, local_n_t, total_epochs, max(batch_size, int(n/batch_num)), truncation, cluster_num,
+                    total_n_t, global_n_t, local_n_t, total_steps, max(batch_size, int(0.9 * n / batch_num)), truncation, cluster_num,
                     early_stopping, mf_list, test_size, device, noise_std
                 ): trial
                 for trial in range(repeats)
@@ -410,13 +410,13 @@ if (__name__ == "__main__"):
             geos= [r[-1]['eval_geometric_alignment'] for r in trials.values()]
             summary[n][method] = {
                 "final_epoch_mean"             : float(np.mean(final_epochs)),
-                "final_epoch_std"              :  float(np.std(final_epochs)),
+                "final_epoch_std"              : float(np.std(final_epochs)),
                 "train_time_per_epoch_mean"    : float(np.mean(times_per_epoch)),
-                "train_time_per_epoch_std"     :  float(np.std(times_per_epoch)),
-                "eval_wasserstein2_mean"       :    float(np.mean(w2s)),
-                "eval_wasserstein2_std"        :     float(np.std(w2s)),
+                "train_time_per_epoch_std"     : float(np.std(times_per_epoch)),
+                "eval_wasserstein2_mean"       : float(np.mean(w2s)),
+                "eval_wasserstein2_std"        : float(np.std(w2s)),
                 "eval_geometric_alignment_mean": float(np.mean(geos)),
-                "eval_geometric_alignment_std" :  float(np.std(geos))
+                "eval_geometric_alignment_std" : float(np.std(geos))
             }
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -431,6 +431,7 @@ if (__name__ == "__main__"):
             "distribution"  : dist_name,
             "ambient_dim"   : ambient_dim,
             "latent_dim"    : latent_dim,
+            "total_steps"   : total_steps,
             "sample_sizes"  : sample_sizes,
             "beta_a"        : beta_a,
             "beta_b"        : beta_b,

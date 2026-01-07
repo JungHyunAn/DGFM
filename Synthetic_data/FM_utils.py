@@ -383,7 +383,7 @@ def train_uniform_FM(model, optimizer, X_target, dim, device,
     stop_criteria = 0
 
     best_w2 = float("inf")
-    best_model = None
+    best_model = model
     recs = []
 
     for epoch in range(epochs):
@@ -413,20 +413,23 @@ def train_uniform_FM(model, optimizer, X_target, dim, device,
         w2 = np.sqrt(ot.emd2(np.ones(N-split)/(N-split), np.ones(N-split)/(N-split), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
 
         # Early stopping
+        save = "False"
         if early_stopping and ((best_w2 - w2) < tol):
             stop_criteria += 1
             if stop_criteria >= 3:  # stop after 3 epochs without improvement
                 break
-        else:
+        elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
             best_model = model
+            save = "True"
 
         # Record results
         recs.append(
             { "epoch": epoch, 
               "validation_w2": w2, 
-              "train_loss": loss.item() }
+              "train_loss": loss.item(),
+              "best_model_save": save }
         )
     return epoch, best_w2, recs, best_model
 
@@ -445,7 +448,7 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
     stop_criteria = 0
 
     best_w2 = float("inf")
-    best_model = None
+    best_model = model
     recs = []
 
     for epoch in range(epochs):
@@ -477,20 +480,23 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
         w2 = np.sqrt(ot.emd2(np.ones(N-split)/(N-split), np.ones(N-split)/(N-split), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
 
         # Early stopping
+        save = "False"
         if early_stopping and ((best_w2 - w2) < tol):
             stop_criteria += 1
             if stop_criteria >= 3:  # stop after 3 epochs without improvement
                 break
-        else:
+        elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
             best_model = model
+            save = "True"
 
         # Record results
         recs.append(
             { "epoch": epoch, 
               "validation_w2": w2, 
-              "train_loss": loss.item() }
+              "train_loss": loss.item(),
+              "best_model_save": save }
         )
     return epoch, best_w2, recs, best_model
 
@@ -533,7 +539,7 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
         
 
     best_w2    = float("inf")
-    best_model = None
+    best_model = model
     recs       = []
 
     global_M = M * mf
@@ -594,21 +600,25 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
             Xgen = run_flow(model, X0, device)
         w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
         # print(f"Validation epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
+
         # Early stopping
+        save = "False"
         if early_stopping and ((best_w2 - w2) < tol):
             stop_criteria += 1
             if stop_criteria >= 3:  # stop after 3 epochs without improvement
                 break
-        else:
+        elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
             best_model = model
+            save = "True"
 
         # Record results
         recs.append(
             { "epoch": epoch, 
               "validation_w2": w2, 
-              "train_loss": loss.item() }
+              "train_loss": loss.item(),
+              "best_model_save": save }
         ) 
     return mixture_sampler, epoch, best_w2, recs, best_model
 
@@ -651,7 +661,7 @@ def train_gfm(model, optimizer, X_target, dim, device,
         
 
     best_w2    = float("inf")
-    best_model = None
+    best_model = model
     recs       = []
 
     for epoch in range(epochs):
@@ -685,20 +695,23 @@ def train_gfm(model, optimizer, X_target, dim, device,
         # print(f"Validation epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
 
         # Early stopping
+        save = "False"
         if early_stopping and ((best_w2 - w2) < tol):
             stop_criteria += 1
             if stop_criteria >= 3:  # stop after 3 epochs without improvement
                 break
-        else:
+        elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
             best_model = model
+            save = "True"
 
         # Record results
         recs.append(
             { "epoch": epoch, 
               "validation_w2": w2, 
-              "train_loss": loss.item() }
+              "train_loss": loss.item(),
+              "best_model_save": save }
         ) 
     return mixture_sampler, epoch, best_w2, recs, best_model
 
@@ -739,7 +752,7 @@ def train_lfm(model, optimizer, X_target, dim, device,
         mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, truncation=truncation, device=device)
     
     best_w2    = float("inf")
-    best_model = None
+    best_model = model
     recs       = []
 
     for epoch in range(epochs):
@@ -780,20 +793,23 @@ def train_lfm(model, optimizer, X_target, dim, device,
         # print(f"Validation epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
 
         # Early stopping
+        save = "False"
         if early_stopping and ((best_w2 - w2) < tol):
             stop_criteria += 1
             if stop_criteria >= 3:  # stop after 3 epochs without improvement
                 break
-        else:
+        elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
             best_model = model
+            save = "True"
 
         # Record results
         recs.append(
             { "epoch": epoch, 
               "validation_w2": w2, 
-              "train_loss": loss.item() }
+              "train_loss": loss.item(),
+              "best_model_save": save }
         ) 
     return mixture_sampler, epoch, best_w2, recs, best_model
 

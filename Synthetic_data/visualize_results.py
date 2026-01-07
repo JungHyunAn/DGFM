@@ -221,7 +221,7 @@ def main():
 
     # ---- MOVE JSON FILE INTO OUTPUT DIRECTORY ----
     dst_json = os.path.join(output_dir, os.path.basename(selected))
-    shutil.move(selected, dst_json)
+    shutil.copy2(selected, dst_json)
 
     print(f"Graphs saved in {output_dir}")
 

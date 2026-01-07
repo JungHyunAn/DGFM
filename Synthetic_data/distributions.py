@@ -195,6 +195,14 @@ class Quadratic_Unimodal(Distribution):
             lin   = z_hat @ self.A.T 
             # quadratic term
             quad  = torch.einsum('ni,kij,nj->nk', z_hat, self.Q, z_hat)
+
+            """
+            with torch.no_grad():
+                lin_norm  = lin.norm(dim=1).mean().item()
+                quad_norm = quad.norm(dim=1).mean().item()
+                print(f"[Align] ||Az|| = {lin_norm:.4e}, ||z^T Q z|| = {quad_norm:.4e}")
+            """
+
             # prediction
             x_hat = lin + quad
 
