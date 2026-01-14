@@ -68,6 +68,8 @@ import os
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 from multiprocessing import get_context
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
@@ -87,10 +89,6 @@ for h in list(robosuite_logger.handlers):
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
 
 from Robot_simulation.heuristics_util import make_env, compute_smooth_trajectory_with_q0, render_trajectory, write_grid_video, step_towards
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 
 class FiLM(nn.Module):
@@ -537,7 +535,7 @@ class MixtureSampler:
 
 
 @torch.no_grad()
-def run_flow(model, x, c, device, n_steps=1000):
+def run_flow(model, x, c, device, n_steps=100):
     """Generates samples by transporting noisy samples through the given vector field
 
     Uses RK2 method to integrate the neural vector field v(x, c).
@@ -573,8 +571,7 @@ def run_flow(model, x, c, device, n_steps=1000):
 
 def _get_environment_params(
     env,
-    task_name: str,
-):
+    task_name: str):
     """Extract environment parameters used for conditioning.
 
     The function returns a 3‑tuple tailored to each task:
@@ -807,8 +804,7 @@ def _rollout_batch(
     task_name: str,
     q_low_batch: np.ndarray,          # (m, T, D) on CPU
     env_settings: List[dict],         # length m
-    print_true: bool
-) -> Tuple[int, float, list, list]:
+    print_true: bool) -> Tuple[int, float, list, list]:
     """Worker: restore envs from settings, upsample to controller rate, roll out CPU-only."""
     successes, reward_sum = 0, 0.0
     success_info, fail_info = [], []
@@ -882,8 +878,9 @@ def eval_model(
     render_width: int = 0,
     render_num: int = 0,
     base_seed: int = 123,
-    gpu_chunk_size: int | None = None,  # NEW: set to chunk the single GPU forward if memory-bound
-) -> Tuple[float, float]:
+    gpu_chunk_size: int | None = None,
+    q_low = None,
+    base_mixture = False) -> Tuple[float, float]:
     """ Evaluates a flow model on given environments.
 
     Multiprocessing is used by calling _rollout_batch to evaluate multiple environments in parallel.
@@ -914,48 +911,67 @@ def eval_model(
     """
     np_rng = np.random.RandomState(base_seed)
 
-    # ---- (2) One GPU forward (optionally chunked) to produce all q_low ----
+
+    # ---- (1) One GPU forward (optionally chunked) to produce all q_low ----
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if not use_cuda:
         device = "cpu"
 
-    model.eval()
-
     # pre-allocate to collect all q_low on CPU
     q_low_all = np.empty((trials, seq_len, dof), dtype=np.float32)
 
-    if gpu_chunk_size is None or gpu_chunk_size <= 0:
-        # single shot (ensure it fits!)
-        x0 = torch.from_numpy(np_rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
-        c  = torch.from_numpy(val_params).to(device)
-        if use_cuda:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                q_low = run_flow(model, x0, c, device)          # (N, T, D) on CUDA
-            q_low_all[:] = q_low.float().cpu().numpy()
-            del q_low; torch.cuda.empty_cache()
-        else:
-            with torch.inference_mode():
-                q_low = run_flow(model, x0, c, device)          # CPU path
-            q_low_all[:] = q_low.cpu().numpy()
-    else:
-        # chunked single pass to cap VRAM
-        N = trials
-        for s in range(0, N, gpu_chunk_size):
-            e = min(N, s + gpu_chunk_size)
-            bs = e - s
-            x0 = torch.from_numpy(np_rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
-            c  = torch.from_numpy(val_params[s:e]).to(device)
+    if q_low is None and model is not None:
+        model.eval()
+        if gpu_chunk_size is None or gpu_chunk_size <= 0:
+            # single shot (ensure it fits!)
+            x0 = torch.from_numpy(np_rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
+            c  = torch.from_numpy(val_params).to(device)
             if use_cuda:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                    q_low = run_flow(model, x0, c, device)
-                q_low_all[s:e] = q_low.float().cpu().numpy()
+                    q_low = run_flow(model, x0, c, device)          # (N, T, D) on CUDA
+                q_low_all[:] = q_low.float().cpu().numpy()
                 del q_low; torch.cuda.empty_cache()
             else:
                 with torch.inference_mode():
-                    q_low = run_flow(model, x0, c, device)
-                q_low_all[s:e] = q_low.cpu().numpy()
+                    q_low = run_flow(model, x0, c, device)          # CPU path
+                q_low_all[:] = q_low.cpu().numpy()
+        else:
+            # chunked single pass to cap VRAM
+            N = trials
+            for s in range(0, N, gpu_chunk_size):
+                e = min(N, s + gpu_chunk_size)
+                bs = e - s
+                x0 = torch.from_numpy(np_rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
+                c  = torch.from_numpy(val_params[s:e]).to(device)
+                if use_cuda:
+                    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                        q_low = run_flow(model, x0, c, device)
+                    q_low_all[s:e] = q_low.float().cpu().numpy()
+                    del q_low; torch.cuda.empty_cache()
+                else:
+                    with torch.inference_mode():
+                        q_low = run_flow(model, x0, c, device)
+                    q_low_all[s:e] = q_low.cpu().numpy()
+    elif q_low is not None:
+        q_low_all = q_low.cpu().numpy()
 
-    # ---- (3) Roll out on CPU with multiple workers ----
+        if base_mixture:
+            model.eval()
+            x0 = torch.from_numpy(q_low_all).to(device)
+            c  = torch.from_numpy(val_params).to(device)
+
+            if use_cuda:
+                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                    q_low = run_flow(model, x0, c, device)          # (N, T, D) on CUDA
+                q_low_all[:] = q_low.float().cpu().numpy()
+                del q_low; torch.cuda.empty_cache()
+            else:
+                with torch.inference_mode():
+                    q_low = run_flow(model, x0, c, device)          # CPU path
+                q_low_all[:] = q_low.cpu().numpy()
+
+
+    # ---- (2) Roll out on CPU with multiple workers ----
     # even split of trials across workers
     base, rem = divmod(trials, max(1, num_workers))
     splits: List[tuple[int, int]] = []
@@ -999,7 +1015,7 @@ def eval_model(
     success_rate = total_success / trials
     mean_reward  = total_reward  / trials
 
-    # ---- (optional) render sample grid (unchanged) ----
+    # ---- (optional) render sample grid ----
     episode_frames = []
     s_left = min(s_count, render_num)
     f_left = min(f_count, render_width*render_width - render_num)
@@ -1352,6 +1368,62 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
     return mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights
 
 
+def build_joint_interpolants(
+    X_train, C_train, perm_t, M, mf,
+    mixture_sampler, inv_cluster, n_t_global, n_t_local, 
+    seq_len, dof, param_len, device):
+    """
+    Build interpolants for DGFM; global:local = mf:1
+    """
+
+    global_M = M * mf
+
+    # ===== GLOBAL =====
+    x0g             = torch.randn(global_M, seq_len, dof, device=device)
+    x1g_flat, c1g, _ = mixture_sampler.sample_joint(global_M, truncated=True)
+    x1g             = x1g_flat.reshape(global_M, seq_len, dof)
+
+    tg   = torch.rand(global_M * n_t_global, device=device).unsqueeze(-1)
+    x0gr = x0g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
+    x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
+
+    xtg   = (1 - tg.view(-1,1,1)) * x0gr + tg.view(-1,1,1) * x1gr
+    vg    = 2.0 * (x1gr - x0gr)
+    cg    = c1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
+    t_ing = 0.5 * tg
+
+    # ===== LOCAL =====
+    idx  = perm_t[:M]
+    x1l  = X_train[idx]
+    c1l  = C_train[idx,:]
+
+    pis = torch.tensor(
+        [np.random.choice(inv_cluster[i]) for i in idx.detach().cpu().tolist()],
+        dtype=torch.long,
+        device=device,
+    )
+    x0l_flat, _, _ = mixture_sampler.sample_cond(c1l, truncated=True, pis=pis)
+    x0l            = x0l_flat.reshape(M, seq_len, dof)
+
+    tl   = torch.rand(M * n_t_local, device=device).unsqueeze(-1)
+    x0lr = x0l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
+    x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
+
+    xtl   = (1 - tl.view(-1,1,1)) * x0lr + tl.view(-1,1,1) * x1lr
+    vl    = 2 * (x1lr - x0lr)
+    cl    = c1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
+    t_inl = 0.5 * tl + 0.5
+
+    # ===== CONCAT =====
+    XT  = torch.cat([xtg,   xtl],   dim=0)
+    VT  = torch.cat([vg,    vl],    dim=0)
+    TIN = torch.cat([t_ing, t_inl], dim=0)
+    CT  = torch.cat([cg,    cl],    dim=0)
+
+    perm = torch.randperm(XT.shape[0], device=device)
+    return XT[perm], TIN[perm], VT[perm], CT[perm]
+
+
 def train_uniform_FM(
     model,
     optimizer,
@@ -1370,8 +1442,7 @@ def train_uniform_FM(
     val_period=5,
     early_stopping=True,
     stop_criteria=3,
-    val_trials=25,
-):
+    val_trials=25):
     """Train vanilla Flow Matching with uniform `t`.
 
     The data term draws (x0, x1) pairs where x0~N(0, I) and x1 is a ground-truth
@@ -1499,8 +1570,7 @@ def train_shifted_FM(
     stop_criteria=3,
     beta_a = 1.5,
     beta_b = 1,
-    val_trials =25,
-):
+    val_trials =25):
     """Train Flow Matching with Beta-biased time sampling ("Shifted FM").
 
     Draw time `t` from Beta(beta_a, beta_b), then reflect to emphasize later
@@ -1621,8 +1691,7 @@ def train_DGFM(
     stop_criteria=3,
     scale_x=1.0,
     scale_c=1.0,
-    val_trials=25,
-):
+    val_trials=25):
     """Train Dimension-Guided Flow Matching (DGFM, conditional).
 
     DGFM builds a conditional mixture over (x, c) by clustering joint features
@@ -1680,13 +1749,13 @@ def train_DGFM(
     )
 
     # -------- 1) Train loop (global + local, eval, early stop) --------
-    N = target_trajectories.shape[0]
-    global_N = mf * N
-    best_avg_reward = 0.0
+    N                 = target_trajectories.shape[0]
+    joint_N           = (mf + 1) * N
+    best_avg_reward   = 0.0
     best_success_rate = 0.0
-    best_model = copy.deepcopy(model)
+    best_model        = copy.deepcopy(model)
     success_rate_recs = {}
-    stop_count = 0
+    stop_count        = 0
 
     # ---- Build environments sequentially for validation and close them ----
     env_settings_all, val_params = _generate_val_env(task_name, val_trials)
@@ -1699,80 +1768,47 @@ def train_DGFM(
         for epoch in tqdm(range(1, max_epochs + 1), desc=f"DGFM_mf{mf} Training", unit="epoch"):
             model.train()
 
-            # ===== Global FM: t ∈ [0, 0.5] (scale factor mf) =====
-            g_loss_sum = 0.0
-            for i in range(0, global_N, batch_size):
-                m = min(batch_size, global_N - i)
+            perm_t = torch.randperm(X_np.shape[0], device=device)
 
-                # base noise
-                x0 = torch.randn(m, seq_len, dof, device=device)
+            # ===== Build joint interpolants =====
+            XT, TIN, VT, CT = build_joint_interpolants(
+                X_train=target_trajectories,
+                C_train=environment_parameters,
+                perm_t=perm_t,      # pass block directly
+                M=N,
+                mf=mf,
+                mixture_sampler=mixture_sampler,
+                inv_cluster=inv_cluster,
+                n_t_global=n_t_global,
+                n_t_local=n_t_local,
+                seq_len=seq_len,
+                dof=dof,
+                param_len=param_len,
+                device=device
+            )
 
-                # mixture joint sample (flattened x), reshape to (m, T, dof)
-                x1_flat, c1, _ = mixture_sampler.sample_joint(m, truncated=True)
-                x1 = x1_flat.reshape(m, seq_len, dof)
+            # ===== Batched training =====
+            loss_sum = 0.0
+            for i in range(0, joint_N, batch_size):
+                m    = min(batch_size, joint_N - i)
 
-                # times in [0,1] -> we evaluate at 0.5 * t and scale target by 2
-                t = torch.rand(m * n_t_global, device=device).unsqueeze(-1)  # (m*n_tg, 1)
-                x0r = x0.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-                x1r = x1.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-                xt  = (1 - t.view(-1,1,1)) * x0r + t.view(-1,1,1) * x1r
-
-                # broadcast env params from mixture
-                env_r = c1.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
-                target_v = 2.0 * (x1r - x0r)
+                xb   = XT[i:i+batch_size]
+                tb   = TIN[i:i+batch_size]
+                vb   = VT[i:i+batch_size]
+                cb   = CT[i:i+batch_size]
 
                 with torch.enable_grad():
-                    pred_v   = model(xt, 0.5 * t, env_r)
-                    sq_err   = (pred_v - target_v) ** 2
+                    pred   = model(xb, tb, cb)
+                    sq_err = (pred - vb) ** 2
                     if hasattr(model, "loss_mask") and model.loss_mask is not None:
                         sq_err = sq_err * model.loss_mask
-                    loss = sq_err.mean()
+                    loss   = sq_err.mean()
+
                     optimizer.zero_grad()
                     loss.backward()
+                    optimizer.step()
 
-                optimizer.step()
-                g_loss_sum += float(loss.item())
-
-            # ===== Local FM: t ∈ [0.5, 1.0] (scale factor 2) =====
-            l_loss_sum = 0.0
-            perm_t = torch.randperm(N, device=device)
-            for i in range(0, N, batch_size):
-                idx = perm_t[i:min(i + batch_size, N)]
-                bsz = idx.shape[0]
-
-                x_true = target_trajectories[idx]               # (bsz, T, dof)
-                c_true = environment_parameters[idx, :]         # (bsz, P)
-
-                # mixture conditional anchors: x̃ ~ p̃(x|c_true)  -> reshape to (bsz, T, dof)
-                pis = torch.tensor(
-                    [np.random.choice(inv_cluster[j]) for j in idx.detach().cpu().tolist()],
-                    dtype=torch.long,
-                    device=device,
-                )
-                x_tilde_flat, _, _ = mixture_sampler.sample_cond(c_true, truncated=True, pis=pis)
-                x_tilde = x_tilde_flat.reshape(bsz, seq_len, dof)
-
-                # times in [0,1] -> evaluate at 0.5 * t + 0.5 and scale target by 2
-                t = torch.rand(bsz * n_t_local, device=device).unsqueeze(-1)      # (bsz*n_tl, 1)
-                x0r = x_tilde.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-                x1r = x_true.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-                xt  = (1 - t.view(-1,1,1)) * x0r + t.view(-1,1,1) * x1r
-
-                env_r = c_true.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
-
-                target_v = 2.0 * (x1r - x0r)
-
-                with torch.enable_grad():
-                    pred_v   = model(xt, 0.5 * t + 0.5, env_r)
-                    sq_err   = (pred_v - target_v) ** 2
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss = sq_err.mean()
-                    
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                l_loss_sum += float(loss.item())
+                    loss_sum += float(loss.item())
 
             if scheduler is not None:
                 scheduler.step()
@@ -1788,13 +1824,12 @@ def train_DGFM(
                 success_rate_recs[epoch] = {
                     "success_rate": success_rate,
                     "avg_reward":   avg_reward,
-                    "g_loss":       g_loss_sum,
-                    "l_loss":       l_loss_sum,
+                    "loss":         loss_sum / (1+mf),
                 }
 
                 if success_rate < best_success_rate:
                     tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                               f"avg reward={avg_reward:.3f}, g_loss={g_loss_sum:.3f}, l_loss={l_loss_sum:.3f}")
+                               f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f}")
                     if early_stopping:
                         if stop_count == stop_criteria:
                             tqdm.write("Early stopping triggered.")
@@ -1808,13 +1843,360 @@ def train_DGFM(
                         best_model = copy.deepcopy(model)
                         stop_count = 0
                         tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, g_loss={g_loss_sum:.3f}, l_loss={l_loss_sum:.3f} | Best model saved")
+                                   f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f} | Best model saved")
                     else:
                         tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, g_loss={g_loss_sum:.3f}, l_loss={l_loss_sum:.3f}")
+                                   f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f}")
 
     except KeyboardInterrupt:
         tqdm.write("Training interrupted by user. Returning best model so far...")
 
-    return best_model, model, success_rate_recs
+    return best_model, model, success_rate_recs, mixture_sampler
 
+
+def train_GFM(
+    model,
+    optimizer,
+    scheduler,
+    task_name,
+    target_trajectories,
+    environment_parameters,
+    seq_len,
+    dof,
+    param_len,
+    gripper_idx,
+    mf,                   # global augmentation ratio (multiplication factor)
+    n_t_local,
+    n_t_global,
+    cluster_size,
+    cluster_d,
+    max_epochs,
+    batch_size,
+    device,
+    val_period=5,
+    early_stopping=True,
+    stop_criteria=3,
+    scale_x=1.0,
+    scale_c=1.0,
+    val_trials=25):
+    """Train GFM only
+
+    Logic is same as DGFM
+    """
+    # -------- 0) Build mixture on (x, c) --------
+    print("Clustering dataset . . .")
+    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
+    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
+
+    clusters, inv_cluster = cluster_points_joint(
+        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
+        standardize=True, scale_x=scale_x, scale_c=scale_c
+    )
+
+    print(f"{len(clusters)} clusters made! Applying PCA . . .")
+    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
+        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
+        max_pca_samples=2000, n_jobs=-1
+    )
+
+    mixture_sampler = MixtureSampler(
+        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
+    )
+
+    N                 = target_trajectories.shape[0]
+    best_avg_reward   = 0.0
+    best_success_rate = 0.0
+    best_model        = copy.deepcopy(model)
+    success_rate_recs = {}
+    stop_count        = 0    
+
+    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
+
+    try:
+        model = model.to(device)
+        target_trajectories = target_trajectories.to(device)          # (N, T, dof)
+        environment_parameters = environment_parameters.to(device)    # (N, param_len)
+
+        for epoch in tqdm(range(1, max_epochs + 1), desc=f"GFM Training", unit="epoch"):
+            model.train()
+
+            # sample from intermediate GMM
+            x0g              = torch.randn(N, seq_len, dof, device=device)
+            x1g_flat, c1g, _ = mixture_sampler.sample_joint(N, truncated=True)
+            x1g              = x1g_flat.reshape(N, seq_len, dof)
+
+            tg   = torch.rand(N * n_t_global, device=device).unsqueeze(-1)
+            x0gr = x0g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
+            x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
+
+            XT    = (1 - tg.view(-1,1,1)) * x0gr + tg.view(-1,1,1) * x1gr
+            VT    = x1gr - x0gr
+            CT    = c1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
+            TIN   = tg
+
+            # ===== Batched training =====
+            loss_sum = 0.0
+            for i in range(0, N, batch_size):
+                m    = min(batch_size, N - i)
+
+                xb   = XT[i:i+batch_size]
+                tb   = TIN[i:i+batch_size]
+                vb   = VT[i:i+batch_size]
+                cb   = CT[i:i+batch_size]
+
+                with torch.enable_grad():
+                    pred   = model(xb, tb, cb)
+                    sq_err = (pred - vb) ** 2
+                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
+                        sq_err = sq_err * model.loss_mask
+                    loss   = sq_err.mean()
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    loss_sum += float(loss.item())
+
+            if scheduler is not None:
+                scheduler.step()
+
+            # ===== Validation / early stopping =====
+            if epoch % val_period == 0:
+                model.eval()
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
+                
+                if not torch.is_grad_enabled():
+                    torch.set_grad_enabled(True)
+
+                success_rate_recs[epoch] = {
+                    "success_rate": success_rate,
+                    "avg_reward":   avg_reward,
+                    "loss":         loss_sum,
+                }
+
+                if success_rate < best_success_rate:
+                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                               f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
+                    if early_stopping:
+                        if stop_count == stop_criteria:
+                            tqdm.write("Early stopping triggered.")
+                            break
+                        else:
+                            stop_count += 1
+                else:
+                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                        best_avg_reward = avg_reward
+                        best_success_rate = success_rate
+                        best_model = copy.deepcopy(model)
+                        stop_count = 0
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
+                    else:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
+
+    except KeyboardInterrupt:
+        tqdm.write("Training interrupted by user. Returning best model so far...")
+
+    return best_model, model, success_rate_recs, mixture_sampler
+
+
+def train_LFM(
+    model,
+    optimizer,
+    scheduler,
+    task_name,
+    target_trajectories,
+    environment_parameters,
+    seq_len,
+    dof,
+    param_len,
+    gripper_idx,
+    mf,                   # global augmentation ratio (multiplication factor)
+    n_t_local,
+    n_t_global,
+    cluster_size,
+    cluster_d,
+    max_epochs,
+    batch_size,
+    device,
+    val_period=5,
+    early_stopping=True,
+    stop_criteria=3,
+    scale_x=1.0,
+    scale_c=1.0,
+    val_trials=25):
+    """Train LFM only
+
+    Logic is same as DGFM
+    """
+
+    # -------- 0) Build mixture on (x, c) --------
+    print("Clustering dataset . . .")
+    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
+    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
+
+    clusters, inv_cluster = cluster_points_joint(
+        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
+        standardize=True, scale_x=scale_x, scale_c=scale_c
+    )
+
+    print(f"{len(clusters)} clusters made! Applying PCA . . .")
+    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
+        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
+        max_pca_samples=2000, n_jobs=-1
+    )
+
+    mixture_sampler = MixtureSampler(
+        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
+    )
+
+    N                 = target_trajectories.shape[0]
+    best_avg_reward   = 0.0
+    best_success_rate = 0.0
+    best_model        = copy.deepcopy(model)
+    success_rate_recs = {}
+    stop_count        = 0    
+
+    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
+
+    try:
+        model = model.to(device)
+        target_trajectories = target_trajectories.to(device)          # (N, T, dof)
+        environment_parameters = environment_parameters.to(device)    # (N, param_len)
+
+        for epoch in tqdm(range(1, max_epochs + 1), desc=f"LFM Training", unit="epoch"):
+            model.train()
+
+            # sample from intermediate GMM
+            perm_t = torch.randperm(X_np.shape[0], device=device)
+            idx    = perm_t[:N]
+            x1l    = target_trajectories[idx]
+            c1l    = environment_parameters[idx,:]
+
+            pis = torch.tensor(
+                [np.random.choice(inv_cluster[i]) for i in idx.detach().cpu().tolist()],
+                dtype=torch.long,
+                device=device,
+            )
+            x0l_flat, _, _ = mixture_sampler.sample_cond(c1l, truncated=True, pis=pis)
+            x0l            = x0l_flat.reshape(N, seq_len, dof)
+
+            tl   = torch.rand(N * n_t_local, device=device).unsqueeze(-1)
+            x0lr = x0l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
+            x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
+
+            XT    = (1 - tl.view(-1,1,1)) * x0lr + tl.view(-1,1,1) * x1lr
+            VT    = x1lr - x0lr
+            CT    = c1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
+            TIN   = tl
+
+            # ===== Batched training =====
+            loss_sum = 0.0
+            for i in range(0, N, batch_size):
+                m    = min(batch_size, N - i)
+
+                xb   = XT[i:i+batch_size]
+                tb   = TIN[i:i+batch_size]
+                vb   = VT[i:i+batch_size]
+                cb   = CT[i:i+batch_size]
+
+                with torch.enable_grad():
+                    pred   = model(xb, tb, cb)
+                    sq_err = (pred - vb) ** 2
+                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
+                        sq_err = sq_err * model.loss_mask
+                    loss   = sq_err.mean()
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+
+                    loss_sum += float(loss.item())
+
+            if scheduler is not None:
+                scheduler.step()
+
+            # ===== Validation / early stopping =====
+            if epoch % val_period == 0:
+                model.eval()
+                q_low_flat, _, _ = mixture_sampler.sample_cond(val_params, truncated=True)
+                q_low            = q_low_flat.reshape(val_trials, seq_len, dof)
+                base_mixture     = True
+
+                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, \
+                                                      trials=val_trials, q_low=q_low, base_mixture=base_mixture)
+                
+                if not torch.is_grad_enabled():
+                    torch.set_grad_enabled(True)
+
+                success_rate_recs[epoch] = {
+                    "success_rate": success_rate,
+                    "avg_reward":   avg_reward,
+                    "loss":         loss_sum,
+                }
+
+                if success_rate < best_success_rate:
+                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                               f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
+                    if early_stopping:
+                        if stop_count == stop_criteria:
+                            tqdm.write("Early stopping triggered.")
+                            break
+                        else:
+                            stop_count += 1
+                else:
+                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                        best_avg_reward = avg_reward
+                        best_success_rate = success_rate
+                        best_model = copy.deepcopy(model)
+                        stop_count = 0
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
+                    else:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
+
+    except KeyboardInterrupt:
+        tqdm.write("Training interrupted by user. Returning best model so far...")
+
+    return best_model, model, success_rate_recs, mixture_sampler
+
+
+def train_GMM(
+    target_trajectories,
+    environment_parameters,
+    seq_len,
+    dof,
+    param_len,
+    gripper_idx,
+    cluster_size,
+    cluster_d,
+    device,
+    scale_x=1.0,
+    scale_c=1.0):
+    """Creates GMM used for DGFM/GFM/LFM
+
+    Logic is same as DGFM
+    """
+    # -------- 0) Build mixture on (x, c) --------
+    print("Clustering dataset . . .")
+    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
+    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
+
+    clusters, inv_cluster = cluster_points_joint(
+        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
+        standardize=True, scale_x=scale_x, scale_c=scale_c
+    )
+
+    print(f"{len(clusters)} clusters made! Applying PCA . . .")
+    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
+        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
+        max_pca_samples=2000, n_jobs=-1
+    )
+
+    mixture_sampler = MixtureSampler(
+        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
+    )
+
+    return mixture_sampler, inv_cluster

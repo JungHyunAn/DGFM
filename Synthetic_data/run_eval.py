@@ -1,21 +1,28 @@
 import os
 import time
 import random
+import json
+import math
+import concurrent.futures
+import multiprocessing
 import numpy as np
 import torch
 import torch.optim as optim
+
+from torch.optim.lr_scheduler import LambdaLR
 from datetime import datetime
-import json
-import concurrent.futures
-import multiprocessing
 from tqdm import tqdm
 from zoneinfo import ZoneInfo
+
 from Synthetic_data.distributions import NormalDistribution, \
                                          Quadratic_Uniform, \
                                          Quadratic_Unimodal, \
                                          Quadratic_Multimodal, \
                                          Linear_Branched, \
-                                         SwissRoll
+                                         SwissRoll, \
+                                         TwoMoon, \
+                                         PinWheel
+
 from Synthetic_data.FM_utils import VectorField, \
                                     train_uniform_FM, \
                                     train_shifted_FM, \
@@ -25,6 +32,17 @@ from Synthetic_data.FM_utils import VectorField, \
                                     run_flow
 
 NUM_WORKERS = 5  # Number of parallel workers for training DGFM
+
+
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr_scale=0.05, last_step=-1):
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = max(0.0, min(1.0, progress))  # clamp to [0,1]
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_lr_scale + (1.0 - min_lr_scale) * cosine
+    return LambdaLR(optimizer, lr_lambda, last_step)
 
 
 def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
@@ -52,58 +70,73 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         dist = Linear_Branched(ambient_dim, device, latent_dim, noise_std=noise_std)
     elif dist_name == "SwissRoll":
         dist = SwissRoll(ambient_dim, device, latent_dim, noise_std=noise_std)
+    elif dist_name == "TwoMoon":
+        dist = TwoMoon(ambient_dim, device, latent_dim, noise_std=noise_std)
+    elif dist_name == "PinWheel":
+        dist = PinWheel(ambient_dim, device, latent_dim, noise_std=noise_std)
     else:
         raise ValueError(f"Unknown distribution: {dist_name}")
     
-    
+    # latent_dim -= 2 # Add ONLY for dimension misspecification experiment!!!
+
     # 2) sample training data
     X_train = dist.sample(n)
 
     trial_results = {}
 
-    # ----- VanillaFM -----
-    model_van = VectorField(ambient_dim).to(device)
-    opt_van   = optim.Adam(model_van.parameters(), lr=1e-3)
-    time_van  = 0.0
 
     # 3) train FM with uniform t sampling
+    epoch_uniform = int(max_steps * batch_size * 10 / n / 9)
+
+    model_uniform = VectorField(ambient_dim).to(device)
+    opt_uniform   = optim.Adam(model_uniform.parameters(), lr=2e-3, weight_decay=1e-5)
+    sch_uniform   = get_cosine_schedule_with_warmup(opt_uniform, int(0.2*max_steps), max_steps)
+
+    time_uniform  = 0.0
+
+    # print("Estimated dimension: ", latent_dim)
     t0 = time.thread_time()
-    epoch, _, recs_uniformFM, best_model_van = train_uniform_FM(
-        model_van, opt_van, X_train,
+    epoch, _, recs_uniformFM, best_model_uniform = train_uniform_FM(
+        model_uniform, opt_uniform, sch_uniform, X_train,
         ambient_dim, device,
         n_t=total_n_t,
-        epochs=int(max_steps * batch_size * 10 / n / 9),
+        epochs=epoch_uniform,
         batch_size=batch_size,
         early_stopping=early_stopping,
     )
-    time_van += time.thread_time() - t0
+    time_uniform += time.thread_time() - t0
 
     # eval
     X0   = np.random.randn(test_size, ambient_dim)
-    Xgen = run_flow(best_model_van, X0, device)
+    Xgen = run_flow(best_model_uniform, X0, device)
     w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
     geo  = dist.geometric_alignment(Xgen)
 
     recs_uniformFM.append({
         "final_epoch": epoch,
-        "train_time": time_van,
+        "train_time": time_uniform,
         "eval_wasserstein2": w2,
         "eval_geometric_alignment": geo
     })
 
     trial_results["UniformFM"] = recs_uniformFM
 
+
     # 4) train FM with shifted t sampling
+    epoch_shifted = int(max_steps * batch_size * 10 / n / 9)
+
     model_shifted = VectorField(ambient_dim).to(device)
-    opt_shifted   = optim.Adam(model_shifted.parameters(), lr=1e-3)
+    opt_shifted   = optim.Adam(model_shifted.parameters(), lr=2e-3, weight_decay=1e-5)
+    sch_shifted   = get_cosine_schedule_with_warmup(opt_shifted, int(0.2*max_steps), max_steps)
+
     time_shifted  = 0.0
 
     t0 = time.thread_time()
     epoch, _, recs_shiftedFM, best_model_shifted = train_shifted_FM(
-        model_shifted, opt_shifted, X_train,
+        model_shifted, opt_shifted, sch_shifted, X_train,
         ambient_dim, device,
         n_t=total_n_t,
-        epochs=int(max_steps * batch_size * 10 / n / 9),  
+        epochs=epoch_shifted,  
         batch_size=batch_size,
         early_stopping=early_stopping,
         beta_a=beta_a, beta_b=beta_b
@@ -126,25 +159,29 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     trial_results["ShiftedFM"] = recs_shiftedFM
 
 
-    cluster_size = min(int(n/cluster_num), latent_dim+5)
-
+    cluster_size = max(int(0.9* n / cluster_num), latent_dim+5)
     # 5) train DGFM (one entry per mf)
     for mf in mf_list:
         key_dg    = f"DGFM-{mf}"
+        epoch_dg  = int(max_steps * batch_size * 10 / n / 9 / (1+mf))
+
         model_dg  = VectorField(ambient_dim).to(device)
-        opt_dg    = optim.Adam(model_dg.parameters(), lr=1e-3)
+
+        opt_dg    = optim.Adam(model_dg.parameters(), lr=2e-3, weight_decay=1e-5)
+        sch_dg    = get_cosine_schedule_with_warmup(opt_dg, int(0.2*max_steps), max_steps)
+
         time_dg   = 0.0
         mixture_sampler = None
 
         t0 = time.thread_time()
         mixture_sampler, epoch, _, recs_dg, best_model_dg = train_dgfm(
-            model_dg, opt_dg,
+            model_dg, opt_dg, sch_dg,
             X_train, ambient_dim,
             mf, device,
             mixture_sampler=mixture_sampler,
             n_t_global=global_n_t,
             n_t_local=local_n_t,
-            epochs=int(max_steps * batch_size * 10 / n / 9 / (1+mf)),
+            epochs=epoch_dg,
             batch_size=batch_size,
             cluster_size=cluster_size,
             cluster_d=latent_dim,
@@ -168,19 +205,24 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
         trial_results[key_dg] = recs_dg
 
+
     # 6) train GFM only
-    model_GFM       = VectorField(ambient_dim).to(device)
-    opt_GFM         = optim.Adam(model_GFM.parameters(), lr=1e-3)
+    epoch_GFM = int(max_steps * batch_size * 10 / n / 9)
+
+    model_GFM = VectorField(ambient_dim).to(device)
+    opt_GFM   = optim.Adam(model_GFM.parameters(), lr=2e-3, weight_decay=1e-5)
+    sch_GFM   = get_cosine_schedule_with_warmup(opt_GFM, int(0.2*max_steps), max_steps)
+    
     time_GFM        = 0.0
     mixture_sampler = None
 
     t0 = time.thread_time()
     mixture_sampler, epoch, _, recs_GFM, best_model_GFM = train_gfm(
-        model_GFM, opt_GFM, X_train,
+        model_GFM, opt_GFM, sch_GFM, X_train,
         ambient_dim, device,
         mixture_sampler=mixture_sampler,
         n_t_global=global_n_t,
-        epochs=int(max_steps * batch_size * 10 / n / 9),
+        epochs=epoch_GFM,
         batch_size=batch_size,
         cluster_size=cluster_size,
         cluster_d=latent_dim,
@@ -204,19 +246,24 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
     trial_results["GFM"] = recs_GFM
 
+
     # 7) train LFM only
-    model_LFM       = VectorField(ambient_dim).to(device)
-    opt_LFM         = optim.Adam(model_LFM.parameters(), lr=1e-3)
-    time_LFM        = 0.0
+    epoch_LFM = int(max_steps * batch_size * 10 / n / 9)
+
+    model_LFM = VectorField(ambient_dim).to(device)
+    opt_LFM   = optim.Adam(model_LFM.parameters(), lr=2e-3, weight_decay=1e-5)
+    sch_LFM   = get_cosine_schedule_with_warmup(opt_LFM, int(0.2*max_steps), max_steps)
+
+    time_LFM  = 0.0
     mixture_sampler = None
 
     t0 = time.thread_time()
     mixture_sampler, epoch, _, recs_LFM, best_model_LFM = train_lfm(
-        model_LFM, opt_LFM, X_train,
+        model_LFM, opt_LFM, sch_LFM, X_train,
         ambient_dim, device,
         mixture_sampler=mixture_sampler,
         n_t_local=local_n_t,
-        epochs=int(max_steps * batch_size * 10 / n / 9),
+        epochs=epoch_LFM,
         batch_size=batch_size,
         cluster_size=cluster_size,
         cluster_d=latent_dim,
@@ -240,6 +287,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
     trial_results["LFM"] = recs_LFM
 
+
     # 8) GMM baseline
     Xgen, _ = mixture_sampler.truncated_sample(test_size)
     w2    = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
@@ -248,7 +296,8 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     recs_GMM = [{"final_epoch": 1,
                  "train_time": 0,
                  "eval_wasserstein2": w2,
-                 "eval_geometric_alignment": geo}]
+                 "eval_geometric_alignment": geo,
+                 "cluster_num": len(mixture_sampler.clusters)}]
 
     trial_results["GMM"] = recs_GMM
 
@@ -307,6 +356,8 @@ if (__name__ == "__main__"):
     print("  [4] Quadratic_Multimodal")
     print("  [5] Branched Linear")
     print("  [6] SwissRoll")
+    print("  [7] TwoMoon")
+    print("  [8] PinWheel")
     dkey = input(">>> ").strip()
     if dkey == "1":
         dist_name = "Normal"
@@ -320,6 +371,10 @@ if (__name__ == "__main__"):
         dist_name = "Linear_Branched"
     elif dkey == "6":
         dist_name = "SwissRoll"
+    elif dkey == "7":
+        dist_name = "TwoMoon"
+    elif dkey == "8":
+        dist_name = "PinWheel"
     else:
         print("Invalid choice."); exit(1)
 
@@ -432,6 +487,8 @@ if (__name__ == "__main__"):
             "ambient_dim"   : ambient_dim,
             "latent_dim"    : latent_dim,
             "total_steps"   : total_steps,
+            "min_batch_size": batch_size,
+            "batch number"  : batch_num,
             "sample_sizes"  : sample_sizes,
             "beta_a"        : beta_a,
             "beta_b"        : beta_b,

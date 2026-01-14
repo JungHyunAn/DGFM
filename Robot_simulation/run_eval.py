@@ -136,7 +136,13 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
 
-from Robot_simulation.FM_util import VectorField, train_uniform_FM, train_shifted_FM, train_DGFM, eval_model, _get_environment_params, _align_handle_to_nut
+from Robot_simulation.FM_util import VectorField, eval_model, _get_environment_params, _align_handle_to_nut, \
+                                     train_uniform_FM, \
+                                     train_shifted_FM, \
+                                     train_DGFM, \
+                                     train_GFM, \
+                                     train_LFM, \
+                                     train_GMM 
 from Robot_simulation.heuristics_util import make_env
 
 
@@ -221,7 +227,10 @@ def train_and_eval_FM(
 ):
     trainer_map = {"UniformFM" : train_uniform_FM,
                    "ShiftedFM" : train_shifted_FM,
-                   "DGFM"      : train_DGFM}
+                   "DGFM"      : train_DGFM,
+                   "GFM"       : train_GFM,
+                   "LFM"       : train_LFM,
+                   "GMM"       : train_GMM}
     trainer = trainer_map[FM_type]
 
     timestamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime("%Y%m%dT%H%M%S")
@@ -281,7 +290,10 @@ def train_and_eval_FM(
 
     # train model
     print(f"[{datetime.now(ZoneInfo('Asia/Seoul')).isoformat()}] Starting {FM_type} training for {task_name} with {N} samples…")
-    if FM_type != "DGFM":
+    
+    q_low      = None
+    best_model = None
+    if FM_type == "UniformFM" or FM_type == "ShiftedFM":
         best_model, last_model, recs = trainer(model=model,
                                             optimizer=optimizer,
                                             scheduler=scheduler,
@@ -318,28 +330,41 @@ def train_and_eval_FM(
         else:
             cluster_d = None
             cluster_size = None
-                    
-        best_model, last_model, recs = trainer(model=model,
-                                               optimizer=optimizer,
-                                               scheduler=scheduler,
-                                               task_name=task_name,
-                                               target_trajectories=target_trajectories,
-                                               environment_parameters=env_params,
-                                               seq_len=seq_len,
-                                               dof=dof,
-                                               param_len=param_len,
-                                               gripper_idx=gripper_idx,
-                                               mf=mf,
-                                               n_t_local=n_t_local,
-                                               n_t_global=n_t_global,
-                                               cluster_size=cluster_size,
-                                               cluster_d=cluster_d,
-                                               max_epochs=max_epochs,
-                                               batch_size=batch_size,
-                                               device=device,
-                                               val_period=val_period,
-                                               early_stopping=early_stopping,
-                                               stop_criteria=stop_criteria)
+
+        if FM_type == "GMM":
+            mixture_sampler, inv_cluster = trainer(target_trajectories=target_trajectories,
+                                                environment_parameters=env_params,
+                                                seq_len=seq_len,
+                                                dof=dof,
+                                                param_len=param_len,
+                                                gripper_idx=gripper_idx,
+                                                cluster_size=cluster_size,
+                                                cluster_d=cluster_d,
+                                                device=device
+                                                )
+
+        else:
+            best_model, last_model, recs, mixture_sampler = trainer(model=model,
+                                                                    optimizer=optimizer,
+                                                                    scheduler=scheduler,
+                                                                    task_name=task_name,
+                                                                    target_trajectories=target_trajectories,
+                                                                    environment_parameters=env_params,
+                                                                    seq_len=seq_len,
+                                                                    dof=dof,
+                                                                    param_len=param_len,
+                                                                    gripper_idx=gripper_idx,
+                                                                    mf=mf,
+                                                                    n_t_local=n_t_local,
+                                                                    n_t_global=n_t_global,
+                                                                    cluster_size=cluster_size,
+                                                                    cluster_d=cluster_d,
+                                                                    max_epochs=max_epochs,
+                                                                    batch_size=batch_size,
+                                                                    device=device,
+                                                                    val_period=val_period,
+                                                                    early_stopping=early_stopping,
+                                                                    stop_criteria=stop_criteria)
 
     # evaluate model
     print(f"Training finished, evaluating for {evaluation_samples} trials . . .")
@@ -366,6 +391,13 @@ def train_and_eval_FM(
     # stack to (N, Dc) float32 (order matches idx)
     eval_params = np.asarray(env_params_list, dtype=np.float32)
 
+    q_low        = None  # Only for GMM
+    base_mixture = False # True for LFM
+    if FM_type == "GMM" or FM_type == "LFM":
+        q_low_flat, _, _ = mixture_sampler.sample_cond(eval_params, truncated=True)
+        q_low            = q_low_flat.reshape(evaluation_samples, seq_len, dof)
+        base_mixture     = (FM_type == "LFM")
+
     success_rate_best, avg_reward_best = eval_model(model=best_model,
                                                 model_class=VectorField,
                                                 task_name=task_name,
@@ -381,30 +413,28 @@ def train_and_eval_FM(
                                                 trials=evaluation_samples,
                                                 render_width=4,
                                                 render_num=8,
-                                                base_seed=seed+1)
+                                                base_seed=seed+1,
+                                                q_low=q_low,
+                                                base_mixture=base_mixture)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
-    '''
-    success_rate_last, avg_reward_last = eval_model(model=last_model,
-                                                model_class=VectorField,
-                                                task_name=task_name,
-                                                seq_len=seq_len,
-                                                dof=dof,
-                                                param_len=param_len,
-                                                gripper_idx=gripper_idx,
-                                                render_dir=exp_dir,
-                                                video_name="last",
-                                                device=device,
-                                                trials=evaluation_samples,
-                                                render_width=4,
-                                                render_num=8,
-                                                base_seed=seed+1)
-    print(f"Success rate : {success_rate_last:.3f}, Average reward : {avg_reward_last:.3f}")
-    '''
 
     # write results    
     json_path = os.path.join(exp_dir, 'results.json')
-    if FM_type == "DGFM":
+    if FM_type == "GMM":
+        output = {
+            "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+            "seed":            seed,
+            "FM_type":         FM_type,
+            "N":               N,
+            "task_name":       task_name,
+            "cluster_d":       cluster_d,
+            "cluster_size":    cluster_size,
+            "eval_samples":    evaluation_samples,
+            "success_rate_best": success_rate_best,
+            "average_reward_best": avg_reward_best,
+        } 
+    elif FM_type == "DGFM" or FM_type == "GFM" or FM_type == "LFM":
         output = {
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
             "seed":            seed,
@@ -424,8 +454,6 @@ def train_and_eval_FM(
             "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
-            #"success_rate_last": success_rate_last,
-            #"average_reward_last": avg_reward_last,
             "records":         recs,
         }
     else:
@@ -444,18 +472,20 @@ def train_and_eval_FM(
             "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
-            #"success_rate_last": success_rate_last,
-            #"average_reward_last": avg_reward_last,
             "records":         recs,
         }
     with open(json_path, "w") as f:
         json.dump(output, f, indent=2)
     print(f"[saved results to {json_path}]")
+    
+    if FM_type == "GMM":
+        return None
 
     # plot and save records
     epochs = sorted(recs.keys())
     rates  = [recs[e].get("success_rate", float("nan")) for e in epochs]
 
+    # first axis for success rate
     fig, ax1 = plt.subplots()
     ln1 = ax1.plot(epochs, rates, linewidth=2, label="success_rate")
     ax1.set_xlabel("Epoch")
@@ -465,22 +495,10 @@ def train_and_eval_FM(
     # second axis for losses
     ax2 = ax1.twinx()
     loss_lines = []
-
-    if FM_type == "DGFM":
-        g_loss = [recs[e].get("g_loss") for e in epochs]
-        l_loss = [recs[e].get("l_loss") for e in epochs]
-        if any(v is not None for v in g_loss):
-            ln2 = ax2.plot(epochs, g_loss, linestyle="--", label="g_loss")
-            loss_lines += ln2
-        if any(v is not None for v in l_loss):
-            ln3 = ax2.plot(epochs, l_loss, linestyle=":", label="l_loss")
-            loss_lines += ln3
-    else:
-        loss = [recs[e].get("loss") for e in epochs]
-        if any(v is not None for v in loss):
-            ln4 = ax2.plot(epochs, loss, linestyle="--", label="loss")
-            loss_lines += ln4
-
+    loss = [recs[e].get("loss") for e in epochs]
+    if any(v is not None for v in loss):
+        ln2 = ax2.plot(epochs, loss, linestyle="--", label="loss")
+        loss_lines += ln2
     ax2.set_ylabel("Loss")
 
     # combined legend
@@ -505,7 +523,7 @@ def train_and_eval_FM(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("train_and_eval_FM")
     parser.add_argument("--FM_type",        type=str,   required=True,
-                        choices=["UniformFM","ShiftedFM","DGFM"])
+                        choices=["UniformFM","ShiftedFM","DGFM","GFM","LFM","GMM"])
     parser.add_argument("--N",              type=int,   required=True)
     parser.add_argument("--dataset_path",   type=str,   required=True)
     parser.add_argument("--task_name",      type=str,   required=True,

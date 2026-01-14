@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from matplotlib import ticker
+from matplotlib.ticker import ScalarFormatter, NullLocator, FixedLocator
 from scipy.special import beta
 
 
@@ -67,7 +68,7 @@ def plot_comparison(data, out_dir, dist_name):
         epochs = sorted(all_epochs)
 
         fig, ax1 = plt.subplots()
-        ax2 = ax1.twinx()
+        # ax2 = ax1.twinx()
 
         for method, trials in methods.items():
             # Prepare per-epoch lists across trials
@@ -87,17 +88,18 @@ def plot_comparison(data, out_dir, dist_name):
             loss_means = [np.nanmean(loss_vals[ep]) for ep in epochs]
             loss_stds = [np.nanstd(loss_vals[ep]) for ep in epochs]
 
-            ax1.plot(epochs, w2_means, marker='o', label=f"{method} W2")
-            ax2.plot(epochs, loss_means, marker='x', linestyle='--', label=f"{method} Loss")
+            ax1.plot(epochs, w2_means, marker='o', label=f"{method} W2", markersize=2)
+            # ax2.plot(epochs, loss_means, marker='x', linestyle='--', label=f"{method} Loss", markersize=2)
 
         ax1.set_xlabel("Epoch")
         ax1.set_ylabel("Validation W2")
-        ax2.set_ylabel("Train Loss")
+        # ax2.set_ylabel("Train Loss")
         plt.title(f"{dist_name} - Comparison: {sample_size} samples (mean ± std)")
 
         lines1, labels1 = ax1.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        fig.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+        fig.legend(lines1 , labels1, loc="upper right")
+        # lines2, labels2 = ax2.get_legend_handles_labels()
+        # fig.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
 
         fname = f"{dist_name}_{sample_size}_comparison.png"
         fig.savefig(os.path.join(out_dir, fname), bbox_inches="tight")
@@ -118,34 +120,52 @@ def plot_summary(data, out_dir, dist_name):
 
     # Eval W2 with error bars
     fig1, ax1 = plt.subplots()
+
+    # --- log scale ---
     ax1.set_xscale('log')
+    # ax1.set_yscale('log')
+
     x = [int(ss) for ss in sample_sizes]
+
     for method in methods:
         means = []
         stds = []
         for ss in sample_sizes:
-            entries = summary[ss].get(method, [])
+            entries = summary[ss].get(method, {})
             means.append(entries.get("eval_wasserstein2_mean", 0))
             stds.append(entries.get("eval_wasserstein2_std", 0))
         ax1.errorbar(x, means, yerr=stds, marker='o', capsize=5, label=method)
 
+    # --- FORCE tick positions and formatting ---
+    ax1.xaxis.set_major_locator(FixedLocator(x))
+    ax1.xaxis.set_minor_locator(NullLocator())
+
+    formatter = ScalarFormatter()
+    formatter.set_scientific(False)
+    formatter.set_useOffset(False)
+    ax1.xaxis.set_major_formatter(formatter)
+
+    # --- limits & labels ---
     xmin, xmax = min(x), max(x)
-    ax1.set_xlim(0.9*xmin, 1.1*xmax)
-    ax1.margins(x=0.1)
-    ax1.set_xticks(x)
-    ax1.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
+    ax1.set_xlim(0.9 * xmin, 1.1 * xmax)
+    # ax1.set_ylim(0.8, 5)
+
     ax1.set_xlabel("Sample Size")
     ax1.set_ylabel("Evaluation W2 Mean ± Std")
     ax1.set_title(f"{dist_name} - (n, d) = ({ambient_dim}, {latent_dim})")
-    ax1.legend()
+    ax1.legend(loc="upper right")
+
     fig1.tight_layout()
-    fig1.savefig(os.path.join(out_dir, f"{dist_name}_summary_eval_w2.png"), bbox_inches="tight")
+    fig1.savefig(
+        os.path.join(out_dir, f"{dist_name}_summary_eval_w2.png"),
+        bbox_inches="tight"
+    )
     plt.close(fig1)
 
     # Eval Geometric Alignment with error bars
     fig2, ax2 = plt.subplots()
     ax2.set_xscale('log')
-    ax2.set_yscale('log') # for big difference in geometric alignment
+    # ax2.set_yscale('log') # for big difference in geometric alignment
     for method in methods:
         means = []
         stds = []
@@ -154,16 +174,30 @@ def plot_summary(data, out_dir, dist_name):
             means.append(entries.get("eval_geometric_alignment_mean", 0))
             stds.append(entries.get("eval_geometric_alignment_std", 0))
         ax2.errorbar(x, means, yerr=stds, marker='o', capsize=5, label=method)
-    ax2.set_xlim(0.9*xmin, 1.1*xmax)
-    ax2.margins(x=0.1)
-    ax2.set_xticks(x)
-    ax2.get_xaxis().set_major_formatter(ticker.ScalarFormatter())
+
+    # --- FORCE tick positions and formatting ---
+    ax2.xaxis.set_major_locator(FixedLocator(x))
+    ax2.xaxis.set_minor_locator(NullLocator())
+
+    formatter = ScalarFormatter()
+    formatter.set_scientific(False)
+    formatter.set_useOffset(False)
+    ax2.xaxis.set_major_formatter(formatter)
+
+    # --- limits & labels ---
+    xmin, xmax = min(x), max(x)
+    ax2.set_xlim(0.9 * xmin, 1.1 * xmax)
+
     ax2.set_xlabel("Sample Size")
     ax2.set_ylabel("Geometric Alignment Mean ± Std")
     ax2.set_title(f"{dist_name} - (n, d) = ({ambient_dim}, {latent_dim})")
-    ax2.legend()
+    ax2.legend(loc="upper right")
+
     fig2.tight_layout()
-    fig2.savefig(os.path.join(out_dir, f"{dist_name}_summary_geom_align.png"), bbox_inches="tight")
+    fig2.savefig(
+        os.path.join(out_dir, f"{dist_name}_summary_geom_align.png"),
+        bbox_inches="tight"
+    )
     plt.close(fig2)
 
 

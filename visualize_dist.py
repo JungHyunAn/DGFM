@@ -23,7 +23,7 @@ def plot_points_and_manifold(samples, manifold_points, title, filename):
     plt.savefig(filename)
     plt.close()
 
-def generate_and_plot_distributions(n=3, d=2, num_samples=500, epsilon=0.1, seed=0):
+def generate_and_plot_distributions(n=3, d=2, num_samples=500, epsilon=0.05, seed=0):
     np.random.seed(seed)
 
     # Quadratic Unimodal
@@ -93,5 +93,55 @@ def generate_and_plot_distributions(n=3, d=2, num_samples=500, epsilon=0.1, seed
     manifold = spiral_manifold @ A.T
     plot_points_and_manifold(x, manifold, "Generalized Swiss Roll", "Generalized_Swiss_Roll_demo.png")
 
+    # Generalized Two Moons
+    A = sample_A((n, n))
+    z1 = np.random.uniform(0, np.pi, size=(num_samples, 1))
+    z_rest = np.random.randn(num_samples, d - 1)
+
+    # First moon (as requested)
+    moon1 = np.hstack([
+        np.cos(z1) + 0.5,
+        np.sin(z1),
+        z_rest,
+        np.zeros((num_samples, n - d - 1))
+    ])
+
+    # Second moon: symmetric to O (origin), i.e., x -> -x
+    moon2 = -moon1
+
+    # Combine two moons
+    moon = np.vstack([moon1, moon2])
+
+    # Add noise and random linear mixing
+    x_n = np.random.randn(2 * num_samples, n)
+    x = moon @ A.T + epsilon * x_n
+
+    # ---- Manifold for visualization (dense points on both moons) ----
+    theta = np.linspace(0, np.pi, 10000).reshape(-1, 1)
+    r = np.hstack([
+        np.cos(theta) + 0.5,
+        np.sin(theta)
+    ])
+
+    # Use a bounded spread for the remaining intrinsic dims (match your Swiss-roll style)
+    z_rest_manifold = (np.random.uniform(-2, 2, size=(10000, d - 1)) * 3)
+
+    moon1_manifold = np.hstack([
+        r,
+        z_rest_manifold,
+        np.zeros((10000, n - d - 1))
+    ])
+
+    moon2_manifold = -moon1_manifold
+
+    moon_manifold = np.vstack([moon1_manifold, moon2_manifold])
+    manifold = moon_manifold @ A.T
+
+    plot_points_and_manifold(
+        x, manifold,
+        "Generalized Two Moon",
+        "Generalized_Two_Moon_demo.png"
+    )
+
 # Run the visualization with manifold
-generate_and_plot_distributions(seed=11)
+generate_and_plot_distributions(seed=6)

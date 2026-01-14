@@ -9,6 +9,7 @@ from scipy.stats import truncnorm, chi2
 from torch.distributions import Beta
 from annoy import AnnoyIndex
 from joblib import Parallel, delayed
+from copy import deepcopy
 
 
 class VectorField(nn.Module):
@@ -369,22 +370,80 @@ def compute_cluster_pca_fast(X, clusters, d, eps=1e-3, outlier_thresh=0.9,
     return np.vstack(mus), np.stack(covs), np.array(weights)
 
 
-def train_uniform_FM(model, optimizer, X_target, dim, device,
+def build_joint_interpolants(
+    X_train, perm_t, M, mf,
+    base_sampler, mixture_sampler,
+    n_t_global, n_t_local,
+    dim, device):
+    """
+    Build interpolants for DGFM; global:local = mf:1
+    """
+
+    global_M = M * mf
+
+    # ===== GLOBAL =====
+    x0g    = base_sampler(global_M)
+    x1g, _ = mixture_sampler.truncated_sample(global_M)
+
+    tg   = torch.rand(global_M * n_t_global, device=device)
+    x0gr = x0g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, dim)
+    x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, dim)
+
+    xtg = (1 - tg.unsqueeze(1)) * x0gr + tg.unsqueeze(1) * x1gr
+    vg  = 2 * (x1gr - x0gr)
+    t_ing = 0.5 * tg
+
+    yg = torch.zeros(xtg.shape[0], device=device, dtype=torch.long) # label 0 = global
+
+    # ===== LOCAL =====
+    idx = perm_t[:M]
+    x1l = X_train[idx]
+
+    inv_cluster = mixture_sampler.inv_cluster
+    pis = torch.tensor(
+        [np.random.choice(inv_cluster[int(i.item())]) for i in idx],
+        device=device
+    )
+    x0l, _ = mixture_sampler.truncated_sample(M, pis=pis)
+
+    tl   = torch.rand(M * n_t_local, device=device)
+    x0lr = x0l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, dim)
+    x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, dim)
+
+    xtl   = (1 - tl.unsqueeze(1)) * x0lr + tl.unsqueeze(1) * x1lr
+    vl    = 2 * (x1lr - x0lr)
+    t_inl = 0.5 * tl + 0.5
+
+    yl = torch.ones(xtl.shape[0], device=device, dtype=torch.long) # label 1 = local
+
+    # ===== CONCAT =====
+    XT  = torch.cat([xtg, xtl], dim=0)
+    VT  = torch.cat([vg,  vl],  dim=0)
+    TIN = torch.cat([t_ing, t_inl], dim=0)
+    Y   = torch.cat([yg, yl], dim=0)
+
+    perm = torch.randperm(XT.shape[0], device=device)
+    return XT[perm], TIN[perm], VT[perm], Y[perm]
+
+
+def train_uniform_FM(model, optimizer, scheduler, X_target, dim, device,
                      n_t=10, epochs=5, batch_size=256, early_stopping=True,tol=1e-3):
     # ----------------------------
     # Vanilla flow matching training
     # ----------------------------
-    N = X_target.shape[0]
-    perm = torch.randperm(N, device=device)
-    split = int(0.9 * N)
+    N       = X_target.shape[0]
+    perm    = torch.randperm(N, device=device)
+    split   = N - min(int(0.1*N), 2000)
+
     idx_train, idx_val = perm[:split], perm[split:]
-    X_train = X_target[idx_train]
-    X_val   = X_target[idx_val]
+    X_train            = X_target[idx_train]
+    X_val              = X_target[idx_val]
+
     stop_criteria = 0
 
-    best_w2 = float("inf")
-    best_model = model
-    recs = []
+    best_w2    = float("inf")
+    best_state = None 
+    recs       = []
 
     for epoch in range(epochs):
         # Training
@@ -406,6 +465,9 @@ def train_uniform_FM(model, optimizer, X_target, dim, device,
             loss.backward()
             optimizer.step()
         
+            if scheduler is not None:
+                scheduler.step()
+
         # Validation
         with torch.no_grad():
             X0   = np.random.randn(len(idx_val), dim)
@@ -421,7 +483,7 @@ def train_uniform_FM(model, optimizer, X_target, dim, device,
         elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
-            best_model = model
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             save = "True"
 
         # Record results
@@ -431,25 +493,33 @@ def train_uniform_FM(model, optimizer, X_target, dim, device,
               "train_loss": loss.item(),
               "best_model_save": save }
         )
+
+    best_model = deepcopy(model)
+    best_model.load_state_dict(best_state)
+    best_model.to(device)
+    best_model.eval()
+
     return epoch, best_w2, recs, best_model
 
 
-def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b=1,
+def train_shifted_FM(model, optimizer, scheduler, X_target, dim, device, beta_a=0.5, beta_b=1,
                      n_t=10, epochs=5, batch_size=256, early_stopping=True,tol=1e-3):
     # ----------------------------
     # Vanilla flow matching training
     # ----------------------------
-    N = X_target.shape[0]
-    perm = torch.randperm(N, device=device)
-    split = int(0.9 * N)
+    N       = X_target.shape[0]
+    perm    = torch.randperm(N, device=device)
+    split   = N - min(int(0.1*N), 2000)
+
     idx_train, idx_val = perm[:split], perm[split:]
-    X_train = X_target[idx_train]
-    X_val   = X_target[idx_val]
+    X_train            = X_target[idx_train]
+    X_val              = X_target[idx_val]
+
     stop_criteria = 0
 
-    best_w2 = float("inf")
-    best_model = model
-    recs = []
+    best_w2    = float("inf")
+    best_state = None
+    recs       = []
 
     for epoch in range(epochs):
         # Training
@@ -468,10 +538,14 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
 
             target_v = x1r - x0r
             pred_v   = model(xt,t)
-            loss = ((pred_v-target_v)**2).mean()
+            loss     = ((pred_v-target_v)**2).mean()
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        
+            if scheduler is not None:
+                scheduler.step()
         
         # Validation
         with torch.no_grad():
@@ -488,7 +562,7 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
         elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
-            best_model = model
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             save = "True"
 
         # Record results
@@ -498,10 +572,16 @@ def train_shifted_FM(model, optimizer, X_target, dim, device, beta_a=0.5, beta_b
               "train_loss": loss.item(),
               "best_model_save": save }
         )
+
+    best_model = deepcopy(model)
+    best_model.load_state_dict(best_state)
+    best_model.to(device)
+    best_model.eval()
+
     return epoch, best_w2, recs, best_model
 
 
-def train_dgfm(model, optimizer, X_target, dim, mf, device,
+def train_dgfm(model, optimizer, scheduler, X_target, dim, mf, device,
                mixture_sampler=None,
                n_t_global=1, n_t_local=1,
                epochs=5, batch_size=256,    
@@ -510,7 +590,13 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
                early_stopping=True, tol=1e-3,
                approx_cluster=False, fast_PCA=True):
     
-    # 0) Clustering & Form intermediate distribution
+    # hyperparams
+    local_w0   = 1.0        # initial local weight
+    local_w1   = 1.0        # final local weight 
+    ramp_start = 0.1     
+    ramp_end   = 0.3      
+
+    # Clustering & Form intermediate distribution
     base_sampler = lambda x: torch.randn(x, dim, device=device)
     N            = X_target.shape[0]
     perm         = np.random.permutation(N)
@@ -539,91 +625,95 @@ def train_dgfm(model, optimizer, X_target, dim, mf, device,
         
 
     best_w2    = float("inf")
-    best_model = model
+    best_state = None
     recs       = []
 
-    global_M = M * mf
+    # Training loop
     for epoch in range(epochs):
+        if epoch > ramp_end * epochs:
+            local_mult = local_w1
+        elif epoch > ramp_start * epochs:
+            local_mult = local_w0 + (local_w1 - local_w0) * (epoch/epochs - ramp_start) / (ramp_end - ramp_start)
+        else:
+            local_mult = local_w0
+        
         perm_t = torch.randperm(X_train.shape[0], device=device)
+        loss_sum = 0.0
 
-        # 1) global FM
-        t0 = time.thread_time()
-        for i in range(0, global_M, batch_size):
-            m       = min(batch_size, global_M-i) # batch size
+        # Build interpolants
+        XT, TIN, VT, Y = build_joint_interpolants(
+            X_train, perm_t, M, mf,
+            base_sampler, mixture_sampler,
+            n_t_global, n_t_local,
+            dim, device
+        )
 
-            x0_t    = base_sampler(m)
-            x1_t, _ = mixture_sampler.truncated_sample(m)
-            t       = torch.rand(m*n_t_global, device=device)  # t sampling for global FM
-            x0r     = x0_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
-            x1r     = x1_t.unsqueeze(1).repeat(1,n_t_global,1).view(-1,dim)
-            xt      = (1-t.unsqueeze(1))*x0r + t.unsqueeze(1)*x1r
+        # (mf + 1) joint passes
+        for joint_pass in range(mf + 1):
+            perm = torch.randperm(XT.shape[0], device=device)
+            XT_p, TIN_p, VT_p, Y_p = XT[perm], TIN[perm], VT[perm], Y[perm]
+
+            for i in range(0, XT_p.shape[0], batch_size):
+                xb  = XT_p[i:i+batch_size]
+                tb  = TIN_p[i:i+batch_size]
+                vb  = VT_p[i:i+batch_size]
+                yb  = Y_p[i:i+batch_size]
+
+                pred = model(xb, tb)
+
+                # per-sample MSE
+                mse = ((pred - vb) ** 2).mean(dim=1)  # shape: (batch,)
+
+                # weights: global=1, local=local_mult
+                w = torch.ones_like(mse)
+                w[yb == 1] = local_mult
+
+                loss = (w * mse).mean()
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
+                loss_sum += loss.item()
+
+            with torch.no_grad():
+                X0   = np.random.randn(len(idx_val), dim)
+                Xgen = run_flow(model, X0, device)
+            w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
+
+            # Early stopping
+            save = "False"
+            if early_stopping and ((best_w2 - w2) < tol):
+                stop_criteria += 1
+                if stop_criteria >= 3:  # stop after 3 epochs without improvement
+                    break
+            elif best_w2 > w2:
+                stop_criteria = 0
+                best_w2 = w2
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                save = "True"
+
+            # Record results
+            recs.append(
+                { "epoch": (1+mf)*epoch + joint_pass, 
+                "validation_w2": w2, 
+                "train_loss": 0,
+                "best_model_save": save }
+            ) 
             
-            target_v = 2*(x1r - x0r)
-            pred_v   = model(xt, 0.5*t)
-            loss     = ((pred_v - target_v)**2).mean()
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        # print(f"Global FM epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
+    best_model = deepcopy(model)
+    best_model.load_state_dict(best_state)
+    best_model.to(device)
+    best_model.eval()
 
-        # 2) local FM
-        t0 = time.thread_time()
-        for i in range(0, M, batch_size):
-            m   = min(batch_size, M-i)
-            idx = perm_t[i:i+m]            
-            
-            # Match within clusters
-            inv_cluster = mixture_sampler.inv_cluster
-            pis_np = np.array([ np.random.choice(inv_cluster[int(j.item())]) for j in idx ], dtype=np.int64)
-            pis = torch.tensor(pis_np, device=device)
-
-            x0, _ = mixture_sampler.truncated_sample(m, pis=pis)
-            x1    = X_train[idx]            
-            t     = torch.rand(m * n_t_local, device=device) # t sampling for local FM 
-            x0r   = x0.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
-            x1r   = x1.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
-            xt    = (1 - t.unsqueeze(1)) * x0r + t.unsqueeze(1) * x1r
-
-            target_v = 2*(x1r - x0r)
-            pred_v = model(xt, 0.5*t+0.5)
-            loss = ((pred_v - target_v) ** 2).mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-        # print(f"Local FM epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
-
-        # Validation
-        t0 = time.thread_time()
-        with torch.no_grad():
-            X0   = np.random.randn(len(idx_val), dim)
-            Xgen = run_flow(model, X0, device)
-        w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
-        # print(f"Validation epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
-
-        # Early stopping
-        save = "False"
-        if early_stopping and ((best_w2 - w2) < tol):
-            stop_criteria += 1
-            if stop_criteria >= 3:  # stop after 3 epochs without improvement
-                break
-        elif best_w2 > w2:
-            stop_criteria = 0
-            best_w2 = w2
-            best_model = model
-            save = "True"
-
-        # Record results
-        recs.append(
-            { "epoch": epoch, 
-              "validation_w2": w2, 
-              "train_loss": loss.item(),
-              "best_model_save": save }
-        ) 
     return mixture_sampler, epoch, best_w2, recs, best_model
 
 
-def train_gfm(model, optimizer, X_target, dim, device,
+def train_gfm(model, optimizer, scheduler, X_target, dim, device,
               mixture_sampler=None,
               n_t_global=1,
               epochs=5, batch_size=256,    
@@ -661,7 +751,7 @@ def train_gfm(model, optimizer, X_target, dim, device,
         
 
     best_w2    = float("inf")
-    best_model = model
+    best_state = None
     recs       = []
 
     for epoch in range(epochs):
@@ -684,6 +774,9 @@ def train_gfm(model, optimizer, X_target, dim, device,
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        
+            if scheduler is not None:
+                scheduler.step()
         # print(f"Global FM epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
 
         # Validation
@@ -703,7 +796,7 @@ def train_gfm(model, optimizer, X_target, dim, device,
         elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
-            best_model = model
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             save = "True"
 
         # Record results
@@ -713,10 +806,16 @@ def train_gfm(model, optimizer, X_target, dim, device,
               "train_loss": loss.item(),
               "best_model_save": save }
         ) 
+
+    best_model = deepcopy(model)
+    best_model.load_state_dict(best_state)
+    best_model.to(device)
+    best_model.eval()
+
     return mixture_sampler, epoch, best_w2, recs, best_model
 
 
-def train_lfm(model, optimizer, X_target, dim, device,
+def train_lfm(model, optimizer, scheduler, X_target, dim, device,
               mixture_sampler=None,
               n_t_local=1,
               epochs=5, batch_size=256,    
@@ -752,7 +851,7 @@ def train_lfm(model, optimizer, X_target, dim, device,
         mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, truncation=truncation, device=device)
     
     best_w2    = float("inf")
-    best_model = model
+    best_state = None 
     recs       = []
 
     for epoch in range(epochs):
@@ -764,11 +863,14 @@ def train_lfm(model, optimizer, X_target, dim, device,
             m   = min(batch_size, M-i)
             idx = perm_t[i:i+m]
             
+            # Match within clusters
             inv_cluster = mixture_sampler.inv_cluster
-            pis_np      = np.array([ np.random.choice(inv_cluster[int(j.item())]) for j in idx ], dtype=np.int64)
-            pis         = torch.tensor(pis_np, device=device)
-
+            pis_np = np.array([ np.random.choice(inv_cluster[int(j.item())]) for j in idx ], dtype=np.int64)
+            pis = torch.tensor(pis_np, device=device)
             x0, _ = mixture_sampler.truncated_sample(m, pis=pis)
+
+            # Match globally
+            # x0, _ = mixture_sampler.truncated_sample(m)
             x1    = X_train[idx]            
             t     = torch.rand(m * n_t_local, device=device) # t sampling for local FM
             x0r   = x0.unsqueeze(1).repeat(1, n_t_local, 1).view(-1, dim)
@@ -782,6 +884,9 @@ def train_lfm(model, optimizer, X_target, dim, device,
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        
+            if scheduler is not None:
+                scheduler.step()
         # print(f"Local FM epoch {epoch} took {time.thread_time() - t0:.2f} seconds")
 
         # Validation
@@ -801,7 +906,7 @@ def train_lfm(model, optimizer, X_target, dim, device,
         elif best_w2 > w2:
             stop_criteria = 0
             best_w2 = w2
-            best_model = model
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             save = "True"
 
         # Record results
@@ -811,6 +916,12 @@ def train_lfm(model, optimizer, X_target, dim, device,
               "train_loss": loss.item(),
               "best_model_save": save }
         ) 
+
+    best_model = deepcopy(model)
+    best_model.load_state_dict(best_state)
+    best_model.to(device)
+    best_model.eval()
+
     return mixture_sampler, epoch, best_w2, recs, best_model
 
 

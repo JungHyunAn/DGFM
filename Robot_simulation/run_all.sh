@@ -20,17 +20,17 @@ SLEEP_TIME=1000   # ← sleep duration between runs
 ###############################
 case "$TASK_NAME" in
   door)
-    DATASET_PATH="Robot_simulation/heuristic_dataset/door_dataset_80000.hdf5"
+    DATASET_PATH="Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5"
     RESULTS_PATH="Robot_simulation/eval_results/door"
     N_LIST=(1000 500 250)
     ;;
   nut)
-    DATASET_PATH="Robot_simulation/heuristic_dataset/nut_dataset_20002.hdf5"
+    DATASET_PATH="Robot_simulation/heuristic_dataset/nut_dataset_10000.hdf5"
     RESULTS_PATH="Robot_simulation/eval_results/nut"
     N_LIST=(1000 500 250)
     ;;
   two_arm)
-    DATASET_PATH="Robot_simulation/heuristic_dataset/two_arm_dataset_20000.hdf5"
+    DATASET_PATH="Robot_simulation/heuristic_dataset/two_arm_dataset_10000.hdf5"
     RESULTS_PATH="Robot_simulation/eval_results/two_arm"
     N_LIST=(2000 1000 500)
     ;;
@@ -63,7 +63,7 @@ run_fm() {
   local WARMUP_STEPS
   local EXTRA_FLAGS=()
 
-  if [[ "$FM_TYPE" == "UniformFM" || "$FM_TYPE" == "ShiftedFM" ]]; then
+  if [[ "$FM_TYPE" == "UniformFM" || "$FM_TYPE" == "ShiftedFM" || "$FM_TYPE" == "LFM" || "$FM_TYPE" == "GFM" || "$FM_TYPE" == "GMM" ]]; then
     VAL_PERIOD=30
     MAX_EPOCHS=3000
     WARMUP_STEPS=600
@@ -118,19 +118,21 @@ run_fm() {
 # Full execution chain:
 ########################################
 
-run_fm "UniformFM" ""
-echo ">> Sleeping $SLEEP_TIME seconds before next FM_type..."
-sleep $SLEEP_TIME
+run_fm "GFM" ""
 
-run_fm "ShiftedFM" ""
-echo ">> Sleeping $SLEEP_TIME seconds before next FM_type..."
-sleep $SLEEP_TIME
+run_fm "LFM" ""
+
+run_fm "GMM" ""
 
 run_fm "DGFM" "2"
-echo ">> Sleeping $SLEEP_TIME seconds before next FM_type..."
-sleep $SLEEP_TIME
 
 run_fm "DGFM" "4"
+
+run_fm "UniformFM" ""
+
+run_fm "ShiftedFM" ""
+
+
 
 echo "==========================================="
 echo "        ALL RUNS FINISHED"
