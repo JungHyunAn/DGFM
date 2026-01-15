@@ -143,5 +143,76 @@ def generate_and_plot_distributions(n=3, d=2, num_samples=500, epsilon=0.05, see
         "Generalized_Two_Moon_demo.png"
     )
 
+
+    # PinWheel
+    # Random linear mixing
+    wheel_num = 3
+    A = sample_A((n, n))
+
+    # ---- Sample points x (like PinWheel.sample()) ----
+    t = np.random.rand(num_samples)  # t ~ U(0,1)
+
+    # wheel indices i ~ Unif{0..wheel_num-1}
+    wheel_idx = np.random.randint(0, wheel_num, size=(num_samples,))
+
+    angles = (2.0 * np.pi / wheel_num) * wheel_idx
+    c = np.cos(angles)
+    s = np.sin(angles)
+
+    base0 = t
+    base1 = np.sin(np.pi * t)  # IMPORTANT: sin(pi*t), matching your class
+
+    v = np.zeros((num_samples, n))
+
+    # Rotated curve in first 2 dims
+    v[:, 0] = c * base0 - s * base1
+    v[:, 1] = s * base0 + c * base1
+
+    # Remaining intrinsic dims: Gaussian for samples (matches class)
+    if d > 1:
+        z_rest = np.random.randn(num_samples, d - 1)
+        v[:, 2:d + 1] = z_rest  # dims 2..d
+
+    # Apply linear mixing and add noise
+    x_n = np.random.randn(num_samples, n)
+    x = v @ A.T + epsilon * x_n
+
+
+    # ---- Manifold for visualization (dense points on each wheel) ----
+    N_man = 3000
+    t_dense = np.linspace(0.0, 1.0, N_man)  # parameter along the curve
+
+    # bounded spread for remaining intrinsic dims (Swiss-roll style)
+    # (If you want it to reflect the *sample* distribution more, switch to np.random.randn)
+    z_rest_manifold = (np.random.uniform(-2, 2, size=(N_man, d - 1)) * 3) if d > 1 else None
+
+    base0_m = t_dense
+    base1_m = np.sin(np.pi * t_dense)
+
+    manifold_list = []
+    for i in range(wheel_num):
+        angle = (2.0 * np.pi / wheel_num) * i
+        ci = np.cos(angle)
+        si = np.sin(angle)
+
+        v_m = np.zeros((N_man, n))
+        v_m[:, 0] = ci * base0_m - si * base1_m
+        v_m[:, 1] = si * base0_m + ci * base1_m
+
+        if d > 1:
+            v_m[:, 2:d + 1] = z_rest_manifold
+
+        manifold_list.append(v_m)
+
+    v_manifold = np.vstack(manifold_list)      # (wheel_num*N_man, n)
+    manifold = v_manifold @ A.T                # mixed manifold in ambient space
+
+
+    plot_points_and_manifold(
+        x, manifold,
+        "Generalized Pin Wheel",
+        "Generalized_PinWheel_demo.png"
+    )
+
 # Run the visualization with manifold
-generate_and_plot_distributions(seed=6)
+generate_and_plot_distributions(seed=23)
