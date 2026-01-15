@@ -120,11 +120,11 @@ run_fm() {
 
 run_fm "GFM" ""
 
-run_fm "LFM" ""
+# run_fm "LFM" ""
 
 run_fm "GMM" ""
 
-run_fm "DGFM" "2"
+# run_fm "DGFM" "2"
 
 run_fm "DGFM" "4"
 

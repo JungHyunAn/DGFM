@@ -38,7 +38,7 @@ To evaluate a flow-matching method (**UniformFM**, **ShiftedFM**, or **DGFM**) o
 
 ```bash
 python -m Robot_simulation.run_eval --FM_type UniformFM --N 1000 \
-  --dataset_path Robot_simulation/heuristic_dataset/door_dataset_80000.hdf5 \
+  --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
   --task_name door --results_path Robot_simulation/eval_results/door \
   --device cuda --val_period 30 --batch_size 500 --max_epochs 3000 \
   --warmup_steps 600 --seed 1000
@@ -48,7 +48,7 @@ For **DGFM**, additional parameters such as the multiplication factor (mf) must 
 
 ```bash
 python -m Robot_simulation.run_eval --FM_type DGFM --mf 4 --N 1000 \
-  --dataset_path Robot_simulation/heuristic_dataset/door_dataset_80000.hdf5 \
+  --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
   --task_name door --results_path Robot_simulation/eval_results/door \
   --device cuda --val_period 6 --batch_size 250 --max_epochs 600 \
   --warmup_steps 120
