@@ -59,7 +59,7 @@ python -m Robot_simulation.run_eval --FM_type DGFM --mf 4 --N 1000 \
 To run all evaluation configurations for a single task, execute:
 
 ```bash
-bash run_all.sh <task_name> <seed>
+bash Robot_simulation/run_all.sh <task_name> <seed>
 ```
 
 ## Results
