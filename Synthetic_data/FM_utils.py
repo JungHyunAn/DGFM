@@ -374,7 +374,8 @@ def build_joint_interpolants(
     X_train, perm_t, M, mf,
     base_sampler, mixture_sampler,
     n_t_global, n_t_local,
-    dim, device):
+    dim, device,
+    tau=0.5):
     """
     Build interpolants for DGFM; global:local = mf:1
     """
@@ -390,8 +391,8 @@ def build_joint_interpolants(
     x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, dim)
 
     xtg = (1 - tg.unsqueeze(1)) * x0gr + tg.unsqueeze(1) * x1gr
-    vg  = 2 * (x1gr - x0gr)
-    t_ing = 0.5 * tg
+    vg  = (1/tau) * (x1gr - x0gr)
+    t_ing = tau * tg
 
     yg = torch.zeros(xtg.shape[0], device=device, dtype=torch.long) # label 0 = global
 
@@ -411,8 +412,8 @@ def build_joint_interpolants(
     x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, dim)
 
     xtl   = (1 - tl.unsqueeze(1)) * x0lr + tl.unsqueeze(1) * x1lr
-    vl    = 2 * (x1lr - x0lr)
-    t_inl = 0.5 * tl + 0.5
+    vl    = (1/(1-tau)) * (x1lr - x0lr)
+    t_inl = (1-tau) * tl + tau
 
     yl = torch.ones(xtl.shape[0], device=device, dtype=torch.long) # label 1 = local
 
@@ -581,9 +582,159 @@ def train_shifted_FM(model, optimizer, scheduler, X_target, dim, device, beta_a=
     return epoch, best_w2, recs, best_model
 
 
+def _sample_ot_pairs_single_batch(x0, x1, device):
+    # ----------------------------
+    # Sample paired indices from a single OT plan between x0 and x1.
+    # ----------------------------
+    m = x0.shape[0]
+    x0_np = x0.detach().cpu().numpy()
+    x1_np = x1.detach().cpu().numpy()
+
+    a = np.full(m, 1.0 / m, dtype=np.float64)
+    b = np.full(m, 1.0 / m, dtype=np.float64)
+    C = ot.dist(x0_np, x1_np) ** 2
+    pi = ot.emd(a, b, C)
+
+    probs = pi.reshape(-1)
+    probs_sum = probs.sum()
+    if probs_sum <= 0:
+        row_idx = np.arange(m, dtype=np.int64)
+        col_idx = np.arange(m, dtype=np.int64)
+    else:
+        probs = probs / probs_sum
+        pair_idx = np.random.choice(m * m, size=m, replace=True, p=probs)
+        row_idx = pair_idx // m
+        col_idx = pair_idx % m
+
+    row_idx = torch.as_tensor(row_idx, device=device, dtype=torch.long)
+    col_idx = torch.as_tensor(col_idx, device=device, dtype=torch.long)
+    return x0[row_idx], x1[col_idx]
+
+
+def sample_minibatch_ot_plan(x0, x1, device, max_batch_size=1280):
+    # ----------------------------
+    # Sample paired indices from minibatch OT plans between x0 and x1.
+    # If the batch is large, solve OT independently within shuffled chunks.
+    # ----------------------------
+    m = x0.shape[0]
+    if m <= max_batch_size:
+        return _sample_ot_pairs_single_batch(x0, x1, device)
+
+    perm0 = torch.randperm(m, device=device)
+    perm1 = torch.randperm(m, device=device)
+
+    x0_chunks = []
+    x1_chunks = []
+    for start in range(0, m, max_batch_size):
+        end = min(start + max_batch_size, m)
+        x0_chunk = x0[perm0[start:end]]
+        x1_chunk = x1[perm1[start:end]]
+        paired_x0, paired_x1 = _sample_ot_pairs_single_batch(x0_chunk, x1_chunk, device)
+        x0_chunks.append(paired_x0)
+        x1_chunks.append(paired_x1)
+
+    return torch.cat(x0_chunks, dim=0), torch.cat(x1_chunks, dim=0)
+
+
+def train_OT_CFM(model, optimizer, scheduler, X_target, dim, device,
+                 n_t=10, epochs=5, batch_size=256,
+                 early_stopping=True, tol=1e-3,
+                 ot_max_batch_size=2000):
+    # ----------------------------
+    # OT-CFM training with minibatch OT pairings.
+    # For each optimization batch, compute the OT plan between a Gaussian
+    # minibatch and a target-data minibatch, then sample paired points from
+    # that batchwise transport plan.
+    # ----------------------------
+    N       = X_target.shape[0]
+    perm    = torch.randperm(N, device=device)
+    split   = N - min(int(0.1 * N), 2000)
+
+    idx_train, idx_val = perm[:split], perm[split:]
+    X_train            = X_target[idx_train]
+    X_val              = X_target[idx_val]
+
+    stop_criteria = 0
+
+    best_w2    = float("inf")
+    best_state = None
+    recs       = []
+
+    for epoch in range(epochs):
+        perm_t = torch.randperm(X_train.shape[0], device=device)
+        loss = None
+
+        for i in range(0, split, batch_size):
+            idx = perm_t[i:min(i + batch_size, split)]
+            x1 = X_train[idx]
+            x0 = torch.randn(len(idx), dim, device=device)
+            x0, x1 = sample_minibatch_ot_plan(
+                x0, x1, device, max_batch_size=ot_max_batch_size
+            )
+
+            t = torch.rand(len(idx) * n_t, device=device)
+
+            x0r = x0.unsqueeze(1).repeat(1, n_t, 1).view(-1, dim)
+            x1r = x1.unsqueeze(1).repeat(1, n_t, 1).view(-1, dim)
+            xt  = (1 - t.unsqueeze(1)) * x0r + t.unsqueeze(1) * x1r
+
+            target_v = x1r - x0r
+            pred_v   = model(xt, t)
+            loss     = ((pred_v - target_v) ** 2).mean()
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if scheduler is not None:
+                scheduler.step()
+
+        with torch.no_grad():
+            X0   = np.random.randn(len(idx_val), dim)
+            Xgen = run_flow(model, X0, device)
+        w2 = np.sqrt(
+            ot.emd2(
+                np.ones(N - split) / (N - split),
+                np.ones(N - split) / (N - split),
+                ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy()) ** 2,
+            )
+        )
+
+        save = "False"
+        if early_stopping and ((best_w2 - w2) < tol):
+            stop_criteria += 1
+            if stop_criteria >= 3:
+                break
+        elif best_w2 > w2:
+            stop_criteria = 0
+            best_w2 = w2
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            save = "True"
+
+        recs.append(
+            {
+                "epoch": epoch,
+                "validation_w2": w2,
+                "train_loss": float("nan") if loss is None else loss.item(),
+                "best_model_save": save,
+            }
+        )
+
+    if best_state is None:
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    best_model = deepcopy(model)
+    best_model.load_state_dict(best_state)
+    best_model.to(device)
+    best_model.eval()
+
+    return epoch, best_w2, recs, best_model
+
+
 def train_dgfm(model, optimizer, scheduler, X_target, dim, mf, device,
                mixture_sampler=None,
                n_t_global=1, n_t_local=1,
+               intermediate_injection=0.5,
                epochs=5, batch_size=256,    
                cluster_size=50, cluster_d=3,
                truncation=1.5,
@@ -614,13 +765,13 @@ def train_dgfm(model, optimizer, scheduler, X_target, dim, mf, device,
             clusters, inv_cluster = cluster_points_annoy(X_train.detach().cpu().numpy(), cluster_size)
         else:
             clusters, inv_cluster  = cluster_points(X_train.detach().cpu().numpy(), cluster_size)
-        # print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
+        #print(f"Clustering took {time.thread_time() - t0:.2f} seconds")
         t0 = time.thread_time()
         if fast_PCA:
             mus, covs, weights = compute_cluster_pca_fast(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
         else:
             mus, covs, weights = compute_cluster_pca(X_train.detach().cpu().numpy(), clusters, d=cluster_d)
-        # print(f"PCA took {time.thread_time() - t0:.2f} seconds")
+        #print(f"PCA took {time.thread_time() - t0:.2f} seconds")
         mixture_sampler = MixtureSampler(mus, covs, weights, clusters, inv_cluster, truncation=truncation, device=device)
         
 
@@ -645,65 +796,60 @@ def train_dgfm(model, optimizer, scheduler, X_target, dim, mf, device,
             X_train, perm_t, M, mf,
             base_sampler, mixture_sampler,
             n_t_global, n_t_local,
-            dim, device
+            dim, device,
+            tau=intermediate_injection
         )
 
-        # (mf + 1) joint passes
-        for joint_pass in range(mf + 1):
-            perm = torch.randperm(XT.shape[0], device=device)
-            XT_p, TIN_p, VT_p, Y_p = XT[perm], TIN[perm], VT[perm], Y[perm]
+        for i in range(0, XT.shape[0], batch_size):
+            xb  = XT[i:i+batch_size]
+            tb  = TIN[i:i+batch_size]
+            vb  = VT[i:i+batch_size]
+            yb  = Y[i:i+batch_size]
 
-            for i in range(0, XT_p.shape[0], batch_size):
-                xb  = XT_p[i:i+batch_size]
-                tb  = TIN_p[i:i+batch_size]
-                vb  = VT_p[i:i+batch_size]
-                yb  = Y_p[i:i+batch_size]
+            pred = model(xb, tb)
+            mse  = ((pred - vb) ** 2).mean(dim=1)
 
-                pred = model(xb, tb)
+            w = torch.ones_like(mse)
+            w[yb == 1] = local_mult
 
-                # per-sample MSE
-                mse = ((pred - vb) ** 2).mean(dim=1)  # shape: (batch,)
+            loss = (w * mse).mean()
 
-                # weights: global=1, local=local_mult
-                w = torch.ones_like(mse)
-                w[yb == 1] = local_mult
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-                loss = (w * mse).mean()
+            if scheduler is not None:
+                scheduler.step()
 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+            if (i % X_train.shape[0] == X_train.shape[0] - batch_size):
+                with torch.no_grad():
+                    X0   = np.random.randn(len(idx_val), dim)
+                    Xgen = run_flow(model, X0, device)
+                w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
 
-                if scheduler is not None:
-                    scheduler.step()
+                # Early stopping
+                save = "False"
+                if early_stopping and ((best_w2 - w2) < tol):
+                    stop_criteria += 1
+                    if stop_criteria >= 3:  # stop after 3 epochs without improvement
+                        break
+                elif best_w2 > w2:
+                    stop_criteria = 0
+                    best_w2 = w2
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    save = "True"
 
-                loss_sum += loss.item()
+                # Record results
+                recs.append(
+                    { "epoch": (1+mf)*epoch + int(i / X_train.shape[0]), # normalize to FM baselines
+                    "validation_w2": w2, 
+                    "train_loss": 0,
+                    "best_model_save": save }
+                ) 
 
-            with torch.no_grad():
-                X0   = np.random.randn(len(idx_val), dim)
-                Xgen = run_flow(model, X0, device)
-            w2 = np.sqrt(ot.emd2(np.ones(N-M)/(N-M), np.ones(N-M)/(N-M), ot.dist(Xgen.cpu().numpy(), X_val.cpu().numpy())**2))
+    #print(f"Training took {time.thread_time() - t0:.2f} seconds") 
+    #print(f"Building interpolants took {time_interpolant:.2f} seconds")
 
-            # Early stopping
-            save = "False"
-            if early_stopping and ((best_w2 - w2) < tol):
-                stop_criteria += 1
-                if stop_criteria >= 3:  # stop after 3 epochs without improvement
-                    break
-            elif best_w2 > w2:
-                stop_criteria = 0
-                best_w2 = w2
-                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-                save = "True"
-
-            # Record results
-            recs.append(
-                { "epoch": (1+mf)*epoch + joint_pass, 
-                "validation_w2": w2, 
-                "train_loss": 0,
-                "best_model_save": save }
-            ) 
-            
 
     best_model = deepcopy(model)
     best_model.load_state_dict(best_state)

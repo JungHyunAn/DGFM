@@ -24,6 +24,30 @@ def select_file(files):
     return files[idx]
 
 
+def _display_method_name(method):
+    if method == "DGFM-4":
+        return "DGFM"
+    if method == "GFM":
+        return "GlobalFM"
+    if method == "OT_CFM":
+        return "OT-CFM"
+    return method
+
+
+def _ordered_methods(methods):
+    preferred_order = [
+        "UniformFM",
+        "ShiftedFM",
+        "GFM",
+        "DGFM-4",
+        "OT_CFM",
+    ]
+    excluded = {"DGFM-8", "LFM", "GMM"}
+    kept = [m for m in methods if m not in excluded]
+    rank = {name: i for i, name in enumerate(preferred_order)}
+    return sorted(kept, key=lambda m: (rank.get(m, len(preferred_order)), m))
+
+
 def plot_trials(data, out_dir, dist_name):
     results = data.get("results", {})
     for sample_size, methods in results.items():
@@ -55,9 +79,8 @@ def plot_trials(data, out_dir, dist_name):
 def plot_comparison(data, out_dir, dist_name):
     results = data.get("results", {})
     for sample_size, methods in results.items():
-        # Determine common epochs across trials for alignment
-        # Assuming each trial has entries for all epochs
-        # Collect unique epochs
+        methods = {m: methods[m] for m in _ordered_methods(methods.keys())}
+
         all_epochs = set()
         for trials in methods.values():
             for trial_data in trials.values():
@@ -71,6 +94,8 @@ def plot_comparison(data, out_dir, dist_name):
         # ax2 = ax1.twinx()
 
         for method, trials in methods.items():
+            label = _display_method_name(method)
+
             # Prepare per-epoch lists across trials
             w2_vals = {epoch: [] for epoch in epochs}
             loss_vals = {epoch: [] for epoch in epochs}
@@ -88,16 +113,16 @@ def plot_comparison(data, out_dir, dist_name):
             loss_means = [np.nanmean(loss_vals[ep]) for ep in epochs]
             loss_stds = [np.nanstd(loss_vals[ep]) for ep in epochs]
 
-            ax1.plot(epochs, w2_means, marker='o', label=f"{method} W2", markersize=2)
-            # ax2.plot(epochs, loss_means, marker='x', linestyle='--', label=f"{method} Loss", markersize=2)
+            ax1.plot(epochs, w2_means, marker='o', label=label, markersize=2)
+            # ax2.plot(epochs, loss_means, marker='x', linestyle='--', label=f"{label} Loss", markersize=2)
 
         ax1.set_xlabel("Epoch")
         ax1.set_ylabel("Validation W2")
         # ax2.set_ylabel("Train Loss")
-        plt.title(f"{dist_name} - Comparison: {sample_size} samples (mean ± std)")
+        plt.title(f"{dist_name} - Comparison: {sample_size} samples (mean)")
 
         lines1, labels1 = ax1.get_legend_handles_labels()
-        fig.legend(lines1 , labels1, loc="upper right")
+        fig.legend(lines1 , labels1, loc="center right")
         # lines2, labels2 = ax2.get_legend_handles_labels()
         # fig.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
 
@@ -116,7 +141,7 @@ def plot_summary(data, out_dir, dist_name):
 
     # prepare sample sizes and methods
     sample_sizes = sorted(summary.keys(), key=lambda x: int(x))
-    methods = list(next(iter(summary.values())).keys())
+    methods = _ordered_methods(next(iter(summary.values())).keys())
 
     # Eval W2 with error bars
     fig1, ax1 = plt.subplots()
@@ -124,6 +149,14 @@ def plot_summary(data, out_dir, dist_name):
     # --- log scale ---
     ax1.set_xscale('log')
     # ax1.set_yscale('log')
+
+    style_map = {
+        "UniformFM": dict(linestyle='-.',  marker='D'),
+        "ShiftedFM": dict(linestyle='--', marker='^'),
+        "GlobalFM":  dict(linestyle=':',  marker='s'),
+        "DGFM":      dict(linestyle='-',  marker='o'),
+        "OT-CFM":    dict(linestyle='-',  marker='P'),
+    }
 
     x = [int(ss) for ss in sample_sizes]
 
@@ -134,7 +167,20 @@ def plot_summary(data, out_dir, dist_name):
             entries = summary[ss].get(method, {})
             means.append(entries.get("eval_wasserstein2_mean", 0))
             stds.append(entries.get("eval_wasserstein2_std", 0))
-        ax1.errorbar(x, means, yerr=stds, marker='o', capsize=5, label=method)
+
+        label = _display_method_name(method)
+
+        style = style_map.get(label, dict(linestyle='-', marker='o'))
+
+        ax1.errorbar(
+            x,
+            means,
+            yerr=stds,
+            capsize=5,
+            label=label,
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+        )
 
     # --- FORCE tick positions and formatting ---
     ax1.xaxis.set_major_locator(FixedLocator(x))
@@ -152,6 +198,13 @@ def plot_summary(data, out_dir, dist_name):
 
     ax1.set_xlabel("Sample Size")
     ax1.set_ylabel("Evaluation W2 Mean ± Std")
+
+    if dist_name == "SwissRoll":
+        dist_name = "Generalized Swiss Roll"
+    elif dist_name == "TwoMoon":
+        dist_name = "Generalized Two Moon"
+    elif dist_name == "PinWheel":
+        dist_name = "Generalized Pinwheel"
     ax1.set_title(f"{dist_name} - (n, d) = ({ambient_dim}, {latent_dim})")
     ax1.legend(loc="upper right")
 
@@ -173,7 +226,20 @@ def plot_summary(data, out_dir, dist_name):
             entries = summary[ss].get(method, [])
             means.append(entries.get("eval_geometric_alignment_mean", 0))
             stds.append(entries.get("eval_geometric_alignment_std", 0))
-        ax2.errorbar(x, means, yerr=stds, marker='o', capsize=5, label=method)
+
+        label = _display_method_name(method)
+
+        style = style_map.get(label, dict(linestyle='-', marker='o'))
+
+        ax2.errorbar(
+            x,
+            means,
+            yerr=stds,
+            capsize=5,
+            label=label,
+            linestyle=style["linestyle"],
+            marker=style["marker"],
+        )
 
     # --- FORCE tick positions and formatting ---
     ax2.xaxis.set_major_locator(FixedLocator(x))

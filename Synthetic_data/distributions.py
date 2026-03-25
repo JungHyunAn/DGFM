@@ -259,7 +259,7 @@ class Quadratic_Multimodal(Distribution):
         noise_std: float = 1e-4,
         A: torch.Tensor = None,
         Q: torch.Tensor = None,
-        mode_num: int = 10
+        mode_num: int = 3
     ):
         eq = f"x = A·z + zᵀ·Q·z + noise, z~sum(N_i(u_i, I_{latent_dim}))"
         super().__init__(ambient_dim, device, latent_dim=latent_dim, equation=eq, name="Quadratic_Multimodal")
@@ -434,7 +434,7 @@ class SwissRoll(Distribution):
         noise_std: float = 1e-4,
     ):
         eq = (
-            f"x = A [cos(t1), sin(t1), t2...t_{latent_dim}, 0...0], t1~U(0,1), [t2...t_{latent_dim}]~N(0,1)"
+            f"x = A [t1 cos(4*pi*t1), t1 sin(4*pi*t1), t2...t_{latent_dim}, 0...0], t1~U(0,1), [t2...t_{latent_dim}]~N(0,1)"
         )
         super().__init__(
             ambient_dim,

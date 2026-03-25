@@ -25,6 +25,7 @@ from Synthetic_data.distributions import NormalDistribution, \
 
 from Synthetic_data.FM_utils import VectorField, \
                                     train_uniform_FM, \
+                                    train_OT_CFM, \
                                     train_shifted_FM, \
                                     train_dgfm, \
                                     train_gfm,  \
@@ -47,7 +48,7 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps, min_lr
 
 def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
                   total_n_t, global_n_t, local_n_t, max_steps, batch_size, truncation, cluster_num,
-                  early_stopping, mf_list, test_size, device, noise_std=1e-4):
+                  early_stopping, mf_list, test_size, device, noise_std=1e-4, int_inject=0.5):
     """
     Runs one trial of both Vanilla FM and DGFM (for each mf in mf_list)
     on sample size n, returns a dict mapping method names to their
@@ -77,7 +78,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     else:
         raise ValueError(f"Unknown distribution: {dist_name}")
     
-    # latent_dim -= 2 # Add ONLY for dimension misspecification experiment!!!
+    # latent_dim += 2 # Add ONLY for dimension misspecification experiment!!!
 
     # 2) sample training data
     X_train = dist.sample(n)
@@ -94,7 +95,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
 
     time_uniform  = 0.0
 
-    # print("Estimated dimension: ", latent_dim)
+    print("Estimated dimension: ", latent_dim)
     t0 = time.thread_time()
     epoch, _, recs_uniformFM, best_model_uniform = train_uniform_FM(
         model_uniform, opt_uniform, sch_uniform, X_train,
@@ -186,7 +187,8 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
             cluster_size=cluster_size,
             cluster_d=latent_dim,
             truncation=truncation,
-            early_stopping=early_stopping
+            early_stopping=early_stopping,
+            intermediate_injection=int_inject
         )
         time_dg += time.thread_time() - t0
 
@@ -197,7 +199,7 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
         geo  = dist.geometric_alignment(Xgen)
 
         recs_dg.append({
-            "final_epoch": epoch,
+            "final_epoch": epoch * (1+mf) + mf,
             "train_time": time_dg,
             "eval_wasserstein2": w2,
             "eval_geometric_alignment": geo
@@ -247,45 +249,39 @@ def run_one_trial(n, seed, trial_idx, dist_name, ambient_dim, latent_dim, beta_a
     trial_results["GFM"] = recs_GFM
 
 
-    # 7) train LFM only
-    epoch_LFM = int(max_steps * batch_size * 10 / n / 9)
+    # 7) train OT-CFM with minibatch OT pairings
+    epoch_otcfm = int(max_steps * batch_size * 10 / n / 9)
 
-    model_LFM = VectorField(ambient_dim).to(device)
-    opt_LFM   = optim.Adam(model_LFM.parameters(), lr=2e-3, weight_decay=1e-5)
-    sch_LFM   = get_cosine_schedule_with_warmup(opt_LFM, int(0.2*max_steps), max_steps)
+    model_otcfm = VectorField(ambient_dim).to(device)
+    opt_otcfm   = optim.Adam(model_otcfm.parameters(), lr=2e-3, weight_decay=1e-5)
+    sch_otcfm   = get_cosine_schedule_with_warmup(opt_otcfm, int(0.2 * max_steps), max_steps)
 
-    time_LFM  = 0.0
-    mixture_sampler = None
+    time_otcfm  = 0.0
 
     t0 = time.thread_time()
-    mixture_sampler, epoch, _, recs_LFM, best_model_LFM = train_lfm(
-        model_LFM, opt_LFM, sch_LFM, X_train,
+    epoch, _, recs_otcfm, best_model_otcfm = train_OT_CFM(
+        model_otcfm, opt_otcfm, sch_otcfm, X_train,
         ambient_dim, device,
-        mixture_sampler=mixture_sampler,
-        n_t_local=local_n_t,
-        epochs=epoch_LFM,
+        n_t=total_n_t,
+        epochs=epoch_otcfm,
         batch_size=batch_size,
-        cluster_size=cluster_size,
-        cluster_d=latent_dim,
-        truncation=truncation,
-        early_stopping=early_stopping
+        early_stopping=early_stopping,
     )
-    time_LFM += time.thread_time() - t0
+    time_otcfm += time.thread_time() - t0
 
-    # eval
-    X0, _ = mixture_sampler.truncated_sample(test_size)
-    Xgen  = run_flow(best_model_LFM, X0, device)
-    w2    = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
-    geo   = dist.geometric_alignment(Xgen)
+    X0   = np.random.randn(test_size, ambient_dim)
+    Xgen = run_flow(best_model_otcfm, X0, device)
+    w2   = dist.wasserstein2_distance(Xgen.cpu().numpy(), test_size)
+    geo  = dist.geometric_alignment(Xgen)
 
-    recs_LFM.append({
+    recs_otcfm.append({
         "final_epoch": epoch,
-        "train_time": time_LFM,
+        "train_time": time_otcfm,
         "eval_wasserstein2": w2,
         "eval_geometric_alignment": geo
     })
 
-    trial_results["LFM"] = recs_LFM
+    trial_results["OT_CFM"] = recs_otcfm
 
 
     # 8) GMM baseline
@@ -321,23 +317,23 @@ if (__name__ == "__main__"):
 
     # 1) pick sample size & trials & seed
     sample_sizes = list(map(int,
-                        (input("Enter sample sizes (comma separated, default 250,500,1000,2000,4000): ")
-                        .strip() or "250,500,1000,2000,4000").split(",")))
+                        (input("Enter sample sizes (comma separated, default 320,640,1280,2560,5120): ")
+                        .strip() or "320,640,1280,2560,5120").split(",")))
     repeats      = int(input("Number of trials per config (default 5): ") or 5)
     seed         = int(input("Input the seed (default 1000): ")           or 1000)
 
     # 2) experiment setup
     ambient_dim    = int(input("Ambient dimension (default 80): ")              or 80)
-    latent_dim     = int(input("Latent dimension (default 20): ")               or 20)
-    total_steps    = int(input("Maximum number of opt. steps (default 2880): ") or 2880)
-    batch_size     = int(input("Minimum Batch size (default 64): ")             or 64)
-    batch_num      = int(input("Number of batches per epoch (default 8): ")     or 8)
+    latent_dim     = int(input("Latent dimension (default 5): ")                or 5)
+    total_steps    = int(input("Maximum number of opt. steps (default 1000): ") or 1000)
+    batch_size     = int(input("Minimum Batch size (default 72): ")             or 72)
+    batch_num      = int(input("Number of batches per epoch (default 4): ")     or 4)
     beta_a, beta_b = list(map(float,
                         (input("Beta parameters for shifted FM (comma separated, default 1.5,1): ")
                         .strip() or "1.5,1").split(",")))
     mf_list        = list(map(int,
-                        (input("DGFM multiplier for global FM (comma separated, default 4,8): ")
-                        .strip() or "4,8").split(",")))
+                        (input("DGFM multiplier for global FM (comma separated, default 4): ")
+                        .strip() or "4").split(",")))
 
     total_n_t      = int(input("Number of timesteps per sample for vanilla FM (default 1): ")     or 1)
     global_n_t     = int(input("Number of timesteps per sample for DGFM global FM (default 1): ") or 1)
@@ -345,6 +341,7 @@ if (__name__ == "__main__"):
     noise_std      = float(input("Noise level of distribution (default 1e-4): ")                  or 1e-4)
     truncation     = float(input("Truncation of GMM (default 1.5): ")                             or 1.5)
     cluster_num    = int(input("Number of expected clusters (default 8): ")                       or 8)
+    int_inject     = float(input("Where to inject GMM (default 0.5): ")                           or 0.5)
 
     early_stopping = input("Use early stopping if validation loss doesn't improve for three epochs? (y/n, default n): ").strip().lower() == 'y'
 
@@ -395,7 +392,7 @@ if (__name__ == "__main__"):
                 executor.submit(
                     run_one_trial, n, seed + trial, trial, dist_name, ambient_dim, latent_dim, beta_a, beta_b,
                     total_n_t, global_n_t, local_n_t, total_steps, max(batch_size, int(0.9 * n / batch_num)), truncation, cluster_num,
-                    early_stopping, mf_list, test_size, device, noise_std
+                    early_stopping, mf_list, test_size, device, noise_std, int_inject
                 ): trial
                 for trial in range(repeats)
             }
@@ -460,7 +457,7 @@ if (__name__ == "__main__"):
         summary[n] = {}
         for method, trials in data[n].items():
             final_epochs = [r[-1]['final_epoch'] for r in trials.values()]
-            times_per_epoch = [r[-1]['train_time']/r[-1]['final_epoch'] for r in trials.values()]
+            times_per_epoch = [r[-1]['train_time']/(r[-1]['final_epoch']+1) for r in trials.values()]
             w2s = [r[-1]['eval_wasserstein2'] for r in trials.values()]
             geos= [r[-1]['eval_geometric_alignment'] for r in trials.values()]
             summary[n][method] = {
@@ -498,6 +495,7 @@ if (__name__ == "__main__"):
             "noise_std"     : noise_std,
             "truncation"    : truncation,
             "cluster_num"   : cluster_num,
+            "inject_time"   : int_inject,
             "early_stopping": early_stopping,
             "mf_list"       : mf_list,
             "results"       : data,

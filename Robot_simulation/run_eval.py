@@ -213,6 +213,7 @@ def train_and_eval_FM(
     device,
     results_path: str,
     mf: int = 4,
+    model_path: str = None,
     n_t: int = None,
     n_t_global: int = None,
     n_t_local: int = None,
@@ -234,8 +235,12 @@ def train_and_eval_FM(
     trainer = trainer_map[FM_type]
 
     timestamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime("%Y%m%dT%H%M%S")
-    exp_dir = os.path.join(results_path, timestamp)
-    os.makedirs(exp_dir, exist_ok=True)
+
+    if model_path is None:
+        exp_dir = os.path.join(results_path, timestamp)
+        os.makedirs(exp_dir, exist_ok=True)
+    else:
+        exp_dir = results_path
 
     # load dataset
     with h5py.File(dataset_path, "r") as hf:
@@ -291,80 +296,86 @@ def train_and_eval_FM(
     # train model
     print(f"[{datetime.now(ZoneInfo('Asia/Seoul')).isoformat()}] Starting {FM_type} training for {task_name} with {N} samples…")
     
-    q_low      = None
-    best_model = None
-    if FM_type == "UniformFM" or FM_type == "ShiftedFM":
-        best_model, last_model, recs = trainer(model=model,
-                                            optimizer=optimizer,
-                                            scheduler=scheduler,
-                                            task_name=task_name,
-                                            target_trajectories=target_trajectories,
-                                            environment_parameters=env_params,
-                                            seq_len=seq_len,
-                                            dof=dof,
-                                            param_len=param_len,
-                                            gripper_idx=gripper_idx,
-                                            n_t=n_t,
-                                            max_epochs=max_epochs,
-                                            batch_size=batch_size,
-                                            device=device,
-                                            val_period=val_period,
-                                            early_stopping=early_stopping,
-                                            stop_criteria=stop_criteria)
-    else:
-        # dimension for tasks
-        if task_name == "door":
-            cluster_d = seq_len * 2 + 3 # 53 | end effector stays on 1-dimension path + env_params
-            cluster_size = max(int(N/5), cluster_d + 5)
-        elif task_name == "wipe":
-            cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
-            cluster_size = max(int(N/5), cluster_d + 5)
-        elif task_name == "two_arm":
-            # cluster_d = seq_len * 6 + 3 # 153 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
-            cluster_d = seq_len * 3 + 3 # 78
-            cluster_size = max(int(N/5), cluster_d + 5)
-        elif task_name == "nut":
-            cluster_d = int(seq_len * 3.2)  # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
-                                            #      for the rest 0.6 portion, end effector stays on 1=dimension path
-            cluster_size = max(int(N/5), cluster_d + 5)
-        else:
-            cluster_d = None
-            cluster_size = None
-
-        if FM_type == "GMM":
-            mixture_sampler, inv_cluster = trainer(target_trajectories=target_trajectories,
+    if model_path is None:
+        q_low      = None
+        best_model = None
+        if FM_type == "UniformFM" or FM_type == "ShiftedFM":
+            best_model, last_model, recs = trainer(model=model,
+                                                optimizer=optimizer,
+                                                scheduler=scheduler,
+                                                task_name=task_name,
+                                                target_trajectories=target_trajectories,
                                                 environment_parameters=env_params,
                                                 seq_len=seq_len,
                                                 dof=dof,
                                                 param_len=param_len,
                                                 gripper_idx=gripper_idx,
-                                                cluster_size=cluster_size,
-                                                cluster_d=cluster_d,
-                                                device=device
-                                                )
-
+                                                n_t=n_t,
+                                                max_epochs=max_epochs,
+                                                batch_size=batch_size,
+                                                device=device,
+                                                val_period=val_period,
+                                                early_stopping=early_stopping,
+                                                stop_criteria=stop_criteria)
         else:
-            best_model, last_model, recs, mixture_sampler = trainer(model=model,
-                                                                    optimizer=optimizer,
-                                                                    scheduler=scheduler,
-                                                                    task_name=task_name,
-                                                                    target_trajectories=target_trajectories,
-                                                                    environment_parameters=env_params,
-                                                                    seq_len=seq_len,
-                                                                    dof=dof,
-                                                                    param_len=param_len,
-                                                                    gripper_idx=gripper_idx,
-                                                                    mf=mf,
-                                                                    n_t_local=n_t_local,
-                                                                    n_t_global=n_t_global,
-                                                                    cluster_size=cluster_size,
-                                                                    cluster_d=cluster_d,
-                                                                    max_epochs=max_epochs,
-                                                                    batch_size=batch_size,
-                                                                    device=device,
-                                                                    val_period=val_period,
-                                                                    early_stopping=early_stopping,
-                                                                    stop_criteria=stop_criteria)
+            # dimension for tasks
+            if task_name == "door":
+                cluster_d = seq_len * 2 + 3 # 53 | end effector stays on 1-dimension path + env_params
+                cluster_size = max(int(N/5), cluster_d + 5)
+            elif task_name == "wipe":
+                cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
+                cluster_size = max(int(N/5), cluster_d + 5)
+            elif task_name == "two_arm":
+                # cluster_d = seq_len * 6 + 3 # 153 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
+                cluster_d = seq_len * 3 + 3 # 78
+                cluster_size = max(int(N/5), cluster_d + 5)
+            elif task_name == "nut":
+                cluster_d = int(seq_len * 3.2)  # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
+                                                #      for the rest 0.6 portion, end effector stays on 1=dimension path
+                cluster_size = max(int(N/5), cluster_d + 5)
+            else:
+                cluster_d = None
+                cluster_size = None
+
+            if FM_type == "GMM":
+                mixture_sampler, inv_cluster = trainer(target_trajectories=target_trajectories,
+                                                    environment_parameters=env_params,
+                                                    seq_len=seq_len,
+                                                    dof=dof,
+                                                    param_len=param_len,
+                                                    gripper_idx=gripper_idx,
+                                                    cluster_size=cluster_size,
+                                                    cluster_d=cluster_d,
+                                                    device=device
+                                                    )
+
+            else:
+                best_model, last_model, recs, mixture_sampler = trainer(model=model,
+                                                                        optimizer=optimizer,
+                                                                        scheduler=scheduler,
+                                                                        task_name=task_name,
+                                                                        target_trajectories=target_trajectories,
+                                                                        environment_parameters=env_params,
+                                                                        seq_len=seq_len,
+                                                                        dof=dof,
+                                                                        param_len=param_len,
+                                                                        gripper_idx=gripper_idx,
+                                                                        mf=mf,
+                                                                        n_t_local=n_t_local,
+                                                                        n_t_global=n_t_global,
+                                                                        cluster_size=cluster_size,
+                                                                        cluster_d=cluster_d,
+                                                                        max_epochs=max_epochs,
+                                                                        batch_size=batch_size,
+                                                                        device=device,
+                                                                        val_period=val_period,
+                                                                        early_stopping=early_stopping,
+                                                                        stop_criteria=stop_criteria)
+    else:
+        best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
+        state = torch.load(model_path, map_location=device)
+        best_model.load_state_dict(state)
+        best_model.eval()
 
     # evaluate model
     print(f"Training finished, evaluating for {evaluation_samples} trials . . .")
@@ -420,102 +431,114 @@ def train_and_eval_FM(
 
 
     # write results    
-    json_path = os.path.join(exp_dir, 'results.json')
-    if FM_type == "GMM":
-        output = {
-            "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
-            "seed":            seed,
-            "FM_type":         FM_type,
-            "N":               N,
-            "task_name":       task_name,
-            "cluster_d":       cluster_d,
-            "cluster_size":    cluster_size,
-            "eval_samples":    evaluation_samples,
-            "success_rate_best": success_rate_best,
-            "average_reward_best": avg_reward_best,
-        } 
-    elif FM_type == "DGFM" or FM_type == "GFM" or FM_type == "LFM":
-        output = {
-            "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
-            "seed":            seed,
-            "FM_type":         FM_type,
-            "N":               N,
-            "task_name":       task_name,
-            "mf":              mf,
-            "cluster_d":       cluster_d,
-            "cluster_size":    cluster_size,
-            "n_t_global":      n_t_global,
-            "n_t_local":       n_t_local,
-            "maximum epoch":   max_epochs,
-            "warmup steps":    warmup_steps,
-            "batch_size":      batch_size,
-            "early_stopping":  early_stopping,
-            "stop_criteria":   stop_criteria,
-            "eval_samples":    evaluation_samples,
-            "success_rate_best": success_rate_best,
-            "average_reward_best": avg_reward_best,
-            "records":         recs,
-        }
+    if model_path is None:
+        json_path = os.path.join(exp_dir, 'results.json')
+        if FM_type == "GMM":
+            output = {
+                "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "seed":            seed,
+                "FM_type":         FM_type,
+                "N":               N,
+                "task_name":       task_name,
+                "cluster_d":       cluster_d,
+                "cluster_size":    cluster_size,
+                "eval_samples":    evaluation_samples,
+                "success_rate_best": success_rate_best,
+                "average_reward_best": avg_reward_best,
+            } 
+        elif FM_type == "DGFM" or FM_type == "GFM" or FM_type == "LFM":
+            output = {
+                "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "seed":            seed,
+                "FM_type":         FM_type,
+                "N":               N,
+                "task_name":       task_name,
+                "mf":              mf,
+                "cluster_d":       cluster_d,
+                "cluster_size":    cluster_size,
+                "n_t_global":      n_t_global,
+                "n_t_local":       n_t_local,
+                "maximum epoch":   max_epochs,
+                "warmup steps":    warmup_steps,
+                "batch_size":      batch_size,
+                "early_stopping":  early_stopping,
+                "stop_criteria":   stop_criteria,
+                "eval_samples":    evaluation_samples,
+                "success_rate_best": success_rate_best,
+                "average_reward_best": avg_reward_best,
+                "records":         recs,
+            }
+        else:
+            output = {
+                "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
+                "seed":            seed,
+                "FM_type":         FM_type,
+                "N":               N,
+                "task_name":       task_name,
+                "n_t":             n_t,
+                "maximum epoch":   max_epochs,
+                "warmup steps":    warmup_steps,
+                "batch_size":      batch_size,
+                "early_stopping":  early_stopping,
+                "stop_criteria":   stop_criteria,
+                "eval_samples":    evaluation_samples,
+                "success_rate_best": success_rate_best,
+                "average_reward_best": avg_reward_best,
+                "records":         recs,
+            }
+        with open(json_path, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"[saved results to {json_path}]")
+        
+        if FM_type == "GMM":
+            return None
+
+        # plot and save records
+        epochs = sorted(recs.keys())
+        rates  = [recs[e].get("success_rate", float("nan")) for e in epochs]
+
+        # first axis for success rate
+        fig, ax1 = plt.subplots()
+        ln1 = ax1.plot(epochs, rates, linewidth=2, label="success_rate")
+        ax1.set_xlabel("Epoch")
+        ax1.set_ylabel("Success Rate")
+        ax1.set_title(f"{FM_type} Training Curves")
+
+        # second axis for losses
+        ax2 = ax1.twinx()
+        loss_lines = []
+        loss = [recs[e].get("loss") for e in epochs]
+        if any(v is not None for v in loss):
+            ln2 = ax2.plot(epochs, loss, linestyle="--", label="loss")
+            loss_lines += ln2
+        ax2.set_ylabel("Loss")
+
+        # combined legend
+        lines  = ln1 + loss_lines
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc="best")
+
+        plot_path = os.path.join(exp_dir, "success_rates.png")  # keep original filename
+        plt.tight_layout()
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"[Saved plot to {plot_path}]")
+
+        # save model parameters
+        model_path = os.path.join(exp_dir, 'model.pt')
+        torch.save(best_model.state_dict(), model_path)
+        print(f"[Saved model to {model_path}]")
     else:
+        recs = None
+        json_path = os.path.join(exp_dir, 'results_eval_trained.json')
         output = {
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
-            "seed":            seed,
-            "FM_type":         FM_type,
-            "N":               N,
-            "task_name":       task_name,
-            "n_t":             n_t,
-            "maximum epoch":   max_epochs,
-            "warmup steps":    warmup_steps,
-            "batch_size":      batch_size,
-            "early_stopping":  early_stopping,
-            "stop_criteria":   stop_criteria,
-            "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
-            "average_reward_best": avg_reward_best,
-            "records":         recs,
+            "average_reward_best": avg_reward_best
         }
-    with open(json_path, "w") as f:
-        json.dump(output, f, indent=2)
-    print(f"[saved results to {json_path}]")
-    
-    if FM_type == "GMM":
-        return None
-
-    # plot and save records
-    epochs = sorted(recs.keys())
-    rates  = [recs[e].get("success_rate", float("nan")) for e in epochs]
-
-    # first axis for success rate
-    fig, ax1 = plt.subplots()
-    ln1 = ax1.plot(epochs, rates, linewidth=2, label="success_rate")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Success Rate")
-    ax1.set_title(f"{FM_type} Training Curves")
-
-    # second axis for losses
-    ax2 = ax1.twinx()
-    loss_lines = []
-    loss = [recs[e].get("loss") for e in epochs]
-    if any(v is not None for v in loss):
-        ln2 = ax2.plot(epochs, loss, linestyle="--", label="loss")
-        loss_lines += ln2
-    ax2.set_ylabel("Loss")
-
-    # combined legend
-    lines  = ln1 + loss_lines
-    labels = [l.get_label() for l in lines]
-    ax1.legend(lines, labels, loc="best")
-
-    plot_path = os.path.join(exp_dir, "success_rates.png")  # keep original filename
-    plt.tight_layout()
-    plt.savefig(plot_path)
-    plt.close()
-    print(f"[Saved plot to {plot_path}]")
-
-    # save model parameters
-    model_path = os.path.join(exp_dir, 'model.pt')
-    torch.save(best_model.state_dict(), model_path)
-    print(f"[Saved model to {model_path}]")
+        with open(json_path, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"[saved results to {json_path}]")
 
     return best_model, recs
 
@@ -531,6 +554,7 @@ if __name__ == "__main__":
     parser.add_argument("--results_path",   type=str,   required=True,
                         help="Base directory under which a timestamped experiment folder will be created.")
     parser.add_argument("--mf",             type=int,   default=4)
+    parser.add_argument("--model_path",     type=str,   default=None)
     parser.add_argument("--device",         type=str,   default="cuda")
     parser.add_argument("--n_t",            type=int,   default=1)
     parser.add_argument("--n_t_global",     type=int,   default=1)
@@ -561,6 +585,7 @@ if __name__ == "__main__":
         device             = dev,
         results_path       = args.results_path,
         mf                 = args.mf,
+        model_path         = args.model_path,
         n_t                = args.n_t,
         n_t_global         = args.n_t_global,
         n_t_local          = args.n_t_local,
