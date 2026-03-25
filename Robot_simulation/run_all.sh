@@ -13,7 +13,7 @@ fi
 
 TASK_NAME="$1"
 SEED="$2"
-SLEEP_TIME=1000   # ← sleep duration between runs
+SLEEP_TIME=600   # ← sleep duration between runs
 
 ###############################
 # Dataset / results / N list
@@ -118,15 +118,15 @@ run_fm() {
 # Full execution chain:
 ########################################
 
-run_fm "GFM" ""
+# run_fm "GFM" ""
 
 # run_fm "LFM" ""
 
-run_fm "GMM" ""
+# run_fm "GMM" ""
 
 # run_fm "DGFM" "2"
 
-run_fm "DGFM" "4"
+# run_fm "DGFM" "4"
 
 run_fm "UniformFM" ""
 
