@@ -25,6 +25,7 @@ class VectorField(nn.Module):
             nn.Linear(512, 256), nn.ReLU(),
             nn.Linear(256, dim)
         )
+
     def forward(self, x, t):
         return self.net(torch.cat([x, t.unsqueeze(1)], dim=1))
 

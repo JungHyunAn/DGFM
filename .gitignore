@@ -22,3 +22,4 @@ sim_eval.log
 logs/
 synth_eval.lock
 synth_eval.pid
+.codex
