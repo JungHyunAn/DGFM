@@ -49,10 +49,16 @@ def run_diffusion(
     schedule_type: str = "cosine",
     ddim_steps: int | None = None,   # if None: use all T_diff steps
     eta: float = 0.0,                # 0.0 = deterministic DDIM; >0 adds stochasticity
+    pred_type: str = "x0",           # "x0" or "epsilon"
 ):
     """
-    Diffusion sampler (DDIM by default) using epsilon-prediction model:
-        eps = model(x_k, t, c), with t=(k+1)/T_diff (normalized step).
+    Diffusion sampler (DDIM by default).
+
+    pred_type="x0"     : model(x_k, t, c) -> x0 directly.
+                         x0 prediction is preferred when the time embedding is weak
+                         (e.g. a small MLP) because xk's noise magnitude already
+                         encodes the noise level, reducing reliance on t conditioning.
+    pred_type="epsilon": model(x_k, t, c) -> eps  (original formulation).
 
     Returns:
         x0: (B, Tseq, dof)
@@ -80,15 +86,18 @@ def run_diffusion(
         k = torch.full((B,), k_int, device=device, dtype=torch.long)
         t = ((k.float() + 1.0) / float(T_diff)).unsqueeze(-1)  # (B,1)
 
-        # epsilon prediction
-        eps = model(x, t, c)  # (B,Tseq,dof)
-
         abar_k = sched._gather(sched.alphas_bar, k, x.shape)
         sqrt_abar_k = torch.sqrt(abar_k)
         sqrt_omabar_k = torch.sqrt(1.0 - abar_k)
 
-        # predict x0
-        x0 = (x - sqrt_omabar_k * eps) / (sqrt_abar_k + 1e-8)
+        out = model(x, t, c)  # (B,Tseq,dof)
+
+        if pred_type == "x0":
+            x0  = out
+            eps = (x - sqrt_abar_k * x0) / (sqrt_omabar_k + 1e-8)
+        else:  # epsilon
+            eps = out
+            x0  = (x - sqrt_omabar_k * eps) / (sqrt_abar_k + 1e-8)
 
         # if last step, return x0
         if j == len(ks) - 1:
@@ -100,8 +109,7 @@ def run_diffusion(
         k_next = torch.full((B,), k_next_int, device=device, dtype=torch.long)
         abar_next = sched._gather(sched.alphas_bar, k_next, x.shape)
 
-        # DDIM update
-        # x_next = sqrt(abar_next)*x0 + sqrt(1-abar_next - sigma^2)*eps + sigma*z
+        # DDIM update: x_next = sqrt(abar_next)*x0 + sqrt(1-abar_next-sigma^2)*eps + sigma*z
         if eta == 0.0:
             sigma = torch.zeros_like(abar_k)
         else:
@@ -142,6 +150,7 @@ def eval_model_DP(
     schedule_type: str = "cosine",
     ddim_steps: int | None = None,
     eta: float = 0.0,
+    pred_type: str = "x0",
 ) -> Tuple[float, float]:
     """
     Same evaluation pipeline as eval_model, but trajectory generation uses diffusion.
@@ -161,19 +170,14 @@ def eval_model_DP(
         xT = torch.from_numpy(np_rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
         c  = torch.from_numpy(val_params).to(device)
 
+        with torch.inference_mode():
+            q_low = run_diffusion(model, xT, c, device,
+                                  T_diff=T_diff, schedule_type=schedule_type,
+                                  ddim_steps=ddim_steps, eta=eta, pred_type=pred_type)
+        q_low_all[:] = q_low.cpu().numpy()
+        del q_low
         if use_cuda:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                q_low = run_diffusion(model, xT, c, device,
-                                      T_diff=T_diff, schedule_type=schedule_type,
-                                      ddim_steps=ddim_steps, eta=eta)
-            q_low_all[:] = q_low.float().cpu().numpy()
-            del q_low; torch.cuda.empty_cache()
-        else:
-            with torch.inference_mode():
-                q_low = run_diffusion(model, xT, c, device,
-                                      T_diff=T_diff, schedule_type=schedule_type,
-                                      ddim_steps=ddim_steps, eta=eta)
-            q_low_all[:] = q_low.cpu().numpy()
+            torch.cuda.empty_cache()
 
     else:
         N = trials
@@ -184,19 +188,14 @@ def eval_model_DP(
             xT = torch.from_numpy(np_rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
             c  = torch.from_numpy(val_params[s:e]).to(device)
 
+            with torch.inference_mode():
+                q_low = run_diffusion(model, xT, c, device,
+                                      T_diff=T_diff, schedule_type=schedule_type,
+                                      ddim_steps=ddim_steps, eta=eta, pred_type=pred_type)
+            q_low_all[s:e] = q_low.cpu().numpy()
+            del q_low
             if use_cuda:
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                    q_low = run_diffusion(model, xT, c, device,
-                                          T_diff=T_diff, schedule_type=schedule_type,
-                                          ddim_steps=ddim_steps, eta=eta)
-                q_low_all[s:e] = q_low.float().cpu().numpy()
-                del q_low; torch.cuda.empty_cache()
-            else:
-                with torch.inference_mode():
-                    q_low = run_diffusion(model, xT, c, device,
-                                          T_diff=T_diff, schedule_type=schedule_type,
-                                          ddim_steps=ddim_steps, eta=eta)
-                q_low_all[s:e] = q_low.cpu().numpy()
+                torch.cuda.empty_cache()
 
     # ---- (3) Roll out on CPU with multiple workers (unchanged) ----
     base, rem = divmod(trials, max(1, num_workers))
@@ -309,9 +308,15 @@ def train_DP(
     early_stopping=True,
     stop_criteria=3,
     val_trials=25,
+    pred_type: str = "x0",
 ):
     """
-    Train Diffusion Policy baseline (epsilon prediction). Same format as train_uniform_FM.
+    Train Diffusion Policy baseline. Same format as train_uniform_FM.
+
+    pred_type="x0"     : model predicts clean trajectory directly (recommended).
+                         Works better with a weak time embedding because xk's
+                         noise magnitude already encodes the noise level.
+    pred_type="epsilon": classic epsilon prediction.
 
     Returns:
         best_model, last_model, success_rate_recs
@@ -368,10 +373,12 @@ def train_DP(
                 t = ((k.float() + 1.0) / float(T_diff)).unsqueeze(-1)  # (B*n_t,1)
 
                 with torch.enable_grad():
-                    eps_pred = model(xk, t, cr)
-                    sq_err = (eps_pred - eps) ** 2
+                    pred = model(xk, t, cr)
+                    target = x0r if pred_type == "x0" else eps
+                    sq_err = (pred - target) ** 2
                     if hasattr(model, "loss_mask") and model.loss_mask is not None:
                         sq_err = sq_err * model.loss_mask
+
                     loss = sq_err.mean()
 
                 optimizer.zero_grad()
@@ -398,6 +405,7 @@ def train_DP(
                     schedule_type=schedule_type,
                     ddim_steps=ddim_steps_eval,
                     eta=eta_eval,
+                    pred_type=pred_type,
                 )
                 success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
 
