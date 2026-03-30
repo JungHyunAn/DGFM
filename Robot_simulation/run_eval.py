@@ -88,7 +88,7 @@ Example invocations
 Uniform FM:
   python -m Robot_simulation.run_eval \
     --FM_type UniformFM --N 5000 \
-    --dataset_path Robot_simulation/heuristic_dataset/door_dataset_80000.hdf5 \
+    --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
     --task_name door --results_path Robot_simulation/eval_results \
     --device cuda --val_period 5 --batch_size 250 --n_t 4 \
     --max_epochs 800 --warmup_steps 200
