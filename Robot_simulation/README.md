@@ -37,21 +37,26 @@ with filenames indicating the task and number of demonstrations.
 To evaluate a flow-matching method (**UniformFM**, **ShiftedFM**, or **DGFM**) on a given task using a specified number of demonstrations, run ```bash Robot_simulation.run_eval``` as:
 
 ```bash
-python -m Robot_simulation.run_eval --FM_type UniformFM --N 1000 \
+python -m Robot_simulation.run_eval --config Robot_simulation/sim_config/door_uniform.json \
   --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
-  --task_name door --results_path Robot_simulation/eval_results/door \
-  --device cuda --val_period 30 --batch_size 500 --max_epochs 3000 \
-  --warmup_steps 600 --seed 1000
 ```
+
+The JSON config bundles simulation and training settings for reproducibility. Keep
+`dataset_path` on the command line so the same config can be reused across
+machines and dataset locations. Command-line arguments override config values.
 
 For **DGFM**, additional parameters such as the multiplication factor (mf) must be specified:
 
 ```bash
-python -m Robot_simulation.run_eval --FM_type DGFM --mf 4 --N 1000 \
+python -m Robot_simulation.run_eval --config Robot_simulation/sim_config/door_dgfm_mf4.json \
   --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
-  --task_name door --results_path Robot_simulation/eval_results/door \
-  --device cuda --val_period 6 --batch_size 250 --max_epochs 600 \
-  --warmup_steps 120
+```
+
+For a quick wiring check from heuristic windows through FM evaluation:
+
+```bash
+python -m Robot_simulation.run_eval --config Robot_simulation/sim_config/door_sanity.json \
+  --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5
 ```
 
 ## Running full task evaluations

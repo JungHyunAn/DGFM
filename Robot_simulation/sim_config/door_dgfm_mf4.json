@@ -1,0 +1,20 @@
+{
+  "FM_type": "DGFM",
+  "N": 1000,
+  "task_name": "door",
+  "results_path": "Robot_simulation/eval_results/door",
+  "device": "cuda",
+  "mf": 4,
+  "n_t_global": 1,
+  "n_t_local": 1,
+  "max_epochs": 600,
+  "batch_size": 250,
+  "warmup_steps": 120,
+  "val_period": 6,
+  "stop_criteria": 3,
+  "evaluation_samples": 100,
+  "horizon": 32,
+  "window_stride": 1,
+  "early_stopping": false,
+  "seed": 1000
+}

@@ -136,14 +136,33 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
 
-from Robot_simulation.FM_util import VectorField, eval_model, _get_environment_params, _align_handle_to_nut, \
+from Robot_simulation.FM_util import VectorField, build_state_conditioned_windows, eval_model, _get_environment_params, _align_handle_to_nut, \
                                      train_uniform_FM, \
                                      train_shifted_FM, \
                                      train_DGFM, \
                                      train_GFM, \
                                      train_LFM, \
                                      train_GMM 
-from Robot_simulation.heuristics_util import make_env
+from Robot_simulation.env_util import make_env
+from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
+
+
+def _load_json_config(path: str | None) -> dict:
+    if path is None:
+        return {}
+    with open(path, "r") as f:
+        config = json.load(f)
+    if not isinstance(config, dict):
+        raise ValueError(f"Config must be a JSON object: {path}")
+    return config
+
+
+def _apply_config_defaults(parser: argparse.ArgumentParser, config: dict) -> None:
+    valid = {action.dest for action in parser._actions}
+    unknown = sorted(set(config) - valid)
+    if unknown:
+        raise ValueError(f"Unknown config keys: {unknown}")
+    parser.set_defaults(**config)
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
@@ -225,6 +244,8 @@ def train_and_eval_FM(
     stop_criteria: int = 3,
     evaluation_samples: int = 1000,
     seed: int = 2002,
+    horizon: int = 32,
+    window_stride: int = 1,
 ):
     trainer_map = {"UniformFM" : train_uniform_FM,
                    "ShiftedFM" : train_shifted_FM,
@@ -248,33 +269,56 @@ def train_and_eval_FM(
         # collect episode subgroup names in order:
         ep_keys = sorted(data_grp.keys(), key=lambda s: int(s.split("_")[-1]))
         total_N = len(ep_keys)
+        selected_ep_keys = ep_keys[:min(N, total_N)]
+        if not selected_ep_keys:
+            raise ValueError(f"No episodes found in dataset: {dataset_path}")
 
         # read the first to get shapes/dtypes
-        first = data_grp[ep_keys[0]]
-        traj0 = first["joint_angles"][:]                         # shape (K, dof)
+        first = data_grp[selected_ep_keys[0]]
+        traj0 = first["joint_angles"][:]                         # shape (T, dof)
         param0 = first["environment_parameters"]["values"][:]    # shape (P,)
+        dyn0 = first["dynamic_states"][:] if "dynamic_states" in first else np.zeros((traj0.shape[0], 0), dtype=np.float32)
 
-        seq_len, dof = traj0.shape
-        param_len    = param0.shape[0]
-        # pre-allocate
-        data_trajectories = np.empty((total_N, seq_len, dof), dtype=traj0.dtype)
-        data_env_params   = np.empty((total_N, param_len), dtype=param0.dtype)
+        full_len, dof = traj0.shape
+        dyn_dim = dyn0.shape[1]
+        seq_len = min(horizon, full_len)
+        data_trajectories = []
+        data_dynamic = []
+        data_static_env = []
         # fill
-        for i, ep in enumerate(ep_keys):
+        for i, ep in enumerate(selected_ep_keys):
             grp = data_grp[ep]
-            data_trajectories[i] = grp["joint_angles"][:]
-            data_env_params[i]   = grp["environment_parameters"]["values"][:]
-        data_trajectories = torch.from_numpy(data_trajectories).float().to(device)
-        data_env_params = torch.from_numpy(data_env_params).float().to(device)
+            q_ep = grp["joint_angles"][:]
+            data_trajectories.append(q_ep)
+            if "dynamic_states" in grp:
+                data_dynamic.append(grp["dynamic_states"][:])
+            else:
+                data_dynamic.append(np.zeros((q_ep.shape[0], dyn_dim), dtype=np.float32))
+            data_static_env.append(grp["environment_parameters"]["values"][:])
+        data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
+
+        window_traj, window_cond = build_state_conditioned_windows(
+            data_trajectories,
+            data_dynamic,
+            data_static_env,
+            horizon=seq_len,
+            stride=window_stride,
+        )
+        data_trajectories = torch.from_numpy(window_traj).float().to(device)
+        data_env_params = torch.from_numpy(window_cond).float().to(device)
+        param_len = window_cond.shape[1]
+        num_demos = len(selected_ep_keys)
+        num_windows = window_traj.shape[0]
 
     # sample the target trajectories & its environment parameters
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
 
-    perm_idx = torch.randperm(N, device=device)
+    perm_idx = torch.randperm(data_trajectories.shape[0], device=device)
     target_trajectories = data_trajectories[perm_idx]
     env_params = data_env_params[perm_idx]
+    train_N = target_trajectories.shape[0]
 
     # obtain gripper indexes
     gripper_idx = None
@@ -294,7 +338,10 @@ def train_and_eval_FM(
     )
 
     # train model
-    print(f"[{datetime.now(ZoneInfo('Asia/Seoul')).isoformat()}] Starting {FM_type} training for {task_name} with {N} samples…")
+    print(
+        f"[{datetime.now(ZoneInfo('Asia/Seoul')).isoformat()}] "
+        f"Starting {FM_type} training for {task_name} with {num_demos} demos -> {train_N} windows..."
+    )
     
     if model_path is None:
         q_low      = None
@@ -321,18 +368,18 @@ def train_and_eval_FM(
             # dimension for tasks
             if task_name == "door":
                 cluster_d = seq_len * 2 + 3 # 53 | end effector stays on 1-dimension path + env_params
-                cluster_size = max(int(N/5), cluster_d + 5)
+                cluster_size = max(int(train_N/5), cluster_d + 5)
             elif task_name == "wipe":
                 cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
-                cluster_size = max(int(N/5), cluster_d + 5)
+                cluster_size = max(int(train_N/5), cluster_d + 5)
             elif task_name == "two_arm":
                 # cluster_d = seq_len * 6 + 3 # 153 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
                 cluster_d = seq_len * 3 + 3 # 78
-                cluster_size = max(int(N/5), cluster_d + 5)
+                cluster_size = max(int(train_N/5), cluster_d + 5)
             elif task_name == "nut":
                 cluster_d = int(seq_len * 3.2)  # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
                                                 #      for the rest 0.6 portion, end effector stays on 1=dimension path
-                cluster_size = max(int(N/5), cluster_d + 5)
+                cluster_size = max(int(train_N/5), cluster_d + 5)
             else:
                 cluster_d = None
                 cluster_size = None
@@ -439,6 +486,10 @@ def train_and_eval_FM(
                 "seed":            seed,
                 "FM_type":         FM_type,
                 "N":               N,
+                "num_demos":       num_demos,
+                "num_windows":     num_windows,
+                "horizon":         seq_len,
+                "window_stride":   window_stride,
                 "task_name":       task_name,
                 "cluster_d":       cluster_d,
                 "cluster_size":    cluster_size,
@@ -452,6 +503,10 @@ def train_and_eval_FM(
                 "seed":            seed,
                 "FM_type":         FM_type,
                 "N":               N,
+                "num_demos":       num_demos,
+                "num_windows":     num_windows,
+                "horizon":         seq_len,
+                "window_stride":   window_stride,
                 "task_name":       task_name,
                 "mf":              mf,
                 "cluster_d":       cluster_d,
@@ -474,6 +529,10 @@ def train_and_eval_FM(
                 "seed":            seed,
                 "FM_type":         FM_type,
                 "N":               N,
+                "num_demos":       num_demos,
+                "num_windows":     num_windows,
+                "horizon":         seq_len,
+                "window_stride":   window_stride,
                 "task_name":       task_name,
                 "n_t":             n_t,
                 "maximum epoch":   max_epochs,
@@ -544,14 +603,20 @@ def train_and_eval_FM(
 
 
 if __name__ == "__main__":
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument("--config", type=str, default=None)
+    config_args, _ = config_parser.parse_known_args()
+
     parser = argparse.ArgumentParser("train_and_eval_FM")
-    parser.add_argument("--FM_type",        type=str,   required=True,
+    parser.add_argument("--config",         type=str,   default=None,
+                        help="JSON config with all run options except dataset_path.")
+    parser.add_argument("--FM_type",        type=str,   default=None,
                         choices=["UniformFM","ShiftedFM","DGFM","GFM","LFM","GMM"])
-    parser.add_argument("--N",              type=int,   required=True)
-    parser.add_argument("--dataset_path",   type=str,   required=True)
-    parser.add_argument("--task_name",      type=str,   required=True,
+    parser.add_argument("--N",              type=int,   default=None)
+    parser.add_argument("--dataset_path",   type=str,   default=None)
+    parser.add_argument("--task_name",      type=str,   default=None,
                         choices=["door","wipe","two_arm","nut"])
-    parser.add_argument("--results_path",   type=str,   required=True,
+    parser.add_argument("--results_path",   type=str,   default=DEFAULT_RECORDS_DIR,
                         help="Base directory under which a timestamped experiment folder will be created.")
     parser.add_argument("--mf",             type=int,   default=4)
     parser.add_argument("--model_path",     type=str,   default=None)
@@ -565,9 +630,19 @@ if __name__ == "__main__":
     parser.add_argument("--val_period",     type=int,   default=5)
     parser.add_argument("--stop_criteria",  type=int,   default=3)
     parser.add_argument("--evaluation_samples", type=int, default=100)
+    parser.add_argument("--horizon", type=int, default=32)
+    parser.add_argument("--window_stride", type=int, default=1)
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
+
+    _apply_config_defaults(parser, _load_json_config(config_args.config))
     args = parser.parse_args()
+
+    missing = [name for name in ("FM_type", "N", "task_name") if getattr(args, name) is None]
+    if missing:
+        parser.error(f"Missing required option(s): {', '.join('--' + name for name in missing)}")
+    if args.N <= 0:
+        parser.error("--N must be positive")
 
     # device setup
     if args.device.startswith("cuda") and torch.cuda.is_available():
@@ -577,10 +652,14 @@ if __name__ == "__main__":
 
     print(f"Running on {dev}\n")
 
+    dataset_path = args.dataset_path
+    if dataset_path is None:
+        dataset_path = os.path.join(DEFAULT_DATASET_DIR, f"{args.task_name}_dataset_{args.N}.hdf5")
+
     train_and_eval_FM(
         FM_type            = args.FM_type,
         N                  = args.N,
-        dataset_path       = args.dataset_path,
+        dataset_path       = dataset_path,
         task_name          = args.task_name,
         device             = dev,
         results_path       = args.results_path,
@@ -596,5 +675,7 @@ if __name__ == "__main__":
         early_stopping     = args.early_stopping,
         stop_criteria      = args.stop_criteria,
         evaluation_samples = args.evaluation_samples,
-        seed               = args.seed
+        seed               = args.seed,
+        horizon            = args.horizon,
+        window_stride      = args.window_stride,
     )

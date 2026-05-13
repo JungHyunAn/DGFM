@@ -6,6 +6,7 @@ from typing import List, Dict, Tuple
 from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_slerp, quat_multiply, quat_inverse
+from Robot_simulation.heuristics_util import get_dynamic_state
 
 
 def generate_two_arm_trajectory(
@@ -41,6 +42,7 @@ def generate_two_arm_trajectory(
 
     # ---------- storage ----------
     q_traj, frames = [], []
+    dynamic_traj = []
 
     # ---------- reset & indices ----------
     env.reset()
@@ -79,6 +81,8 @@ def generate_two_arm_trajectory(
     # ---------- helper for recording ----------
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
+        # TODO(two_arm): Replace empty placeholder with pot / handle dynamic state.
+        dynamic_traj.append(get_dynamic_state(env, "two_arm"))
 
     # ---------- begin recording ----------
     record_q()
@@ -236,7 +240,15 @@ def generate_two_arm_trajectory(
         if verbose:
             print(f"Saved video to {path}")
 
-    return np.stack(q_traj, axis=0), success, frames, init_qpos, env_setting, environment_parameters
+    return (
+        np.stack(q_traj, axis=0),
+        success,
+        frames,
+        init_qpos,
+        env_setting,
+        environment_parameters,
+        np.stack(dynamic_traj, axis=0),
+    )
 
 
 if __name__ == "__main__":
@@ -258,7 +270,7 @@ if __name__ == "__main__":
         control_freq=20,
     )
 
-    traj, success, _, init_qpos, env_state, env_param = generate_two_arm_trajectory(
+    traj, success, _, init_qpos, env_state, env_param, dynamic_states = generate_two_arm_trajectory(
         env,
         render=True,
         video_folder="Robot_simulation/videos",
@@ -270,6 +282,7 @@ if __name__ == "__main__":
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
     print("Environment parameters:", env_param)
+    print("Dynamic state shape:", dynamic_states.shape)
 
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():

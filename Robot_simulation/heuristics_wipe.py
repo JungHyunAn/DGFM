@@ -15,7 +15,7 @@ from robosuite.utils.transform_utils import mat2quat
 from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 
-from Robot_simulation.heuristics_util import step_towards
+from Robot_simulation.heuristics_util import get_dynamic_state, step_towards
 
 
 def generate_wipe_trajectory(
@@ -59,6 +59,7 @@ def generate_wipe_trajectory(
 
     # ---------- storage ----------
     q_traj: List[np.ndarray] = []
+    dynamic_traj: List[np.ndarray] = []
     frames: List[np.ndarray] = []
 
     # ---------- reset & joint indices ----------
@@ -85,6 +86,8 @@ def generate_wipe_trajectory(
     # ---------- helper for recording ----------
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
+        # TODO(wipe): Replace empty placeholder with remaining marker / dirt state.
+        dynamic_traj.append(get_dynamic_state(env, "wipe"))
 
     # ---------- helper for step then check & record ----------
     def step_and_check(pos, quat, steps=1):
@@ -191,7 +194,15 @@ def generate_wipe_trajectory(
         if verbose:
             print(f"Saved frontview video to {out}")
 
-    return np.stack(q_traj, axis=0), success, frames, init_qpos, env_setting, environment_paramters
+    return (
+        np.stack(q_traj, axis=0),
+        success,
+        frames,
+        init_qpos,
+        env_setting,
+        environment_paramters,
+        np.stack(dynamic_traj, axis=0),
+    )
 
 
 if __name__ == "__main__":
@@ -227,7 +238,7 @@ if __name__ == "__main__":
     env.task_config["table_full_size"] = [0.4, 0.6, 0.05]
     env.table_full_size = [0.4, 0.6, 0.05]
 
-    traj, success, frames, init_qpos, env_state, env_param = generate_wipe_trajectory(
+    traj, success, frames, init_qpos, env_state, env_param, dynamic_states = generate_wipe_trajectory(
         env,
         render=True,
         video_folder="Robot_simulation/videos",
@@ -239,6 +250,7 @@ if __name__ == "__main__":
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
     print("Environment parameters:", env_param)
+    print("Dynamic state shape:", dynamic_states.shape)
     
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():

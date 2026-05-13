@@ -5,7 +5,7 @@ import numpy as np
 from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
-from Robot_simulation.heuristics_util import step_towards
+from Robot_simulation.heuristics_util import get_dynamic_state, step_towards
 
 def generate_nut_trajectory(
     env,
@@ -57,6 +57,7 @@ def generate_nut_trajectory(
 
     # ---------- storage ----------
     q_traj = []
+    dynamic_traj = []
     frames = []
 
     # ---------- reset & joint indices ----------
@@ -102,6 +103,8 @@ def generate_nut_trajectory(
     # ---------- helper for recording ----------
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
+        # TODO(nut): Replace empty placeholder with nut pose / peg-relative state.
+        dynamic_traj.append(get_dynamic_state(env, "nut"))
 
     # ---------- begin recording ----------
     record_q()
@@ -222,7 +225,15 @@ def generate_nut_trajectory(
         if verbose:
             print(f"Saved frontview video to {path}")
 
-    return np.stack(q_traj, axis=0), success, frames, init_qpos, environment_setting, environment_parameters
+    return (
+        np.stack(q_traj, axis=0),
+        success,
+        frames,
+        init_qpos,
+        environment_setting,
+        environment_parameters,
+        np.stack(dynamic_traj, axis=0),
+    )
 
 
 if __name__ == "__main__":
@@ -249,7 +260,7 @@ if __name__ == "__main__":
     env.table_offset[2] += delta_z
     env.reset()    
     
-    traj, success, _, init_qpos, env_state, env_param = generate_nut_trajectory(
+    traj, success, _, init_qpos, env_state, env_param, dynamic_states = generate_nut_trajectory(
         env,
         delta_z,
         render=True,
@@ -262,6 +273,7 @@ if __name__ == "__main__":
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
     print("Environment parameters:", env_param)
+    print("Dynamic state shape:", dynamic_states.shape)
 
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():

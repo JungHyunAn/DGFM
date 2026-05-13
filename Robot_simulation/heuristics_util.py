@@ -72,6 +72,77 @@ from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
 
 
+def _safe_qpos_by_joint_substring(env, substrings):
+    """Return qpos values for joints whose names contain any requested substring."""
+    values = []
+    names = getattr(env.sim.model, "joint_names", [])
+    for name in names:
+        lname = name.lower()
+        if any(s in lname for s in substrings):
+            try:
+                addr = env.sim.model.get_joint_qpos_addr(name)
+                values.append(np.asarray(env.sim.data.qpos[addr]).reshape(-1)[0])
+            except Exception:
+                continue
+    return values
+
+
+def get_dynamic_state(env, task_name: str) -> np.ndarray:
+    """Extract task dynamic state recorded alongside robot joint angles.
+
+    Door records handle/latch angle and door hinge angle. Wipe records a
+    per-marker remaining-dirt mask. Other tasks intentionally return an empty
+    vector until task-specific dynamics are chosen.
+    """
+    if task_name == "door":
+        handle_angle = None
+        door_angle = None
+
+        for attr in ("handle_qpos_addr", "latch_qpos_addr"):
+            if hasattr(env, attr):
+                try:
+                    handle_angle = float(np.asarray(env.sim.data.qpos[getattr(env, attr)]).reshape(-1)[0])
+                    break
+                except Exception:
+                    pass
+        for attr in ("hinge_qpos_addr", "door_qpos_addr"):
+            if hasattr(env, attr):
+                try:
+                    door_angle = float(np.asarray(env.sim.data.qpos[getattr(env, attr)]).reshape(-1)[0])
+                    break
+                except Exception:
+                    pass
+
+        if handle_angle is None:
+            vals = _safe_qpos_by_joint_substring(env, ("handle", "latch"))
+            handle_angle = vals[0] if vals else 0.0
+        if door_angle is None:
+            vals = _safe_qpos_by_joint_substring(env, ("hinge", "door"))
+            door_angle = vals[0] if vals else 0.0
+
+        return np.array([handle_angle, door_angle], dtype=np.float32)
+
+    # TODO(two_arm): Record pot/handle dynamic pose or lifted height during rollout.
+    # TODO(nut): Record nut pose relative to peg during rollout.
+    if task_name == "wipe":
+        markers = getattr(getattr(env.model, "mujoco_arena", None), "markers", ())
+        if not markers:
+            return np.zeros((0,), dtype=np.float32)
+
+        marker_geom_ids = getattr(env, "_dgfm_wipe_marker_geom_ids", None)
+        if marker_geom_ids is None or len(marker_geom_ids) != len(markers):
+            marker_geom_ids = np.fromiter(
+                (env.sim.model.geom_name2id(marker.visual_geoms[0]) for marker in markers),
+                dtype=np.int32,
+                count=len(markers),
+            )
+            env._dgfm_wipe_marker_geom_ids = marker_geom_ids
+
+        return (env.sim.model.geom_rgba[marker_geom_ids, 3] > 0.0).astype(np.float32)
+
+    return np.zeros((0,), dtype=np.float32)
+
+
 SIG = (mujoco.mjtState.mjSTATE_INTEGRATION)
 def save_mj_state(env):
     m = env.sim.model._model
@@ -793,16 +864,27 @@ def render_trajectory(
             offset += n
         env.sim.forward()
 
+    terminated = False
     if hold_init:
         for _ in range(100):
-            env.step(_to_action_from_q(q_high[0], task_name))
+            _, _, done, _ = env.step(_to_action_from_q(q_high[0], task_name))
+            if done:
+                terminated = True
+                break
 
     frames = []
+    if terminated:
+        img = env.sim.render(640,480, camera_name=camera_name)
+        frames.append(np.flipud(img))
+        return frames
+
     for q in q_high:
         action = _to_action_from_q(q, task_name)
         
-        env.step(action)
+        _, _, done, _ = env.step(action)
 
         img = env.sim.render(640,480, camera_name=camera_name)
         frames.append(np.flipud(img))
+        if done:
+            break
     return frames

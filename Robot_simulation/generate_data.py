@@ -75,7 +75,7 @@ python -m Robot_simulation.generate_dataset_parallel
 Important notes & assumptions
 -----------------------------
 - The **heuristic generator** must return:
-    (q_traj, success, frames_unused, initial_qpos, environment_setting, env_param)
+    (q_traj, success, frames, initial_qpos, environment_setting, env_param, dynamic_states)
   where `environment_setting` contains full MuJoCo state arrays. Only episodes
   with `success=True` are saved.
 - Keyframes are sampled from a potentially downsampled trace but `key_inds`
@@ -123,10 +123,9 @@ from Robot_simulation.heuristics_door import generate_door_trajectory
 from Robot_simulation.heuristics_wipe import generate_wipe_trajectory
 from Robot_simulation.heuristics_two_arm import generate_two_arm_trajectory
 from Robot_simulation.heuristics_nut import generate_nut_trajectory
-from Robot_simulation.heuristics_util import (make_env, 
-                                              write_grid_video, 
-                                              compute_smooth_trajectory, 
-                                              render_trajectory)
+from Robot_simulation.env_util import make_env
+from Robot_simulation.heuristics_util import write_grid_video, render_trajectory
+from Robot_simulation import DEFAULT_DATASET_DIR
 
 DOWNSAMPLE_RATIOS  = {"door"    : 2,
                       "wipe"    : -1,
@@ -259,6 +258,8 @@ def save_episode(
     initial_pose: np.ndarray,
     env_setting,
     env_param,
+    dynamic_states: Optional[np.ndarray] = None,
+    rendered_images: Optional[np.ndarray] = None,
 ):
     """
     Write one successful episode into the HDF5 file.
@@ -295,7 +296,13 @@ def save_episode(
     grp.create_dataset("key_inds",      data=key_inds,      compression="gzip")
     grp.attrs["success"]       = int(success)
     grp.attrs["num_keyframes"] = joint_angles.shape[0]
+    grp.attrs["trajectory_format"] = "full"
     grp.create_dataset("initial_pose", data=initial_pose, compression="gzip")
+    if dynamic_states is None:
+        dynamic_states = np.zeros((joint_angles.shape[0], 0), dtype=np.float32)
+    grp.create_dataset("dynamic_states", data=dynamic_states, compression="gzip")
+    if rendered_images is not None:
+        grp.create_dataset("rendered_images", data=rendered_images, compression="gzip")
     # save environment settings
     env_setting_grp = grp.create_group("environment_setting")
     for k, v in env_setting.items():
@@ -315,6 +322,7 @@ def worker_generate(
     chunk_size: int,
     max_trials: int,
     seed: int,
+    save_rendered_images: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Worker process entrypoint for multiprocessing.
@@ -348,27 +356,29 @@ def worker_generate(
     generator = gen_map[task_name]
     np.random.seed(seed + worker_id)
 
-    env = make_env(task_name, has_offscreen_renderer=False, use_camera_obs=False)
+    env = make_env(
+        task_name,
+        has_offscreen_renderer=save_rendered_images,
+        use_camera_obs=False,
+    )
     successes = []
     trials = 0
 
     while len(successes) < chunk_size and trials < max_trials:
         trials += 1
         # generator now returns (actions, success, frames, initial_qpos)
-        q_traj, success, _, init_qpos, environment_setting, env_param = generator(env, render=False)
+        result = generator(env, render=save_rendered_images)
+        q_traj, success, frames, init_qpos, environment_setting, env_param, dynamic_states = result
         # print(trials, success)
         if success:
-            # door_bid = env.object_body_ids["door"]
-            # print("Passed door position: ", env.sim.data.body_xpos[door_bid])
-            q_keys, idx = sample_keyframes(q_traj, 
-                                           downsample_ratio=DOWNSAMPLE_RATIOS[task_name], 
-                                           intervals=KEYFRAME_INTERVALS[task_name])
             successes.append({
-                "joint_angles": q_keys,         # (35,dof)
-                "key_inds":      idx,           # (35,)
+                "joint_angles": q_traj,
+                "key_inds":      np.arange(len(q_traj), dtype=np.int64),
                 "initial_pose":  init_qpos,
                 "environment_setting":  environment_setting,
                 "environment_parameters": env_param,
+                "dynamic_states": dynamic_states,
+                "rendered_images": np.asarray(frames, dtype=np.uint8) if save_rendered_images else None,
             })
 
     env.close()
@@ -406,14 +416,15 @@ def generate_data_parallel(
     n: int,
     task_name: str,
     render: bool = False,
-    output_dir: str = "Robot_simulation/heuristic_dataset",
+    output_dir: str = DEFAULT_DATASET_DIR,
     hdf5_name: Optional[str] = None,
     num_workers: int = 4,
     chunk_size: int = 2,
     max_render_videos: int = 25,
     max_trials_per_worker: int = 200,
     base_seed: int = 12345,
-    verbose: bool = True
+    verbose: bool = True,
+    save_rendered_images: bool = False,
 ):
     """
     Orchestrate parallel trajectory generation, HDF5 serialization, and optional rendering.
@@ -480,7 +491,15 @@ def generate_data_parallel(
 
         # Launch initial workers
         futures = [
-            pool.submit(worker_generate, wid, task_name, chunk_size, max_trials_per_worker, base_seed)
+            pool.submit(
+                worker_generate,
+                wid,
+                task_name,
+                chunk_size,
+                max_trials_per_worker,
+                base_seed,
+                save_rendered_images,
+            )
             for wid in range(num_workers)
         ]
 
@@ -501,7 +520,9 @@ def generate_data_parallel(
                         True,
                         entry["initial_pose"],
                         entry["environment_setting"],
-                        entry["environment_parameters"]
+                        entry["environment_parameters"],
+                        entry["dynamic_states"],
+                        entry["rendered_images"],
                     )
 
                     pbar.update(1)
@@ -512,7 +533,15 @@ def generate_data_parallel(
                 if success_count < n:
                     wid = np.random.randint(0, num_workers)
                     futures.append(
-                        pool.submit(worker_generate, wid, task_name, chunk_size, max_trials_per_worker, base_seed)
+                        pool.submit(
+                            worker_generate,
+                            wid,
+                            task_name,
+                            chunk_size,
+                            max_trials_per_worker,
+                            base_seed,
+                            save_rendered_images,
+                        )
                     )
 
     hf.attrs["num_episodes"] = success_count
@@ -524,8 +553,8 @@ def generate_data_parallel(
         print("Restoring & Rendering saved trajectories . . .")
         for i in range(render_episodes):
             with h5py.File(h5_path, "r") as hf_read:
-                q_keys  = hf_read[f"data/entire_episode_{i}/joint_angles"][:]
-                init_q  = q_keys[0]
+                q_traj  = hf_read[f"data/entire_episode_{i}/joint_angles"][:]
+                init_q  = q_traj[0]
                 g = hf_read[f"data/entire_episode_{i}/environment_setting"]
                 environment_setting = {k: g[k][()] for k in g.keys()}   # dict of arrays
             # restore the initial pose            
@@ -535,10 +564,8 @@ def generate_data_parallel(
                              use_joint_control=True, 
                              environment_setting=environment_setting)
             
-            q_high = compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
-
             frames = render_trajectory(
-                env_r, task_name, q_high, init_q,
+                env_r, task_name, q_traj, init_q,
                 fps=control_freq * 3,
                 camera_name="frontview"
             )
@@ -576,6 +603,14 @@ if __name__ == "__main__":
         help="Whether to replay and render videos of the collected episodes"
     )
     parser.add_argument(
+        "--save_rendered_images", action="store_true",
+        help="Save per-step rendered images inside each successful HDF5 episode"
+    )
+    parser.add_argument(
+        "--output_dir", type=str, default=DEFAULT_DATASET_DIR,
+        help="Directory to save generated HDF5 datasets"
+    )
+    parser.add_argument(
         "--num_workers", type=int, default=5,
         help="Number of parallel worker processes"
     )
@@ -594,7 +629,9 @@ if __name__ == "__main__":
         n=args.n,
         task_name=args.task_name,
         render=args.render,
+        output_dir=args.output_dir,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
-        verbose=args.verbose
+        verbose=args.verbose,
+        save_rendered_images=args.save_rendered_images,
     )

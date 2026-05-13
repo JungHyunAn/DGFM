@@ -76,7 +76,7 @@ from tqdm import tqdm
 from typing import Tuple, List
 from sklearn.decomposition import IncrementalPCA
 from sklearn.neighbors import NearestNeighbors
-from scipy.stats import truncnorm, chi2
+from scipy.stats import chi2
 from torch.distributions import Beta
 from joblib import Parallel, delayed
 import logging
@@ -88,7 +88,8 @@ for h in list(robosuite_logger.handlers):
     robosuite_logger.removeHandler(h)
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
 
-from Robot_simulation.heuristics_util import make_env, compute_smooth_trajectory_with_q0, render_trajectory, write_grid_video, step_towards
+from Robot_simulation.env_util import make_env
+from Robot_simulation.heuristics_util import compute_smooth_trajectory_with_q0, get_dynamic_state, render_trajectory, write_grid_video, step_towards
 
 
 class FiLM(nn.Module):
@@ -330,209 +331,207 @@ class VectorField(nn.Module):
         # gripper dims remain zero -> "no flow" for grippers
 
         return v_full
-    
 
-class MixtureSampler:
-    """Low-rank conditional Gaussian mixture over (x, c).
 
-    Each component places a low-rank Gaussian on the flattened trajectory `x`
-    via a basis `B` and a full Gaussian on environment parameters `c`. The
-    conditional p(x|c) is efficient to sample using precomputed Choleskies.
+def build_state_conditioned_windows(
+    trajectories: np.ndarray,
+    dynamic_states: np.ndarray | None,
+    static_env_params: np.ndarray,
+    horizon: int,
+    stride: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Convert full episodes into diffusion-policy-style FM training windows.
 
-    Construction inputs typically come from `compute_cluster_pca_fast_joint`.
-
-    Args:
-        mu_x: (K, Dx) component means for flattened trajectories.
-        mu_c: (K, Dc) component means for environment parameters.
-        B: (K, Dx, d) component bases, with `d` < `Dx`.
-        Sig_zz: (K, d, d) covariance of latent coordinates z.
-        Sig_zc: (K, d, Dc) cross-covariance between z and c.
-        Sig_cc: (K, Dc, Dc) covariance of c.
-        weights: (K,) mixture weights (will be normalized).
-        device: Torch device for internal tensors and sampling.
-        reg: Diagonal regularizer added to covariances for stability.
-        orth_sigma: Optional isotropic noise added in x-space (orthogonal to B).
-
-    Methods:
-        sample_cond(c, ...): Sample x ~ p(x|c) optionally forcing components.
-        sample_joint(M, ...): Sample (x, c) ~ p(x,c) by drawing component first.
+    Each training item maps
+    ``[current_joint_angles, current_dynamic_state, static_environment_params]``
+    to the next fixed-horizon joint trajectory.
     """
-    def __init__(self, mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights,
-                 device='cpu', reg=1e-6, orth_sigma=0.0):
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+    if stride <= 0:
+        raise ValueError("stride must be positive")
+
+    xs, cs = [], []
+    n_eps = len(trajectories)
+    for ep in range(n_eps):
+        q = np.asarray(trajectories[ep], dtype=np.float32)
+        dyn = None if dynamic_states is None else dynamic_states[ep]
+        if dyn is None:
+            dyn = np.zeros((len(q), 0), dtype=np.float32)
+        else:
+            dyn = np.asarray(dyn, dtype=np.float32)
+            if dyn.shape[0] != len(q):
+                raise ValueError(f"dynamic_states[{ep}] length {dyn.shape[0]} != trajectory length {len(q)}")
+        env_c = np.asarray(static_env_params[ep], dtype=np.float32)
+        for start in range(0, len(q) - horizon + 1, stride):
+            xs.append(q[start:start + horizon])
+            cs.append(np.concatenate([q[start], dyn[start], env_c], axis=0))
+
+    if not xs:
+        raise ValueError(f"No training windows produced; horizon={horizon} is longer than all trajectories.")
+
+    return np.asarray(xs, dtype=np.float32), np.asarray(cs, dtype=np.float32)
+
+
+def make_policy_condition(
+    current_q: np.ndarray,
+    current_dynamic_state: np.ndarray | None,
+    static_env_params: np.ndarray,
+) -> np.ndarray:
+    if current_dynamic_state is None:
+        current_dynamic_state = np.zeros((0,), dtype=np.float32)
+    return np.concatenate(
+        [
+            np.asarray(current_q, dtype=np.float32).reshape(-1),
+            np.asarray(current_dynamic_state, dtype=np.float32).reshape(-1),
+            np.asarray(static_env_params, dtype=np.float32).reshape(-1),
+        ],
+        axis=0,
+    )
+
+
+class VanillaFM:
+    """State-conditioned Flow Matching trainer for fixed-horizon policies."""
+
+    def __init__(
+        self,
+        model,
+        optimizer,
+        scheduler,
+        *,
+        task_name: str,
+        horizon: int,
+        dof: int,
+        condition_dim: int,
+        gripper_idx=None,
+        time_sampling: str = "uniform",
+        beta_a: float = 1.5,
+        beta_b: float = 1.0,
+        device: str = "cuda",
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.task_name = task_name
+        self.horizon = horizon
+        self.dof = dof
+        self.condition_dim = condition_dim
+        self.gripper_idx = gripper_idx
+        self.time_sampling = time_sampling
+        self.beta_a = beta_a
+        self.beta_b = beta_b
         self.device = device
-        # shapes
-        self.K, self.Dx = mu_x.shape
-        self.Dc = mu_c.shape[1]
-        self.d  = B.shape[2]
 
-        # tensors
-        self.mu_x = torch.as_tensor(mu_x, dtype=torch.float32, device=device)   # (K, Dx)
-        self.mu_c = torch.as_tensor(mu_c, dtype=torch.float32, device=device)   # (K, Dc)
-        self.B    = torch.as_tensor(B,    dtype=torch.float32, device=device)   # (K, Dx, d)
-        self.Szz  = torch.as_tensor(Sig_zz, dtype=torch.float32, device=device) # (K, d, d)
-        self.Szc  = torch.as_tensor(Sig_zc, dtype=torch.float32, device=device) # (K, d, Dc)
-        self.Scc  = torch.as_tensor(Sig_cc, dtype=torch.float32, device=device) # (K, Dc, Dc)
+    def sample_t(self, n: int) -> torch.Tensor:
+        if self.time_sampling == "shifted":
+            t = Beta(self.beta_a, self.beta_b).sample((n, 1)).to(self.device)
+            return torch.ones_like(t) - t
+        return torch.rand(n, device=self.device).unsqueeze(-1)
 
-        w = torch.as_tensor(weights, dtype=torch.float32, device=device)
-        self.weights = (w / w.sum()).clamp_min(1e-12)                            # (K,)
+    def train(
+        self,
+        target_trajectories,
+        conditions,
+        *,
+        n_t: int,
+        max_epochs: int,
+        batch_size: int,
+        val_period: int = 5,
+        early_stopping: bool = True,
+        stop_criteria: int = 3,
+        val_trials: int = 25,
+    ):
+        N = target_trajectories.shape[0]
+        best_avg_reward = 0.0
+        best_success_rate = 0.0
+        best_model = copy.deepcopy(self.model)
+        records = {}
+        stop_count = 0
 
-        self.reg = float(reg)
-        self.orth_sigma = float(orth_sigma)
+        env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
 
-        # Choleskies and inverses used in conditionals
-        self.Lcc   = []   # cholesky(Σ_cc)
-        self.invcc = []   # Σ_cc^{-1}
-        self.logdet_cc = []
-        self.Lzgc  = []   # cholesky(Σ_{z|c})
+        try:
+            self.model = self.model.to(self.device)
+            target_trajectories = target_trajectories.to(self.device)
+            conditions = conditions.to(self.device)
+            for epoch in tqdm(range(1, max_epochs + 1), desc=f"{self.time_sampling.title()}FM Training", unit="epoch"):
+                self.model.train()
+                perm_t = torch.randperm(N, device=self.device)
+                loss_sum = 0.0
+                for i in range(0, N, batch_size):
+                    idx = perm_t[i:min(i + batch_size, N)]
+                    x1 = target_trajectories[idx]
+                    x0 = torch.randn(len(idx), self.horizon, self.dof, device=self.device)
+                    t = self.sample_t(len(idx) * n_t)
+                    cond = conditions[idx, :]
 
-        for k in range(self.K):
-            Scc_k = self.Scc[k] + self.reg * torch.eye(self.Dc, device=device)
-            Lcc_k = torch.linalg.cholesky(Scc_k)
-            self.Lcc.append(Lcc_k)
-            invcc_k = torch.cholesky_inverse(Lcc_k)
-            self.invcc.append(invcc_k)
-            self.logdet_cc.append(2.0 * torch.log(torch.diag(Lcc_k)).sum())
+                    x1r = x1.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+                    x0r = x0.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+                    t_col = t.view(-1, 1, 1)
+                    xt = (1 - t_col) * x0r + t_col * x1r
+                    cond_r = cond.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
+                    target_v = x1r - x0r
 
-            # Σ_{z|c} = Σ_zz - Σ_zc Σ_cc^{-1} Σ_cz
-            Szgc_k = self.Szz[k] - self.Szc[k] @ invcc_k @ self.Szc[k].transpose(0,1)
-            # stabilize
-            Szgc_k = 0.5 * (Szgc_k + Szgc_k.transpose(0,1)) + self.reg * torch.eye(Szgc_k.shape[0], device=self.device)
-            Lzgc_k = torch.linalg.cholesky(Szgc_k)
-            self.Lzgc.append(Lzgc_k)
+                    pred_v = self.model(xt, t, cond_r)
+                    sq_err = (pred_v - target_v) ** 2
+                    if hasattr(self.model, "loss_mask") and self.model.loss_mask is not None:
+                        sq_err = sq_err * self.model.loss_mask
+                    loss = sq_err.mean()
 
-        # stack for vectorization convenience
-        self.Lcc      = torch.stack(self.Lcc, dim=0)         # (K, Dc, Dc)
-        self.invcc    = torch.stack(self.invcc, dim=0)       # (K, Dc, Dc)
-        self.logdet_cc = torch.stack(self.logdet_cc, dim=0)  # (K,)
-        self.Lzgc     = torch.stack(self.Lzgc, dim=0)        # (K, d, d)
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                    loss_sum += float(loss.item())
 
-    # ---- small helper: x ~ p_k(x | c) for a fixed component k ----
-    def _x_given_c_fixed_k(self, k, c, truncated=False, trunc=(-1.5, 1.5)):
-        # c: (n, Dc)
-        delta   = c - self.mu_c[k].unsqueeze(0)                      # (n, Dc)
-        # μ_{z|c} = Σ_zc Σ_cc^{-1} (c - μ_c)
-        mu_zc   = delta @ (self.invcc[k].T @ self.Szc[k].T)          # (n, d)
-        if truncated:
-            lo, hi = trunc
-            z_eps = torch.from_numpy(
-                truncnorm.rvs(lo, hi, size=(c.shape[0], self.d)).astype(np.float32)
-            ).to(self.device)
-        else:
-            z_eps = torch.randn(c.shape[0], self.d, device=self.device)
-        z = mu_zc + z_eps @ self.Lzgc[k].T                           # (n, d)
-        x = self.mu_x[k].unsqueeze(0) + z @ self.B[k].T              # (n, Dx)
-        if self.orth_sigma > 0.0:
-            x = x + torch.randn_like(x) * self.orth_sigma
-        return x
+                if self.scheduler is not None:
+                    self.scheduler.step()
 
-    @torch.no_grad()
-    def sample_cond(self, c_in, deterministic_component=False,
-                    truncated=False, trunc=(-1.5,1.5), pis=None):
-        """Sample trajectories x ~ p(x|c).
-
-        If `pis` is given (component indices), sampling is performed per fixed
-        component without computing responsibilities. Otherwise, responsibilities
-        ω_k(c) ∝ π_k N(c; μ_c^k, Σ_cc^k) are computed and components are drawn.
-
-        Args:
-            c_in: (B, Dc) environment parameters.
-            deterministic_component: If True, pick argmax component per item.
-            truncated: If True, use truncated normal for latent sampling.
-            trunc: (low, high) bounds in std units for latent truncation.
-            pis: Optional (B,) long tensor of fixed component ids.
-
-        Returns:
-            x_out: (B, Dx) flattened trajectory samples.
-            pis: (B,) component indices used.
-            w: (B, K) responsibility weights or None when `pis` is forced.
-        """
-        c = torch.as_tensor(c_in, dtype=torch.float32, device=self.device)
-        Bsz = c.shape[0]
-
-        # Fast path: fixed components -> no responsibilities
-        if pis is not None:
-            pis = torch.as_tensor(pis, device=self.device, dtype=torch.long)
-            x_out = torch.empty(Bsz, self.Dx, device=self.device)
-            # process by unique component to reduce python overhead
-            for k in pis.unique(sorted=True).tolist():
-                mask = (pis == k)
-                if mask.any():
-                    x_out[mask] = self._x_given_c_fixed_k(
-                        k, c[mask], truncated=truncated, trunc=trunc
+                if epoch % val_period == 0:
+                    success_rate, avg_reward = eval_model(
+                        self.model,
+                        VectorField,
+                        self.task_name,
+                        self.horizon,
+                        self.dof,
+                        self.condition_dim,
+                        self.gripper_idx,
+                        val_params,
+                        env_settings_all,
+                        self.device,
+                        trials=val_trials,
                     )
-            return x_out, pis, None  # no weights when forced
+                    records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
+                    if success_rate < best_success_rate:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
+                        if early_stopping:
+                            if stop_count == stop_criteria:
+                                tqdm.write("Early stopping triggered.")
+                                break
+                            stop_count += 1
+                    elif (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                        best_avg_reward = avg_reward
+                        best_success_rate = success_rate
+                        best_model = copy.deepcopy(self.model)
+                        stop_count = 0
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
+                    else:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
+        except KeyboardInterrupt:
+            tqdm.write("Training interrupted by user. Returning best model so far...")
 
-        # Otherwise compute responsibilities ω_k(c) ∝ π_k N(c; μ_c^k, Σ_cc^k)
-        logp = []
-        for k in range(self.K):
-            delta = c - self.mu_c[k].unsqueeze(0)                      # (B, Dc)
-            y     = torch.cholesky_solve(delta.T, self.Lcc[k])         # (Dc, B)
-            quad  = (delta.T * y).sum(dim=0)                           # (B,)
-            lp    = -0.5 * (quad + self.logdet_cc[k] + self.Dc * np.log(2*np.pi))
-            logp.append(lp.unsqueeze(1))
-        logp = torch.cat(logp, dim=1)                                  # (B, K)
-        logw = logp + torch.log(self.weights).unsqueeze(0)             # (B, K)
-        logw = logw - logw.logsumexp(dim=1, keepdim=True)
-        w    = torch.exp(logw)                                         # (B, K)
+        return best_model, self.model, records
 
-        if deterministic_component:
-            pis = torch.argmax(w, dim=1)
-        else:
-            pis = torch.multinomial(w, num_samples=1).squeeze(1)       # (B,)
 
-        # draw x for each fixed component
-        x_out = torch.empty(Bsz, self.Dx, device=self.device)
-        for k in pis.unique(sorted=True).tolist():
-            mask = (pis == k)
-            if mask.any():
-                x_out[mask] = self._x_given_c_fixed_k(
-                    k, c[mask], truncated=truncated, trunc=trunc
-                )
-        return x_out, pis, w
+class UniformFM(VanillaFM):
+    def __init__(self, *args, **kwargs):
+        kwargs["time_sampling"] = "uniform"
+        super().__init__(*args, **kwargs)
 
-    @torch.no_grad()
-    def sample_joint(self, M, truncated=False, trunc=(-1.5, 1.5), pis=None):
-        """Sample (x, c) pairs jointly from the mixture.
 
-        Components are drawn first (unless `pis` is provided), then `c` is sampled
-        from N(μ_c, Σ_cc) followed by x|c using the fixed-component sampler.
-
-        Args:
-            M: Number of samples to generate.
-            truncated: If True, use truncated normal for latent sampling.
-            trunc: (low, high) bounds in std units for latent truncation.
-            pis: Optional (M,) fixed component indices.
-
-        Returns:
-            x: (M, Dx) flattened trajectories.
-            c: (M, Dc) environment parameters.
-            pis: (M,) component indices used.
-        """
-        # choose components if not given
-        if pis is None:
-            pis = torch.multinomial(self.weights, M, replacement=True).to(self.device)
-        else:
-            pis = torch.as_tensor(pis, device=self.device, dtype=torch.long)
-
-        # sample c per chosen component
-        c = torch.empty(M, self.Dc, device=self.device)
-        for k in pis.unique(sorted=True).tolist():
-            mask = (pis == k)
-            if not mask.any():
-                continue
-            nk  = int(mask.sum().item())
-            eps = torch.randn(nk, self.Dc, device=self.device)
-            c_k = self.mu_c[k].unsqueeze(0) + eps @ self.Lcc[k].T
-            c[mask] = c_k
-
-        # sample x given c
-        x = torch.empty(M, self.Dx, device=self.device)
-        for k in pis.unique(sorted=True).tolist():
-            mask = (pis == k)
-            if mask.any():
-                x[mask] = self._x_given_c_fixed_k(k, c[mask], truncated=truncated, trunc=trunc)
-        return x, c, pis
-
+class ShiftedFM(VanillaFM):
+    def __init__(self, *args, **kwargs):
+        kwargs["time_sampling"] = "shifted"
+        super().__init__(*args, **kwargs)
 
 @torch.no_grad()
 def run_flow(model, x, c, device, n_steps=100):
@@ -648,6 +647,15 @@ def _to_action_from_q(q, task_name):
         arm2 = q[9:16]
         grip2 = float((q[16] + q[17]) / 2.0)
         return np.concatenate([arm1, [grip1], arm2, [grip2]])
+
+
+def _current_robot_q(env, task_name: str) -> np.ndarray:
+    full_qpos = env.sim.data.qpos.copy()
+    if task_name in ["door", "nut"]:
+        return np.concatenate([full_qpos[:7], full_qpos[7:9]])
+    if task_name == "wipe":
+        return full_qpos[:7]
+    return np.concatenate([full_qpos[0:9], full_qpos[9:18]])
 
 
 def _align_handle_to_nut(env, 
@@ -860,6 +868,96 @@ def _rollout_batch(
         env.close()
 
     return successes, reward_sum, success_info, fail_info
+
+
+def _rollout_state_policy_batch(
+    task_name: str,
+    model_state: dict,
+    model_class,
+    seq_len: int,
+    dof: int,
+    param_len: int,
+    gripper_idx,
+    static_params: np.ndarray,
+    env_settings: List[dict],
+    base_seed: int,
+    max_policy_steps: int,
+    flow_steps: int,
+) -> Tuple[int, float, list, list]:
+    """Worker rollout for state-conditioned short-horizon FM policies."""
+    successes, reward_sum = 0, 0.0
+    success_info, fail_info = [], []
+
+    device = "cpu"
+    model = model_class(seq_len, dof, param_len, gripper_idx=gripper_idx)
+    model.load_state_dict(model_state)
+    model.eval()
+
+    rng = np.random.RandomState(base_seed)
+    for i, setting in enumerate(env_settings):
+        env = make_env(
+            task_name,
+            use_joint_control=True,
+            environment_setting=setting,
+            training=True,
+        )
+        executed = []
+        static_c = static_params[i]
+        done = False
+
+        for _ in range(max_policy_steps):
+            if done:
+                break
+            q0 = _current_robot_q(env, task_name)
+            dyn = get_dynamic_state(env, task_name)
+            dyn_dim = param_len - q0.shape[0] - np.asarray(static_c).reshape(-1).shape[0]
+            if dyn_dim < 0:
+                raise ValueError(f"Model param_len {param_len} is shorter than q + static condition length")
+            if dyn_dim == 0:
+                dyn = None
+            else:
+                dyn = np.asarray(dyn, dtype=np.float32).reshape(-1)
+                if dyn.shape[0] < dyn_dim:
+                    dyn = np.pad(dyn, (0, dyn_dim - dyn.shape[0]))
+                elif dyn.shape[0] > dyn_dim:
+                    dyn = dyn[:dyn_dim]
+            cond_np = make_policy_condition(q0, dyn, static_c)
+            if cond_np.shape[0] != param_len:
+                raise ValueError(f"Condition length {cond_np.shape[0]} != model param_len {param_len}")
+
+            x0 = torch.from_numpy(rng.randn(1, seq_len, dof).astype(np.float32))
+            c = torch.from_numpy(cond_np.reshape(1, -1).astype(np.float32))
+            with torch.inference_mode():
+                q_low = run_flow(model, x0, c, device, n_steps=flow_steps).cpu().numpy()[0]
+
+            q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)
+            for q in q_high:
+                _, _, done, _ = env.step(_to_action_from_q(q, task_name))
+                executed.append(q.copy())
+                if done or env._check_success():
+                    break
+            if done or env._check_success():
+                break
+
+        if env._check_success():
+            if task_name == "two_arm":
+                z0 = env._handle0_xpos[2]
+                z1 = env._handle1_xpos[2]
+                if abs(z1 - z0) < 0.05:
+                    successes += 1
+                    success_info.append({"traj": np.asarray(executed), "setting": setting})
+                else:
+                    fail_info.append({"traj": np.asarray(executed), "setting": setting})
+            else:
+                successes += 1
+                success_info.append({"traj": np.asarray(executed), "setting": setting})
+        else:
+            fail_info.append({"traj": np.asarray(executed), "setting": setting})
+
+        reward_sum += env.reward()
+        env.close()
+
+    return successes, reward_sum, success_info, fail_info
 def eval_model(
     model,
     model_class,                 # kept for signature compatibility (not used here)
@@ -880,7 +978,9 @@ def eval_model(
     base_seed: int = 123,
     gpu_chunk_size: int | None = None,
     q_low = None,
-    base_mixture = False) -> Tuple[float, float]:
+    base_mixture = False,
+    max_policy_steps: int = 8,
+    flow_steps: int = 100) -> Tuple[float, float]:
     """ Evaluates a flow model on given environments.
 
     Multiprocessing is used by calling _rollout_batch to evaluate multiple environments in parallel.
@@ -911,6 +1011,89 @@ def eval_model(
     """
     np_rng = np.random.RandomState(base_seed)
 
+
+    state_conditioned = val_params.shape[1] != param_len
+    if state_conditioned:
+        if model is None:
+            raise ValueError("State-conditioned evaluation requires a model.")
+        model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+
+        base, rem = divmod(trials, max(1, num_workers))
+        splits: List[tuple[int, int]] = []
+        off = 0
+        for i in range(num_workers):
+            n = base + (1 if i < rem else 0)
+            if n > 0:
+                splits.append((off, off + n))
+                off += n
+
+        total_success = 0
+        total_reward = 0.0
+        success_info: List[dict] = []
+        failure_info: List[dict] = []
+        s_count = 0
+        f_count = 0
+
+        ctx = get_context("spawn")
+        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as ex:
+            futs = []
+            for worker_i, (s, e) in enumerate(splits):
+                futs.append(ex.submit(
+                    _rollout_state_policy_batch,
+                    task_name,
+                    model_state,
+                    model_class,
+                    seq_len,
+                    dof,
+                    param_len,
+                    gripper_idx,
+                    val_params[s:e],
+                    env_settings_all[s:e],
+                    base_seed + worker_i * 1009,
+                    max_policy_steps,
+                    flow_steps,
+                ))
+            for fut in futs:
+                succ, rew, info_s, info_f = fut.result()
+                total_success += succ
+                total_reward += rew
+                if s_count < render_num:
+                    take = min(render_num - s_count, len(info_s))
+                    success_info += info_s[:take]; s_count += take
+                if f_count < (render_width * render_width - render_num):
+                    take = min(render_width * render_width - render_num - f_count, len(info_f))
+                    failure_info += info_f[:take]; f_count += take
+
+        success_rate = total_success / trials
+        mean_reward = total_reward / trials
+
+        episode_frames = []
+        s_left = min(s_count, render_num)
+        f_left = min(f_count, render_width * render_width - render_num)
+        while s_left > 0:
+            env_r = make_env(task_name, has_offscreen_renderer=True, use_camera_obs=False,
+                             use_joint_control=True, environment_setting=success_info[s_left - 1]["setting"],
+                             training=True)
+            frames = render_trajectory(env_r, task_name, success_info[s_left - 1]["traj"],
+                                       success_info[s_left - 1]["traj"][0, :],
+                                       camera_name="frontview", hold_init=True, set_init=False)
+            episode_frames.append(frames)
+            env_r.close()
+            s_left -= 1
+        while f_left > 0:
+            env_r = make_env(task_name, has_offscreen_renderer=True, use_camera_obs=False,
+                             use_joint_control=True, environment_setting=failure_info[f_left - 1]["setting"],
+                             training=True)
+            frames = render_trajectory(env_r, task_name, failure_info[f_left - 1]["traj"],
+                                       failure_info[f_left - 1]["traj"][0, :],
+                                       camera_name="frontview", hold_init=True, set_init=False)
+            episode_frames.append(frames)
+            env_r.close()
+            f_left -= 1
+        if render_num and episode_frames:
+            grid_path = os.path.join(render_dir, f"{task_name}_grid_{video_name}.mp4")
+            write_grid_video(episode_frames, grid_path, grid_shape=(render_width, render_width))
+        return success_rate, mean_reward
 
     # ---- (1) One GPU forward (optionally chunked) to produce all q_low ----
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
@@ -1728,6 +1911,8 @@ def train_DGFM(
         last_model: Final model (or at interruption).
         success_rate_recs: Dict of validation metrics per epoch.
     """
+    from Robot_simulation.DGFM_util import MixtureSampler
+
     # -------- 0) Build mixture on (x, c) --------
     print("Clustering dataset . . .")
     X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
@@ -1883,6 +2068,8 @@ def train_GFM(
 
     Logic is same as DGFM
     """
+    from Robot_simulation.DGFM_util import MixtureSampler
+
     # -------- 0) Build mixture on (x, c) --------
     print("Clustering dataset . . .")
     X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
@@ -2030,6 +2217,8 @@ def train_LFM(
 
     Logic is same as DGFM
     """
+    from Robot_simulation.DGFM_util import MixtureSampler
+
 
     # -------- 0) Build mixture on (x, c) --------
     print("Clustering dataset . . .")
@@ -2179,6 +2368,8 @@ def train_GMM(
 
     Logic is same as DGFM
     """
+    from Robot_simulation.DGFM_util import MixtureSampler
+
     # -------- 0) Build mixture on (x, c) --------
     print("Clustering dataset . . .")
     X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)

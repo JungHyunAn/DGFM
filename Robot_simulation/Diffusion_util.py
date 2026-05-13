@@ -7,7 +7,8 @@ from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 import copy
 from tqdm import tqdm
-from Robot_simulation.heuristics_util import make_env, render_trajectory, write_grid_video
+from Robot_simulation.env_util import make_env
+from Robot_simulation.heuristics_util import render_trajectory, write_grid_video
 from Robot_simulation.FM_util import _rollout_batch, _generate_val_env
 
 

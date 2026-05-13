@@ -7,7 +7,7 @@ from robosuite.controllers.composite.composite_controller_factory import load_co
 from robosuite.utils.transform_utils import mat2quat, quat_multiply
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
-from Robot_simulation.heuristics_util import step_towards
+from Robot_simulation.heuristics_util import get_dynamic_state, step_towards
 
 
 def generate_door_trajectory(
@@ -62,6 +62,7 @@ def generate_door_trajectory(
 
     # ---------- storage ----------
     q_traj = []
+    dynamic_traj = []
     frontview_frames = []
 
     # ---------- reset & indices ----------
@@ -100,6 +101,7 @@ def generate_door_trajectory(
     def record_q():
         full = env.sim.data.qpos.copy()
         q_traj.append(full[joint_idx].copy())
+        dynamic_traj.append(get_dynamic_state(env, "door"))
 
     # ---------- begin recording ----------
     record_q()
@@ -197,7 +199,15 @@ def generate_door_trajectory(
         if verbose:
             print(f"Saved frontview video to {out}")
 
-    return np.stack(q_traj, axis=0), success, frontview_frames, init_qpos, environment_setting, environment_parameters
+    return (
+        np.stack(q_traj, axis=0),
+        success,
+        frontview_frames,
+        init_qpos,
+        environment_setting,
+        environment_parameters,
+        np.stack(dynamic_traj, axis=0),
+    )
 
 
 if __name__ == "__main__":
@@ -234,7 +244,7 @@ if __name__ == "__main__":
         control_freq=20,
     )
 
-    traj, success, _, init_qpos, env_state, env_param = generate_door_trajectory(
+    traj, success, _, init_qpos, env_state, env_param, dynamic_states = generate_door_trajectory(
         env,
         open_steps=50,
         render=True,
@@ -247,6 +257,7 @@ if __name__ == "__main__":
     print("Trajectory length:", len(traj))
     print("Initial joint angles:", init_qpos)
     print("Environment parameters:", env_param)
+    print("Dynamic state shape:", dynamic_states.shape)
     print("Env snapshot keys & shapes:")
     for k, v in env_state.items():
         print(f"  {k}: {v.shape}  dtype={v.dtype}")
