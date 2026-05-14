@@ -3,8 +3,8 @@
 from pathlib import Path
 
 
-_PREFERRED_DATASET_DIR = Path("/PublicHDD/ajh916/DGFM/Synthetic_data/heuristic_dataset")
-_PREFERRED_RECORDS_DIR = Path("/PublicHDD/ajh916/DGFM/Synthetic_data/eval_results")
+_PREFERRED_DATASET_DIR = Path("/PublicHDD/ajh916/DGFM/Robot_simulation/heuristic_dataset")
+_PREFERRED_RECORDS_DIR = Path("/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results")
 
 _LOCAL_ROOT = Path(__file__).resolve().parent
 _LOCAL_DATASET_DIR = _LOCAL_ROOT / "heuristic_dataset"
