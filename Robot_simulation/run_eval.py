@@ -67,8 +67,8 @@ FM-specific:
 Task conventions
 ----------------
 - Gripper indices are auto-set:
-  - door / nut: [7, 8]
-  - two_arm   : [7, 8, 16, 17]
+  - door / nut: [7]
+  - two_arm   : [7, 15]
   - wipe      : no gripper
 - Shapes:
   - Trajectories tensor: (B, T, dof)
@@ -250,6 +250,7 @@ def train_and_eval_FM(
     seed: int = 2002,
     horizon: int = 32,
     window_stride: int = 1,
+    max_policy_steps: int = 20,
 ):
     flow_class_map = {
         "UniformFM": UniformFM,
@@ -327,12 +328,21 @@ def train_and_eval_FM(
     # obtain gripper indexes
     gripper_idx = None
     if task_name in ["door", "nut"]:
-        gripper_idx = [7, 8]
+        gripper_idx = [7]
     elif task_name == "two_arm":
-        gripper_idx = [7, 8, 16, 17]      
+        gripper_idx = [7, 15]
 
     # define models
-    print("parameter length: ", param_len)
+    print(
+        "[config] "
+        f"FM_type={FM_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
+        f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
+        f"horizon_arg={horizon} | window_stride={window_stride} | "
+        f"max_policy_steps={max_policy_steps} | "
+        f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
+        f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
+        f"n_t={n_t} | n_t_global={n_t_global} | n_t_local={n_t_local} | seed={seed} | device={device}"
+    )
     model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-6)
     scheduler = get_cosine_schedule_with_warmup(
@@ -458,7 +468,8 @@ def train_and_eval_FM(
                                                 render_num=8,
                                                 base_seed=seed+1,
                                                 q_low=None,
-                                                base_mixture=False)
+                                                base_mixture=False,
+                                                max_policy_steps=max_policy_steps)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
 
@@ -474,6 +485,7 @@ def train_and_eval_FM(
             "num_windows":     num_windows,
             "horizon":         seq_len,
             "window_stride":   window_stride,
+            "max_policy_steps": max_policy_steps,
             "task_name":       task_name,
             "n_t":             n_t if FM_type != "DGFM" else None,
             "mf":              mf if FM_type == "DGFM" else None,
@@ -581,6 +593,7 @@ if __name__ == "__main__":
     parser.add_argument("--evaluation_samples", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--window_stride", type=int, default=1)
+    parser.add_argument("--max_policy_steps", type=int, default=20)
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
 
@@ -628,4 +641,5 @@ if __name__ == "__main__":
         seed               = args.seed,
         horizon            = args.horizon,
         window_stride      = args.window_stride,
+        max_policy_steps   = args.max_policy_steps,
     )

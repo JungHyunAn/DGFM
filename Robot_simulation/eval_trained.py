@@ -1,7 +1,7 @@
 import os
 import torch
 import numpy as np
-from Robot_simulation.FM_util import VectorField, run_flow, compute_smooth_trajectory, _get_environment_params
+from Robot_simulation.FM_util import VectorField
 from Robot_simulation.heuristics_util import make_env, write_grid_video, render_trajectory
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
@@ -66,9 +66,9 @@ def run_trained(
     # obtain gripper indexes
     gripper_idx = None
     if task_name in ["door", "nut"]:
-        gripper_idx = [7, 8]
+        gripper_idx = [7]
     elif task_name == "two_arm":
-        gripper_idx = [7, 8, 16, 17]      
+        gripper_idx = [7, 15]
 
     env_params_list: list[np.ndarray] = [None] * evaluation_samples
     env_settings_all: list[dict]      = [None] * evaluation_samples

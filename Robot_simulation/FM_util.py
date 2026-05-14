@@ -21,7 +21,8 @@ Key design choices & assumptions
    - Trajectories are '(B, T, D)' = (batch, seq_len, dof).
    - Environment parameters are '(B, P)'.
    - Times 't ∈ [0, 1]'.
-   - For gripper DoF, models can ignore (mask) those joints during training.
+   - Gripper pose channels are learned like arm channels. For gripper tasks,
+     datasets use compact normalized gripper poses: 0 closed, 1 open.
 
 2) **Trainers**
    - **UniformFM**: sample t ~ Uniform[0,1], regress v_t (standard FM).
@@ -67,7 +68,7 @@ for h in list(robosuite_logger.handlers):
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
 
 from Robot_simulation.env_util import make_env
-from Robot_simulation.heuristics_util import compute_smooth_trajectory_with_q0, get_dynamic_state, render_trajectory, write_grid_video, step_towards
+from Robot_simulation.heuristics_util import get_dynamic_state, render_trajectory, write_grid_video, step_towards
 
 
 class FiLM(nn.Module):
@@ -196,24 +197,36 @@ class UNet1D(nn.Module):
         return self.final_conv(x)
 
 
+PANDA_GRIPPER_OPEN_QPOS = 0.04
+
+
+def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
+    gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
+    return np.clip(np.mean(gripper_qpos, axis=-1) / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
+
+
+def _normalized_gripper_to_action(value) -> float:
+    value = float(np.clip(value, 0.0, 1.0))
+    return 1.0 - 2.0 * value
+
+
 class VectorField(nn.Module):
     """Conditional vector field v(x, t, c) over joint trajectories.
 
-    The model isolates arm DoF from gripper DoF and predicts a velocity field
-    only for arm joints using a 1D U-Net; gripper channels are held at zero
-    by a built-in mask. Time is encoded via a small MLP and concatenated with
-    (optionally scaled) environment parameters for FiLM conditioning.
+    The model predicts a velocity field for every policy channel, including
+    normalized gripper pose channels. Time is encoded via a small MLP and
+    concatenated with (optionally scaled) environment parameters for FiLM
+    conditioning.
 
     Args:
         seq_len: Number of time steps (T) per trajectory.
         dof: Total joint DoF per time step (includes grippers if present).
         param_len: Dimensionality of environment parameter vector `c`.
-        gripper_idx: Indices of gripper joints within the DoF. If provided,
-            these channels are excluded from the U-Net and zeroed in the output.
+        gripper_idx: Optional gripper channel indices, kept for compatibility.
+            These channels are still modeled and included in the loss.
 
     Attributes:
-        arm_idx (Tensor): Indices of arm joints modeled by the U-Net.
-        loss_mask (Tensor): (1, 1, dof) mask that zeros gripper dims in loss.
+        loss_mask (Tensor): (1, 1, dof) all-ones mask kept for compatibility.
 
     Forward Args:
         x: (B, T, dof) current state on the straight path between x0 and x1.
@@ -221,7 +234,7 @@ class VectorField(nn.Module):
         env_params: (B, param_len) environment parameters (scaled by 100 internally).
 
     Returns:
-        (B, T, dof) velocity field with zeros on gripper dims.
+        (B, T, dof) velocity field for all policy channels.
     """
 
     def __init__(self, seq_len, dof, param_len, gripper_idx=None):
@@ -234,14 +247,9 @@ class VectorField(nn.Module):
             gripper_idx = []
         if isinstance(gripper_idx, list):
             gripper_idx = torch.tensor(gripper_idx, dtype=torch.long)
-        arm_idx = torch.tensor([i for i in range(dof) if i not in set(gripper_idx.tolist())], dtype=torch.long)
-
         self.register_buffer("gripper_idx", gripper_idx, persistent=False)
-        self.register_buffer("arm_idx", arm_idx, persistent=False)
 
         loss_mask = torch.ones(dof, dtype=torch.float32)
-        if gripper_idx.numel() > 0:
-            loss_mask[gripper_idx] = 0.0
         self.register_buffer("loss_mask", loss_mask.view(1, 1, dof), persistent=False)
 
         # Time embedding for FiLM conditioning
@@ -262,7 +270,7 @@ class VectorField(nn.Module):
         condition_dim = 32 + param_len
 
         # 1D U-Net for sequence modeling
-        self.unet = UNet1D(dof=len(arm_idx), condition_dim=condition_dim)
+        self.unet = UNet1D(dof=dof, condition_dim=condition_dim)
 
     def forward(self, x, t, env_params):
         # x: (B, seq_len, dof), t: (B, 1), env_params: (B, param_len)
@@ -295,20 +303,8 @@ class VectorField(nn.Module):
         # Create conditioning vector
         condition = torch.cat([p_embed, t_embed], dim=-1)  # (B, cond_dim)
 
-        # ------ select arm channels only ------
-        # (B, seq_len, n_arm) -> (B, n_arm, seq_len) for Conv1d
-        x_arm = x[:, :, self.arm_idx].permute(0, 2, 1).contiguous()
-
-        # ------ run the U-Net on arm channels ------
-        v_arm = self.unet(x_arm, condition)        # (B, n_arm, seq_len)
-        v_arm = v_arm.permute(0, 2, 1).contiguous() # -> (B, seq_len, n_arm)
-
-        # ------ stitch back to full DOF with zeros in grippers ------
-        v_full = x.new_zeros(B, seq_len, dof)
-        v_full[:, :, self.arm_idx] = v_arm.to(v_full.dtype)
-        # gripper dims remain zero -> "no flow" for grippers
-
-        return v_full
+        v = self.unet(x.permute(0, 2, 1).contiguous(), condition)
+        return v.permute(0, 2, 1).contiguous()
 
 
 def build_state_conditioned_windows(
@@ -520,33 +516,25 @@ class ShiftedFM(VanillaFM):
 def run_flow(model, x, c, device, n_steps=100):
     """Generates samples by transporting noisy samples through the given vector field
 
-    Uses RK2 method to integrate the neural vector field v(x, c).
+    Uses Euler integration for the neural vector field v(x, c).
 
     Args:
         model: Neural vector field model.
         x: Samples from the base distribution.
         c: Environment parameters.
-        n_steps: number of steps for RK2.
+        n_steps: number of Euler steps.
 
     Returns:
         output x with same size as input x
     """
     dt = 1.0 / n_steps
 
-    # reusable buffers
     t = torch.empty((x.shape[0], 1), device=device, dtype=x.dtype)
-    x_mid = torch.empty_like(x)
 
     for i in range(n_steps):
         t.fill_(i * dt)
-
         v = model(x, t, c)
-        torch.add(x, v, alpha=dt, out=x_mid)
-        x.add_(v, alpha=0.5 * dt)
-        
-        t.add_(dt)
-        v = model(x_mid, t, c)
-        x.add_(v, alpha=0.5 * dt)
+        x.add_(v, alpha=dt)
 
     return x
 
@@ -609,7 +597,8 @@ def _to_action_from_q(q, task_name):
     """Pack a joint vector into the action format expected by the controller.
 
     The packing mirrors existing controller wrappers for each task. In particular,
-    gripper pairs are averaged into a single scalar control per gripper.
+    compact policy gripper channels are normalized poses where 0 is closed and
+    1 is open; these are mapped to the controller's close/open command.
 
     Args:
         q: (D,) joint configuration for the whole system.
@@ -618,27 +607,43 @@ def _to_action_from_q(q, task_name):
     Returns:
         np.ndarray: Action vector compatible with `env.step(action)` for the task.
     """
+    q = np.asarray(q, dtype=np.float32)
     if task_name in ["door", "nut"]:
-        arm_q   = q[:7]
-        grip_sc = float((q[7] + q[8]) / 2.0)   # your current compression
+        arm_q = q[:7]
+        if q.shape[0] == 8:
+            grip_sc = _normalized_gripper_to_action(q[7])
+        else:
+            grip_sc = float((q[7] + q[8]) / 2.0)
         return np.concatenate([arm_q, [grip_sc]])
     elif task_name == "wipe":
         return q[:7]
     else:  # two_arm
         arm1 = q[0:7]
-        grip1 = float((q[7] + q[8]) / 2.0)
-        arm2 = q[9:16]
-        grip2 = float((q[16] + q[17]) / 2.0)
+        if q.shape[0] == 16:
+            grip1 = _normalized_gripper_to_action(q[7])
+            arm2 = q[8:15]
+            grip2 = _normalized_gripper_to_action(q[15])
+        else:
+            grip1 = float((q[7] + q[8]) / 2.0)
+            arm2 = q[9:16]
+            grip2 = float((q[16] + q[17]) / 2.0)
         return np.concatenate([arm1, [grip1], arm2, [grip2]])
 
 
 def _current_robot_q(env, task_name: str) -> np.ndarray:
     full_qpos = env.sim.data.qpos.copy()
     if task_name in ["door", "nut"]:
-        return np.concatenate([full_qpos[:7], full_qpos[7:9]])
+        return np.concatenate([full_qpos[:7], [float(_gripper_qpos_to_normalized(full_qpos[7:9]))]])
     if task_name == "wipe":
         return full_qpos[:7]
-    return np.concatenate([full_qpos[0:9], full_qpos[9:18]])
+    return np.concatenate(
+        [
+            full_qpos[0:7],
+            [float(_gripper_qpos_to_normalized(full_qpos[7:9]))],
+            full_qpos[9:16],
+            [float(_gripper_qpos_to_normalized(full_qpos[16:18]))],
+        ]
+    )
 
 
 def _condition_from_env(env, task_name: str, static_c: np.ndarray, param_len: int) -> tuple[np.ndarray, np.ndarray]:
@@ -702,12 +707,10 @@ def _state_policy_env_worker(
             if msg.get("type") != "act":
                 raise ValueError(f"Unknown worker message: {msg}")
 
-            q0 = _current_robot_q(env, task_name)
             q_low = np.asarray(msg["q_low"], dtype=np.float32)
-            q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)
 
             done = False
-            for q in q_high:
+            for q in q_low:
                 _, _, done, _ = env.step(_to_action_from_q(q, task_name))
                 executed.append(q.copy())
                 if done or env._check_success():
@@ -906,24 +909,10 @@ def _rollout_batch(
                        environment_setting=setting,
                        training=True)
 
-        # plan at low rate -> smooth to control rate
+        # Policy windows are already sampled at the environment control rate.
         q_low  = q_low_batch[i]
         
-        full_qpos = env.sim.data.qpos.copy()
-
-        if task_name in ["door", "nut"]:
-            # 7 arm + 2 gripper finger joints
-            q0 = np.concatenate([full_qpos[:7], full_qpos[7:9]])
-        elif task_name == "wipe":
-            # only arm joints
-            q0 = full_qpos[:7]
-        else:  # two_arm
-            # 2 x (7 arm + 2 gripper) = 18
-            q0 = np.concatenate([full_qpos[0:9], full_qpos[9:18]])
-
-        q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)        
-
-        for q in q_high:            
+        for q in q_low:
             env.step(_to_action_from_q(q, task_name))
 
         if env._check_success():
@@ -933,14 +922,14 @@ def _rollout_batch(
 
                 if abs(z1 - z0) < 0.05:
                     successes += 1
-                    success_info.append({"traj": q_high, "setting": setting})
+                    success_info.append({"traj": q_low, "setting": setting})
                 else:
-                    fail_info.append({"traj": q_high, "setting": setting})
+                    fail_info.append({"traj": q_low, "setting": setting})
             else:
                 successes += 1
-                success_info.append({"traj": q_high, "setting": setting})
+                success_info.append({"traj": q_low, "setting": setting})
         else:
-            fail_info.append({"traj": q_high, "setting": setting})
+            fail_info.append({"traj": q_low, "setting": setting})
 
         reward_sum += env.reward()
         env.close()
@@ -1106,7 +1095,7 @@ def eval_model(
     gpu_chunk_size: int | None = None,
     q_low = None,
     base_mixture = False,
-    max_policy_steps: int = 8,
+    max_policy_steps: int = 20,
     flow_steps: int = 100) -> Tuple[float, float]:
     """ Evaluates a flow model on given environments.
 
@@ -1175,7 +1164,7 @@ def eval_model(
                              training=True)
             frames = render_trajectory(env_r, task_name, success_info[s_left - 1]["traj"],
                                        success_info[s_left - 1]["traj"][0, :],
-                                       camera_name="frontview", hold_init=True, set_init=False)
+                                       camera_name="frontview", hold_init=False, set_init=False)
             episode_frames.append(frames)
             env_r.close()
             s_left -= 1
@@ -1185,7 +1174,7 @@ def eval_model(
                              training=True)
             frames = render_trajectory(env_r, task_name, failure_info[f_left - 1]["traj"],
                                        failure_info[f_left - 1]["traj"][0, :],
-                                       camera_name="frontview", hold_init=True, set_init=False)
+                                       camera_name="frontview", hold_init=False, set_init=False)
             episode_frames.append(frames)
             env_r.close()
             f_left -= 1
@@ -1314,7 +1303,7 @@ def eval_model(
                                    success_info[s_left - 1]["traj"],
                                    success_info[s_left - 1]["traj"][0, :],
                                    camera_name="frontview",
-                                   hold_init=True,
+                                   hold_init=False,
                                    set_init=False)
         episode_frames.append(frames)
         env_r.close()
@@ -1332,7 +1321,7 @@ def eval_model(
                                    failure_info[f_left - 1]["traj"],
                                    failure_info[f_left - 1]["traj"][0, :],
                                    camera_name="frontview",
-                                   hold_init=True,
+                                   hold_init=False,
                                    set_init=False)
         episode_frames.append(frames)
         env_r.close()

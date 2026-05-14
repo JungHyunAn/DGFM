@@ -258,7 +258,7 @@ def eval_model_DP(
                                    success_info[s_left - 1]["traj"],
                                    success_info[s_left - 1]["traj"][0, :],
                                    camera_name="frontview",
-                                   hold_init=True,
+                                   hold_init=False,
                                    set_init=False)
         episode_frames.append(frames)
         env_r.close()
@@ -276,7 +276,7 @@ def eval_model_DP(
                                    failure_info[f_left - 1]["traj"],
                                    failure_info[f_left - 1]["traj"][0, :],
                                    camera_name="frontview",
-                                   hold_init=True,
+                                   hold_init=False,
                                    set_init=False)
         episode_frames.append(frames)
         env_r.close()

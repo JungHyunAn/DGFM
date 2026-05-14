@@ -124,7 +124,7 @@ from Robot_simulation.heuristics_wipe import generate_wipe_trajectory
 from Robot_simulation.heuristics_two_arm import generate_two_arm_trajectory
 from Robot_simulation.heuristics_nut import generate_nut_trajectory
 from Robot_simulation.env_util import make_env
-from Robot_simulation.heuristics_util import write_grid_video, render_trajectory
+from Robot_simulation.heuristics_util import normalize_policy_trajectory, write_grid_video, render_trajectory
 from Robot_simulation import DEFAULT_DATASET_DIR
 
 DOWNSAMPLE_RATIOS  = {"door"    : 2,
@@ -183,7 +183,7 @@ def init_hdf5(path: str, task_name: str, env):
     meta.attrs["task"] = task_name
     meta.attrs["timestamp"] = time.time()
     meta.attrs["robot"] = env.robots[0].robot_model.naming_prefix
-    meta.attrs["dof"] = env.robots[0].dof
+    meta.attrs["robot_dof"] = env.robots[0].dof
     return f
 
 
@@ -296,7 +296,9 @@ def save_episode(
     grp.create_dataset("key_inds",      data=key_inds,      compression="gzip")
     grp.attrs["success"]       = int(success)
     grp.attrs["num_keyframes"] = joint_angles.shape[0]
-    grp.attrs["trajectory_format"] = "full"
+    grp.attrs["trajectory_format"] = "policy"
+    grp.attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
+    grp.attrs["dof"] = joint_angles.shape[1]
     grp.create_dataset("initial_pose", data=initial_pose, compression="gzip")
     if dynamic_states is None:
         dynamic_states = np.zeros((joint_angles.shape[0], 0), dtype=np.float32)
@@ -369,12 +371,13 @@ def worker_generate(
         # generator now returns (actions, success, frames, initial_qpos)
         result = generator(env, render=save_rendered_images)
         q_traj, success, frames, init_qpos, environment_setting, env_param, dynamic_states = result
+        q_policy = normalize_policy_trajectory(task_name, q_traj)
         # print(trials, success)
         if success:
             successes.append({
-                "joint_angles": q_traj,
-                "key_inds":      np.arange(len(q_traj), dtype=np.int64),
-                "initial_pose":  init_qpos,
+                "joint_angles": q_policy,
+                "key_inds":      np.arange(len(q_policy), dtype=np.int64),
+                "initial_pose":  q_policy[0],
                 "environment_setting":  environment_setting,
                 "environment_parameters": env_param,
                 "dynamic_states": dynamic_states,
@@ -511,6 +514,9 @@ def generate_data_parallel(
                 for entry in batch:
                     if success_count >= n:
                         break
+                    if success_count == 0:
+                        hf["meta"].attrs["policy_dof"] = entry["joint_angles"].shape[1]
+                        hf["meta"].attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
                     # Save actions + initial_pose
                     save_episode(
                         hf,

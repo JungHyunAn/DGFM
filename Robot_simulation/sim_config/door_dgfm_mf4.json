@@ -15,6 +15,7 @@
   "evaluation_samples": 100,
   "horizon": 32,
   "window_stride": 1,
+  "max_policy_steps": 20,
   "early_stopping": false,
   "seed": 1000
 }

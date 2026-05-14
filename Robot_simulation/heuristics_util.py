@@ -12,8 +12,6 @@ What this module provides
   ('qpos', 'qvel', 'body_pos', 'body_quat', ...).
 - **compute_smooth_trajectory**: Convert sparse keyframes to high-rate trajectories 
   via cubic splines; may include grasp motion insertion.
-- **compute_smooth_trajectory_with_q0**: Before upsampling, inserts a prefix sequence
-  to smoothly move to the first action.
 - **render_trajectory**: Renders the trajectory.
 
 Key design choices & assumptions
@@ -27,9 +25,9 @@ Key design choices & assumptions
    With `use_joint_control=True`, Panda arms run an absolute 7-DoF
    JOINT_POSITION controller (linear interpolation). Action packing used by
    '_to_action_from_q' mirrors task interfaces:
-     • door / nut:  7 arm joints + 1 gripper scalar (avg of the two fingers)
+     • door / nut:  7 arm joints + 1 normalized gripper pose
      • wipe:        7 arm joints
-     • two_arm:     ([7 arm] + [1 grip]) x 2
+     • two_arm:     ([7 arm] + [1 normalized gripper pose]) x 2
    If you change controllers or action conventions, update `_to_action_from_q`.
 
 3) **Spline upsampling**
@@ -70,6 +68,56 @@ from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
+
+PANDA_GRIPPER_OPEN_QPOS = 0.04
+
+
+def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
+    """Map Panda finger qpos to normalized gripper pose: 0 closed, 1 open."""
+    gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
+    grip = np.mean(gripper_qpos, axis=-1, keepdims=True)
+    return np.clip(grip / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
+
+
+def _normalized_gripper_to_action(value) -> float:
+    """Map normalized gripper pose to controller command: 0 closed, 1 open."""
+    value = float(np.clip(value, 0.0, 1.0))
+    return 1.0 - 2.0 * value
+
+
+def _normalized_gripper_to_qpos(value) -> np.ndarray:
+    value = float(np.clip(value, 0.0, 1.0))
+    return np.full((2,), value * PANDA_GRIPPER_OPEN_QPOS, dtype=np.float32)
+
+
+def normalize_policy_trajectory(task_name: str, q_trace: np.ndarray) -> np.ndarray:
+    """Convert raw robot qpos traces to compact policy poses with normalized grippers.
+
+    Shapes:
+      door/nut:  raw 9  -> policy 8  = 7 arm + 1 normalized gripper
+      two_arm:   raw 18 -> policy 16 = (7 arm + 1 normalized gripper) x 2
+      wipe:      raw >=7 -> policy 7 = arm only
+    """
+    q_trace = np.asarray(q_trace, dtype=np.float32)
+    if task_name in ["door", "nut"]:
+        if q_trace.shape[-1] < 9:
+            raise ValueError(f"{task_name} trajectory must have at least 9 raw qpos dims")
+        return np.concatenate(
+            [q_trace[:, :7], _gripper_qpos_to_normalized(q_trace[:, 7:9])],
+            axis=-1,
+        ).astype(np.float32)
+    if task_name == "two_arm":
+        if q_trace.shape[-1] < 18:
+            raise ValueError("two_arm trajectory must have at least 18 raw qpos dims")
+        left_grip = _gripper_qpos_to_normalized(q_trace[:, 7:9])
+        right_grip = _gripper_qpos_to_normalized(q_trace[:, 16:18])
+        return np.concatenate(
+            [q_trace[:, 0:7], left_grip, q_trace[:, 9:16], right_grip],
+            axis=-1,
+        ).astype(np.float32)
+    if task_name == "wipe":
+        return q_trace[:, :7].astype(np.float32)
+    raise ValueError(f"Unsupported task for policy trajectory normalization: {task_name}")
 
 
 def _safe_qpos_by_joint_substring(env, substrings):
@@ -685,130 +733,63 @@ def compute_smooth_trajectory_wipper(
     return q_high
 
 
-def _plan_linear(q0, q1, duration, hz):
-    """
-    Linear interpolation in joint space.
-    Returns:
-      t: (T,) timestamps in [0, duration]
-      q: (T, D) waypoints with q[0]=q0, q[-1]=q1
-    """
-    q0 = np.asarray(q0, dtype=float)
-    q1 = np.asarray(q1, dtype=float)
-    assert q0.shape == q1.shape, "q0 and q1 must have same shape"
-    D = q0.shape[0]
-
-    if duration <= 0 or hz <= 0:
-        # Degenerate: just return the target
-        return np.array([0.0]), np.asarray(q1, dtype=float).reshape(1, D)
-
-    # +1 to include both endpoints; ~1/hz spacing
-    T = max(int(np.round(duration * hz)) + 1, 2)
-    t = np.linspace(0.0, duration, T, endpoint=True)
-
-    alpha = (t / duration)[:, None]  # (T, 1)
-    q = (1.0 - alpha) * q0 + alpha * q1
-
-    # Numerical safety
-    q[0]  = q0
-    q[-1] = q1
-    return t, q
-def compute_smooth_trajectory_with_q0(
-    env_r,
-    task_name,
-    q_keys: np.ndarray,
-    control_freq: int,
-    q0: np.ndarray,
-    approach_duration: float = 20.0,   # seconds; tweak as you like
-    pause_steps: int = 50,            # number of frames to pause at first key
-):
-    """
-    Prepend a linear interpolation from q0 -> q_keys[0] to the trajectory produced by
-    compute_smooth_trajectory(...). Uses joint-position lerp only.
-
-    Args:
-        env_r: robosuite env (passed through to compute_smooth_trajectory)
-        task_name: task selector for your internal logic
-        q_keys: (T_low, D) or (D,) key poses
-        control_freq: controller/sim stepping frequency (Hz)
-        q0: (D,) starting joint configuration
-        approach_duration: duration (s) for the initial linear segment
-
-    Returns:
-        q_high: (T_high, D) full trajectory starting from q0 and moving smoothly
-                into the first keyframe, then following the smoothed plan.
-    """
-    q_keys = np.asarray(q_keys, dtype=float)
-    q0     = np.asarray(q0,     dtype=float)
-
-    # Normalize shapes
-    if q_keys.ndim == 1:
-        q_keys = q_keys[None, :]  # (1, D)
-
-    # Basic shape checks
-    assert q0.ndim == 1, "q0 must be shape (D,)"
-    assert q_keys.ndim == 2, "q_keys must be shape (T, D) or (D,)"
-    D = q_keys.shape[1]
-    assert q0.shape[0] == D, f"Dim mismatch: q0 has {q0.shape[0]} dims, q_keys has {D}"
-
-    # If already at the first key pose, skip the approach
-    first_key = q_keys[0]
-    if np.allclose(q0, first_key, atol=1e-9, rtol=0.0) or (approach_duration <= 0):
-        return compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
-
-    # 1) Linear prefix from q0 -> q_keys[0]
-    #    We drop the last sample to avoid duplicating the first frame of the main segment.
-    t_app, Q_app = _plan_linear(q0, first_key, duration=float(approach_duration), hz=int(control_freq))
-    if Q_app.shape[0] > 1:
-        Q_prefix = Q_app[:-1]
-    else:
-        Q_prefix = Q_app  # degenerate (very short) case
-
-    # 2) Main segment (your existing builder)
-    Q_main = compute_smooth_trajectory(env_r, task_name, q_keys, control_freq)
-
-    if pause_steps > 0:
-        pause_block = np.repeat(first_key[None, :], pause_steps, axis=0)
-    else:
-        pause_block = np.empty((0, D), dtype=float)
-
-    if task_name in ["door", "two_arm"]:
-        gripper_ids = [
-            env_r.sim.model.get_joint_qpos_addr(joint_name)
-            for robot in env_r.robots
-            for gripper in robot.gripper.values()
-            for joint_name in gripper.joints
-        ]
-        Q_prefix[:, gripper_ids] = -1.0
-        pause_block[:, gripper_ids] = -1.0
-    elif task_name == "nut":
-        gripper_ids = [
-            env_r.sim.model.get_joint_qpos_addr(joint_name)
-            for robot in env_r.robots
-            for gripper in robot.gripper.values()
-            for joint_name in gripper.joints
-        ]
-        Q_prefix[:, gripper_ids] = 1.0
-        pause_block[:, gripper_ids] = 1.0
-
-    # Concatenate
-    q_high = np.vstack([Q_prefix, pause_block, Q_main])
-    return q_high
-
-
 def _to_action_from_q(q, task_name):
     """Match exactly the action packing in env.step(...)."""
+    q = np.asarray(q, dtype=np.float32)
     if task_name in ["door", "nut"]:
-        arm_q   = q[:7]
-        grip_sc = float((q[7] + q[8]) / 2.0)   # your current compression
+        arm_q = q[:7]
+        if q.shape[0] == 8:
+            grip_sc = _normalized_gripper_to_action(q[7])
+        else:
+            grip_sc = float((q[7] + q[8]) / 2.0)
         return np.concatenate([arm_q, [grip_sc]])
     elif task_name == "wipe":
         return q[:7]
     else:  # two_arm
         arm1 = q[0:7]
-        grip1 = float((q[7] + q[8]) / 2.0)
-        arm2 = q[9:16]
-        grip2 = float((q[16] + q[17]) / 2.0)
+        if q.shape[0] == 16:
+            grip1 = _normalized_gripper_to_action(q[7])
+            arm2 = q[8:15]
+            grip2 = _normalized_gripper_to_action(q[15])
+        else:
+            grip1 = float((q[7] + q[8]) / 2.0)
+            arm2 = q[9:16]
+            grip2 = float((q[16] + q[17]) / 2.0)
         return np.concatenate([arm1, [grip1], arm2, [grip2]])
+
+
+def _set_robot_qpos_from_policy_pose(env, task_name: str, pose: np.ndarray):
+    pose = np.asarray(pose, dtype=np.float32)
+    if task_name in ["door", "nut"] and pose.shape[0] == 8:
+        robot = env.robots[0]
+        arm_names = robot.robot_model.joints
+        grip_names = next(iter(robot.gripper.values())).joints
+        arm_idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in arm_names]
+        grip_idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in grip_names]
+        env.sim.data.qpos[arm_idx] = pose[:7]
+        env.sim.data.qpos[grip_idx] = _normalized_gripper_to_qpos(pose[7])
+        return True
+    if task_name == "two_arm" and pose.shape[0] == 16:
+        offset = 0
+        for robot_i, robot in enumerate(env.robots):
+            arm_names = robot.robot_model.joints
+            grip_names = next(iter(robot.gripper.values())).joints
+            arm_idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in arm_names]
+            grip_idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in grip_names]
+            arm_start = 0 if robot_i == 0 else 8
+            grip_pos = 7 if robot_i == 0 else 15
+            env.sim.data.qpos[arm_idx] = pose[arm_start:arm_start + 7]
+            env.sim.data.qpos[grip_idx] = _normalized_gripper_to_qpos(pose[grip_pos])
+            offset += len(arm_names) + len(grip_names)
+        return True
+    if task_name == "wipe" and pose.shape[0] == 7:
+        robot = env.robots[0]
+        arm_idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in robot.robot_model.joints]
+        env.sim.data.qpos[arm_idx] = pose[:7]
+        return True
+    return False
+
+
 def render_trajectory(
     env,
     task_name: str,
@@ -836,32 +817,34 @@ def render_trajectory(
 
     Notes:
         - Joint indices are resolved once, then we set `env.sim.data.qpos[joint_idx]`.
-        - For a two-DOF gripper, we average the two joint values to produce a single
-          scalar action (matches Door controller interface).
+        - Compact policy trajectories use one normalized gripper pose per gripper:
+          0 closed, 1 open.
         - If you switched to a JOINT_POSITION controller, ensure the action format
           matches (absolute joint targets) instead of OSC deltas.
     """
     
     # restore robot + door
     if set_init:
-        offset = 0
-        for robot in env.robots:
-            # collect this robot's joint names
-            arm_names  = robot.robot_model.joints
-            grip_names = next(iter(robot.gripper.values())).joints
-            names      = arm_names + grip_names
+        if not _set_robot_qpos_from_policy_pose(env, task_name, initial_pose):
+            offset = 0
+            for robot in env.robots:
+                # collect this robot's joint names
+                arm_names  = robot.robot_model.joints
+                grip_names = next(iter(robot.gripper.values())).joints
+                names      = arm_names + grip_names
 
-            # how many values to pull from initial_pose
-            n = len(names)
+                # how many values to pull from initial_pose
+                n = len(names)
 
-            # look up their indices in qpos
-            idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in names]
+                # look up their indices in qpos
+                idx = [env.sim.model.get_joint_qpos_addr(nm) for nm in names]
 
-            # copy the slice of initial_pose into sim.data.qpos
-            env.sim.data.qpos[idx] = initial_pose[offset:offset + n]
-            env.sim.data.qvel[:] = 0
+                # copy the slice of initial_pose into sim.data.qpos
+                env.sim.data.qpos[idx] = initial_pose[offset:offset + n]
+                env.sim.data.qvel[:] = 0
 
-            offset += n
+                offset += n
+        env.sim.data.qvel[:] = 0
         env.sim.forward()
 
     terminated = False

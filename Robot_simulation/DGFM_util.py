@@ -549,7 +549,8 @@ def train_DGFM(
         target_trajectories: (N, T, D) dataset.
         environment_parameters: (N, P) dataset conditioning.
         seq_len, dof, param_len: T, D, P.
-        gripper_idx: Optional indices ignored by loss.
+        gripper_idx: Optional normalized gripper channel indices. Gripper
+            channels are modeled and included in the loss.
         mf: Global synthetic data multiplier (global_N = mf * N).
         n_t_local: # of time samples per batch item in local phase.
         n_t_global: # of time samples per batch item in global phase.

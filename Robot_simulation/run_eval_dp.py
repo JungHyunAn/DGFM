@@ -157,9 +157,9 @@ def train_and_eval_DP(
 
     gripper_idx = None
     if task_name in ["door", "nut"]:
-        gripper_idx = [7, 8]
+        gripper_idx = [7]
     elif task_name == "two_arm":
-        gripper_idx = [7, 8, 16, 17]
+        gripper_idx = [7, 15]
 
     print("parameter length: ", param_len)
     model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
