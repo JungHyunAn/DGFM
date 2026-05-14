@@ -8,12 +8,9 @@ trajectory generators with Flow Matching on RoboSuite tasks. It includes:
 What this module provides
 -------------------------
 - **VectorField**: a conditional velocity field (1D U-Net backbone with FiLM)
-  mapping (x_t, t, c) → v_t used by UniformFM / ShiftedFM / DGFM trainers.
-- **MixtureSampler**: a low-rank conditional Gaussian mixture over trajectories
-  and environment parameters used by **Dimension-Guided FM (DGFM)** to provide
-  intermediate (interpolated) samples.
-- **Trainers**: 'train_uniform_FM', 'train_shifted_FM', train_DGFM'; each returns
-  '(best_model, last_model, records)' with validation metrics over epochs.
+  mapping (x_t, t, c) → v_t.
+- **Flow classes**: `VanillaFM`, `UniformFM`, and `ShiftedFM` train fixed-horizon
+  state-conditioned policies.
 - **Evaluation**: 'eval_model' runs many parallel rollouts in RoboSuite,
   reports success rate / average reward, and (optionally) renders a grid video.
 - **Utilities**: helpers like 'run_flow' for integrating the learned vector field from t=0→1.
@@ -26,27 +23,13 @@ Key design choices & assumptions
    - Times 't ∈ [0, 1]'.
    - For gripper DoF, models can ignore (mask) those joints during training.
 
-2) **DGFM's low-rank mixture (used only when training DGFM)**
-   - Per mixture component *k* we model:
-       x = μ_x^k + B^k z,  with  z|c ~ N(μ_{z|c}^k, Σ_{z|c}^k),  and  c ~ N(μ_c^k, Σ_cc^k)
-     where B^k ∈ R^{D x d} is a PCA basis (d < D). We precompute for each cluster:
-       Σ_zz^k, Σ_zc^k, Σ_cc^k and Cholesky factors; responsibilities use p(c|k) only.
-   - Conditioning uses standard Gaussian identities:
-       μ_{z|c}^k = Σ_zc^k {Σ_cc^k}^{-1} (c - μ_c^k),
-       Σ_{z|c}^k = Σ_zz^k - Σ_zc^k {Σ_cc^k}^{-1} Σ_cz^k.
-   - Sampling supports optional truncated normal in z (for robustness) and a small
-     orthogonal noise on x (σ⊥) to account for off-subspace variability.
-   - Numerical stability: all covariances are symmetrized and Tikhonov-regularized
-     before Cholesky; log-determinants are cached.
-
-3) **Trainers**
+2) **Trainers**
    - **UniformFM**: sample t ~ Uniform[0,1], regress v_t (standard FM).
    - **ShiftedFM**: shift / warp t to emphasize early (or late) time steps via Beta distribution.
-   - **DGFM**: use the mixture to define intermediate targets (configurable via `mf`, 
-     `cluster_d`, `cluster_size`, `n_t_global`, `n_t_local`).
+   - **DGFM** lives in `Robot_simulation.DGFM_util`.
    - Schedules: cosine with warmup; Adam optimizer; early stopping supported.
 
-4) **Evaluation loop**
+3) **Evaluation loop**
    - Before training: build env, extract env params c
    - For each trial: restore env, sample a trajectory by integrating the vector field (via `run_flow`), 
      upsample / smooth externally, replay, then compute success / reward. 
@@ -63,7 +46,6 @@ For nut assembly task, grasping the nut is ensured by lifting the nut in '_align
 """
 
 import numpy as np
-import random
 import os
 import copy
 import torch
@@ -74,11 +56,7 @@ from multiprocessing import get_context
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 from typing import Tuple, List
-from sklearn.decomposition import IncrementalPCA
-from sklearn.neighbors import NearestNeighbors
-from scipy.stats import chi2
 from torch.distributions import Beta
-from joblib import Parallel, delayed
 import logging
 logging.disable(logging.WARNING)
 robosuite_logger = logging.getLogger("robosuite")
@@ -448,7 +426,10 @@ class VanillaFM:
         records = {}
         stop_count = 0
 
-        env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
+        do_validation = val_period > 0 and val_trials > 0
+        env_settings_all, val_params = (None, None)
+        if do_validation:
+            env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
 
         try:
             self.model = self.model.to(self.device)
@@ -486,7 +467,7 @@ class VanillaFM:
                 if self.scheduler is not None:
                     self.scheduler.step()
 
-                if epoch % val_period == 0:
+                if do_validation and epoch % val_period == 0:
                     success_rate, avg_reward = eval_model(
                         self.model,
                         VectorField,
@@ -519,6 +500,8 @@ class VanillaFM:
         except KeyboardInterrupt:
             tqdm.write("Training interrupted by user. Returning best model so far...")
 
+        if not records:
+            best_model = copy.deepcopy(self.model)
         return best_model, self.model, records
 
 
@@ -656,6 +639,101 @@ def _current_robot_q(env, task_name: str) -> np.ndarray:
     if task_name == "wipe":
         return full_qpos[:7]
     return np.concatenate([full_qpos[0:9], full_qpos[9:18]])
+
+
+def _condition_from_env(env, task_name: str, static_c: np.ndarray, param_len: int) -> tuple[np.ndarray, np.ndarray]:
+    q0 = _current_robot_q(env, task_name)
+    dyn = get_dynamic_state(env, task_name)
+    static_flat = np.asarray(static_c, dtype=np.float32).reshape(-1)
+    dyn_dim = param_len - q0.shape[0] - static_flat.shape[0]
+    if dyn_dim < 0:
+        raise ValueError(f"Model param_len {param_len} is shorter than q + static condition length")
+    if dyn_dim == 0:
+        dyn = None
+    else:
+        dyn = np.asarray(dyn, dtype=np.float32).reshape(-1)
+        if dyn.shape[0] < dyn_dim:
+            dyn = np.pad(dyn, (0, dyn_dim - dyn.shape[0]))
+        elif dyn.shape[0] > dyn_dim:
+            dyn = dyn[:dyn_dim]
+    cond = make_policy_condition(q0, dyn, static_flat)
+    if cond.shape[0] != param_len:
+        raise ValueError(f"Condition length {cond.shape[0]} != model param_len {param_len}")
+    return cond.astype(np.float32), q0
+
+
+def _state_policy_success(env, task_name: str) -> bool:
+    if not env._check_success():
+        return False
+    if task_name == "two_arm":
+        z0 = env._handle0_xpos[2]
+        z1 = env._handle1_xpos[2]
+        return abs(z1 - z0) < 0.05
+    return True
+
+
+def _state_policy_env_worker(
+    conn,
+    idx: int,
+    task_name: str,
+    setting: dict,
+    static_c: np.ndarray,
+    seq_len: int,
+    param_len: int,
+    max_policy_steps: int,
+):
+    env = None
+    executed = []
+    try:
+        env = make_env(
+            task_name,
+            use_joint_control=True,
+            environment_setting=setting,
+            training=True,
+        )
+        steps = 0
+        cond, _ = _condition_from_env(env, task_name, static_c, param_len)
+        conn.send({"type": "cond", "idx": idx, "cond": cond})
+
+        while True:
+            msg = conn.recv()
+            if msg.get("type") == "close":
+                break
+            if msg.get("type") != "act":
+                raise ValueError(f"Unknown worker message: {msg}")
+
+            q0 = _current_robot_q(env, task_name)
+            q_low = np.asarray(msg["q_low"], dtype=np.float32)
+            q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)
+
+            done = False
+            for q in q_high:
+                _, _, done, _ = env.step(_to_action_from_q(q, task_name))
+                executed.append(q.copy())
+                if done or env._check_success():
+                    break
+
+            steps += 1
+            success = _state_policy_success(env, task_name)
+            if success or done or steps >= max_policy_steps:
+                conn.send({
+                    "type": "result",
+                    "idx": idx,
+                    "success": bool(success),
+                    "reward": float(env.reward()),
+                    "traj": np.asarray(executed, dtype=np.float32),
+                    "setting": setting,
+                })
+                break
+
+            cond, _ = _condition_from_env(env, task_name, static_c, param_len)
+            conn.send({"type": "cond", "idx": idx, "cond": cond})
+    except Exception as exc:
+        conn.send({"type": "error", "idx": idx, "error": repr(exc)})
+    finally:
+        if env is not None:
+            env.close()
+        conn.close()
 
 
 def _align_handle_to_nut(env, 
@@ -870,94 +948,143 @@ def _rollout_batch(
     return successes, reward_sum, success_info, fail_info
 
 
-def _rollout_state_policy_batch(
+def _run_flow_batched(
+    model,
+    cond_batch: np.ndarray,
+    seq_len: int,
+    dof: int,
+    device: str,
+    rng: np.random.RandomState,
+    flow_steps: int,
+    gpu_chunk_size: int | None = None,
+) -> np.ndarray:
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    if not use_cuda:
+        device = "cpu"
+
+    n = cond_batch.shape[0]
+    out = np.empty((n, seq_len, dof), dtype=np.float32)
+    chunk = n if gpu_chunk_size is None or gpu_chunk_size <= 0 else gpu_chunk_size
+
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        bs = e - s
+        x0 = torch.from_numpy(rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
+        c = torch.from_numpy(cond_batch[s:e].astype(np.float32)).to(device)
+        if use_cuda:
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                q_low = run_flow(model, x0, c, device, n_steps=flow_steps)
+            out[s:e] = q_low.float().cpu().numpy()
+            del q_low
+            torch.cuda.empty_cache()
+        else:
+            with torch.inference_mode():
+                q_low = run_flow(model, x0, c, device, n_steps=flow_steps)
+            out[s:e] = q_low.cpu().numpy()
+    return out
+
+
+def _rollout_state_policy_synchronized(
+    model,
     task_name: str,
-    model_state: dict,
-    model_class,
     seq_len: int,
     dof: int,
     param_len: int,
-    gripper_idx,
     static_params: np.ndarray,
     env_settings: List[dict],
+    device: str,
+    trials: int,
+    num_workers: int,
     base_seed: int,
     max_policy_steps: int,
     flow_steps: int,
-) -> Tuple[int, float, list, list]:
-    """Worker rollout for state-conditioned short-horizon FM policies."""
-    successes, reward_sum = 0, 0.0
-    success_info, fail_info = [], []
-
-    device = "cpu"
-    model = model_class(seq_len, dof, param_len, gripper_idx=gripper_idx)
-    model.load_state_dict(model_state)
-    model.eval()
-
+    gpu_chunk_size: int | None = None,
+) -> Tuple[float, float, list, list]:
+    """Synchronize state-conditioned environments and batch flow inference in the parent."""
     rng = np.random.RandomState(base_seed)
-    for i, setting in enumerate(env_settings):
-        env = make_env(
-            task_name,
-            use_joint_control=True,
-            environment_setting=setting,
-            training=True,
-        )
-        executed = []
-        static_c = static_params[i]
-        done = False
+    total_success = 0
+    total_reward = 0.0
+    success_info: List[dict] = []
+    failure_info: List[dict] = []
+    ctx = get_context("spawn")
 
-        for _ in range(max_policy_steps):
-            if done:
-                break
-            q0 = _current_robot_q(env, task_name)
-            dyn = get_dynamic_state(env, task_name)
-            dyn_dim = param_len - q0.shape[0] - np.asarray(static_c).reshape(-1).shape[0]
-            if dyn_dim < 0:
-                raise ValueError(f"Model param_len {param_len} is shorter than q + static condition length")
-            if dyn_dim == 0:
-                dyn = None
-            else:
-                dyn = np.asarray(dyn, dtype=np.float32).reshape(-1)
-                if dyn.shape[0] < dyn_dim:
-                    dyn = np.pad(dyn, (0, dyn_dim - dyn.shape[0]))
-                elif dyn.shape[0] > dyn_dim:
-                    dyn = dyn[:dyn_dim]
-            cond_np = make_policy_condition(q0, dyn, static_c)
-            if cond_np.shape[0] != param_len:
-                raise ValueError(f"Condition length {cond_np.shape[0]} != model param_len {param_len}")
+    for batch_start in range(0, trials, max(1, num_workers)):
+        batch_end = min(trials, batch_start + max(1, num_workers))
+        conns = {}
+        procs = {}
+        active = set()
 
-            x0 = torch.from_numpy(rng.randn(1, seq_len, dof).astype(np.float32))
-            c = torch.from_numpy(cond_np.reshape(1, -1).astype(np.float32))
-            with torch.inference_mode():
-                q_low = run_flow(model, x0, c, device, n_steps=flow_steps).cpu().numpy()[0]
+        for idx in range(batch_start, batch_end):
+            parent_conn, child_conn = ctx.Pipe()
+            proc = ctx.Process(
+                target=_state_policy_env_worker,
+                args=(
+                    child_conn,
+                    idx,
+                    task_name,
+                    env_settings[idx],
+                    static_params[idx],
+                    seq_len,
+                    param_len,
+                    max_policy_steps,
+                ),
+            )
+            proc.start()
+            child_conn.close()
+            conns[idx] = parent_conn
+            procs[idx] = proc
+            active.add(idx)
 
-            q_high = compute_smooth_trajectory_with_q0(env, task_name, q_low, env.control_freq, q0)
-            for q in q_high:
-                _, _, done, _ = env.step(_to_action_from_q(q, task_name))
-                executed.append(q.copy())
-                if done or env._check_success():
-                    break
-            if done or env._check_success():
-                break
-
-        if env._check_success():
-            if task_name == "two_arm":
-                z0 = env._handle0_xpos[2]
-                z1 = env._handle1_xpos[2]
-                if abs(z1 - z0) < 0.05:
-                    successes += 1
-                    success_info.append({"traj": np.asarray(executed), "setting": setting})
+        pending_conditions = {}
+        while active:
+            for idx in list(active):
+                if idx in pending_conditions:
+                    continue
+                msg = conns[idx].recv()
+                mtype = msg.get("type")
+                if mtype == "cond":
+                    pending_conditions[idx] = msg["cond"]
+                elif mtype == "result":
+                    active.remove(idx)
+                    if msg["success"]:
+                        total_success += 1
+                        success_info.append({"traj": msg["traj"], "setting": msg["setting"]})
+                    else:
+                        failure_info.append({"traj": msg["traj"], "setting": msg["setting"]})
+                    total_reward += msg["reward"]
+                elif mtype == "error":
+                    raise RuntimeError(f"State rollout worker {idx} failed: {msg['error']}")
                 else:
-                    fail_info.append({"traj": np.asarray(executed), "setting": setting})
-            else:
-                successes += 1
-                success_info.append({"traj": np.asarray(executed), "setting": setting})
-        else:
-            fail_info.append({"traj": np.asarray(executed), "setting": setting})
+                    raise RuntimeError(f"Unexpected state rollout message from {idx}: {msg}")
 
-        reward_sum += env.reward()
-        env.close()
+            ready = [idx for idx in sorted(active) if idx in pending_conditions]
+            if not ready:
+                continue
 
-    return successes, reward_sum, success_info, fail_info
+            cond_batch = np.stack([pending_conditions.pop(idx) for idx in ready], axis=0)
+            q_low_batch = _run_flow_batched(
+                model,
+                cond_batch,
+                seq_len,
+                dof,
+                device,
+                rng,
+                flow_steps,
+                gpu_chunk_size,
+            )
+            for local_i, idx in enumerate(ready):
+                conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})
+
+        for idx, conn in conns.items():
+            conn.close()
+        for idx, proc in procs.items():
+            proc.join()
+            if proc.exitcode not in (0, None):
+                raise RuntimeError(f"State rollout worker {idx} exited with code {proc.exitcode}")
+
+    return total_success / trials, total_reward / trials, success_info, failure_info
+
+
 def eval_model(
     model,
     model_class,                 # kept for signature compatibility (not used here)
@@ -1016,56 +1143,28 @@ def eval_model(
     if state_conditioned:
         if model is None:
             raise ValueError("State-conditioned evaluation requires a model.")
-        model_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-
-        base, rem = divmod(trials, max(1, num_workers))
-        splits: List[tuple[int, int]] = []
-        off = 0
-        for i in range(num_workers):
-            n = base + (1 if i < rem else 0)
-            if n > 0:
-                splits.append((off, off + n))
-                off += n
-
-        total_success = 0
-        total_reward = 0.0
-        success_info: List[dict] = []
-        failure_info: List[dict] = []
-        s_count = 0
-        f_count = 0
-
-        ctx = get_context("spawn")
-        with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as ex:
-            futs = []
-            for worker_i, (s, e) in enumerate(splits):
-                futs.append(ex.submit(
-                    _rollout_state_policy_batch,
-                    task_name,
-                    model_state,
-                    model_class,
-                    seq_len,
-                    dof,
-                    param_len,
-                    gripper_idx,
-                    val_params[s:e],
-                    env_settings_all[s:e],
-                    base_seed + worker_i * 1009,
-                    max_policy_steps,
-                    flow_steps,
-                ))
-            for fut in futs:
-                succ, rew, info_s, info_f = fut.result()
-                total_success += succ
-                total_reward += rew
-                if s_count < render_num:
-                    take = min(render_num - s_count, len(info_s))
-                    success_info += info_s[:take]; s_count += take
-                if f_count < (render_width * render_width - render_num):
-                    take = min(render_width * render_width - render_num - f_count, len(info_f))
-                    failure_info += info_f[:take]; f_count += take
-
-        success_rate = total_success / trials
-        mean_reward = total_reward / trials
+        model.eval()
+        success_rate, mean_reward, success_all, failure_all = _rollout_state_policy_synchronized(
+            model=model,
+            task_name=task_name,
+            seq_len=seq_len,
+            dof=dof,
+            param_len=param_len,
+            static_params=val_params,
+            env_settings=env_settings_all,
+            device=device,
+            trials=trials,
+            num_workers=num_workers,
+            base_seed=base_seed,
+            max_policy_steps=max_policy_steps,
+            flow_steps=flow_steps,
+            gpu_chunk_size=gpu_chunk_size,
+        )
+        success_info = success_all[:render_num]
+        fail_slots = max(0, render_width * render_width - render_num)
+        failure_info = failure_all[:fail_slots]
+        s_count = len(success_info)
+        f_count = len(failure_info)
 
         episode_frames = []
         s_left = min(s_count, render_num)
@@ -1245,1149 +1344,3 @@ def eval_model(
                          grid_shape=(render_width, render_width))
 
     return success_rate, mean_reward
-
-
-def _standardize_cols(A, eps=1e-8):
-    """Z-score standardize each column of `A`.
-
-    Args:
-        A: (N, D) array.
-        eps: Small floor for std to avoid division by zero.
-
-    Returns:
-        A_std: Standardized array with zero mean / unit variance per column.
-        stats: Tuple (mean[1,D], std[1,D]) used for the transform.
-    """
-    mu = A.mean(axis=0, keepdims=True) # (D, )
-    sd = A.std(axis=0, keepdims=True)
-    sd = np.where(sd < eps, 1.0, sd)
-    return (A - mu) / sd, (mu, sd)
-def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
-                         standardize=True, scale_x=1.0, scale_c=1.0):
-    """Greedy set-cover style clustering on joint features [X | C].
-
-    Steps:
-      1) Build local m-NN neighborhoods in a standardized / scaled feature space.
-      2) Choose uncovered seeds and take their neighborhoods as candidate clusters.
-      3) Merge seed clusters with Jaccard overlap ≥ `jaccard_thresh` using seed-to-seed KNN.
-      4) Ensure full coverage and build an inverse map from point index to cluster ids.
-
-    Args:
-        X: (N, Dx) flattened trajectories.
-        C: (N, Dc) environment parameters.
-        m: Neighborhood size for initial local clusters (m ≥ 2).
-        jaccard_thresh: Merge threshold on set overlap.
-        merge_k: Number of nearest seed clusters to consider when merging.
-        standardize: If True, z-score features before clustering.
-        scale_x: Scale factor applied to standardized X block.
-        scale_c: Scale factor applied to standardized C block.
-
-    Returns:
-        clusters: List[Set[int]] of merged index sets.
-        inv_cluster: Dict[int, List[int]] mapping point → list of cluster ids.
-    """
-    N, Dx = X.shape
-    Dc = C.shape[1]
-    assert C.shape[0] == N and m >= 2
-
-    # 0) Feature build
-    if standardize:
-        Xs, _ = _standardize_cols(X)
-        Cs, _ = _standardize_cols(C)
-    else:
-        Xs, Cs = X, C
-    F = np.hstack([scale_x * Xs, scale_c * Cs])
-
-    # 1) local m-NN neighborhoods
-    nn = NearestNeighbors(n_neighbors=min(m, N), algorithm='kd_tree')
-    nn.fit(F)
-    _, indices = nn.kneighbors(F)
-    raw = []
-    for i, neigh in enumerate(indices):
-        s = set(neigh.tolist())
-        s.add(i)              # ensure self-inclusion
-        raw.append(s)
-
-    # 2) greedy cover -> candidates
-    covered = np.zeros(N, dtype=bool)
-    seed_indices, candidates = [], []
-    for i in range(N):
-        if not covered[i]:
-            seed_indices.append(i)
-            cand = raw[i].copy()
-            candidates.append(cand)
-            covered[list(cand)] = True
-
-    M = len(candidates)
-    if M <= 1:
-        # One full cluster; make inv total
-        clusters = [set(range(N))]
-        inv = {j: [0] for j in range(N)}
-        return clusters, inv
-
-    # 3) merge via seed-to-seed KNN + Jaccard
-    seed_pts = F[seed_indices]
-    seed_nbrs = NearestNeighbors(n_neighbors=min(merge_k+1, M), algorithm='kd_tree').fit(seed_pts)
-    _, seed_neighbors = seed_nbrs.kneighbors(seed_pts)
-
-    parent = list(range(M))
-    cluster_sets = {i: candidates[i] for i in range(M)}
-
-    def find(u):
-        while parent[u] != u:
-            parent[u] = parent[parent[u]]
-            u = parent[u]
-        return u
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra == rb:
-            return ra
-        # merge smaller into larger
-        if len(cluster_sets[ra]) < len(cluster_sets[rb]):
-            ra, rb = rb, ra
-        parent[rb] = ra
-        cluster_sets[ra] |= cluster_sets.pop(rb)
-        return ra
-
-    for i in range(M):
-        for j in seed_neighbors[i][1:]:
-            ri, rj = find(i), find(j)
-            if ri == rj:
-                continue
-            Ci, Cj = cluster_sets[ri], cluster_sets[rj]
-            inter = len(Ci & Cj)
-            union_sz = len(Ci | Cj)
-            if union_sz > 0 and (inter / union_sz) >= jaccard_thresh:
-                union(ri, rj)
-
-    merged_clusters = list(cluster_sets.values())
-
-    # 4) assert & repair coverage
-    covered_all = set().union(*merged_clusters) if merged_clusters else set()
-    if len(covered_all) < N:
-        print(f"Warning! {len(missing)} points are not covered by clusters, adding them to the first cluster")
-        missing = [j for j in range(N) if j not in covered_all]
-        for j in missing:
-            merged_clusters[0].append(j)
-
-    # 5) build inverse map
-    inv_cluster = {j: [] for j in range(N)}
-    for ci, cluster in enumerate(merged_clusters):
-        for j in cluster:
-            inv_cluster[j].append(ci)
-
-    return merged_clusters, inv_cluster
-
-
-def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples):
-    """Compute per-cluster low-rank stats on X and full stats on C.
-
-    Workflow:
-      - Joint outlier filter using empirical covariance of [X|C].
-      - PCA basis `B_x` on X only (rank = `d_x`), robust to degeneracy.
-      - Covariances: Σ_zz from projected coordinates, Σ_cc full, Σ_zc cross.
-
-    Args:
-        X: (N, Dx) flattened trajectories for all points.
-        C: (N, Dc) environment parameters for all points.
-        idx: Iterable of indices belonging to this cluster.
-        d_x: Target rank for the low-rank basis on X.
-        eps: Numerical regularization for covariances.
-        chi2_thresh: Chi-square quantile for joint outlier removal in [X|C].
-        max_pca_samples: Subsample size cap for PCA fit for speed.
-
-    Returns:
-        mu_x: (Dx,) mean of X in cluster (after outlier filter).
-        mu_c: (Dc,) mean of C in cluster.
-        Bx: (Dx, d_x) low-rank basis for X.
-        Sig_zz: (d_x, d_x) covariance in latent space.
-        Sig_zc: (d_x, Dc) cross-covariance between latent z and C.
-        Sig_cc: (Dc, Dc) covariance of C.
-        weight: Relative cluster weight (#inliers / N).
-    """
-    Xi = X[idx]         # (S, Dx)
-    Ci = C[idx]         # (S, Dc)
-    S, Dx = Xi.shape
-    Dc = Ci.shape[1]
-
-    # --- 1) joint outlier filter using empirical cov of [X|C] ---
-    J = np.hstack([Xi, Ci])           # (S, Dx+Dc)
-    Dj = J.shape[1]
-    muJ = J.mean(axis=0)
-    covJ = np.cov(J, rowvar=False) + eps * np.eye(Dj)
-    L = np.linalg.cholesky(covJ)
-    Y = np.linalg.solve(L, (J - muJ).T)    # (Dj, S)
-    dists = (Y * Y).sum(axis=0)
-    mask = dists <= chi2_thresh
-    Xi_c = Xi[mask]
-    Ci_c = Ci[mask]
-    if Xi_c.shape[0] < max(5, d_x + 1):    # fallback if too few inliers
-        Xi_c, Ci_c = Xi, Ci
-
-    # Subsample for PCA if huge
-    S2 = Xi_c.shape[0]
-    if S2 > max_pca_samples:
-        sel = np.random.choice(S2, max_pca_samples, replace=False)
-        Xp = Xi_c[sel]
-    else:
-        Xp = Xi_c
-
-    # --- 2) PCA on X only (robust) ---
-    # center and check variance
-    Xp0 = Xp - Xp.mean(axis=0, keepdims=True)
-    col_var = Xp0.var(axis=0)                  # (Dx,)
-    total_var = float(col_var.sum())
-
-    if total_var <= 1e-12 or Xp.shape[0] < 2:
-        # Degenerate cluster: no usable variance. Use a fixed fallback basis.
-        print("Degenerate cluster!")
-        n_comp = min(d_x, Dx)
-        Bx = np.zeros((Dx, n_comp), dtype=np.float32)
-        for j in range(n_comp):
-            Bx[j, j] = 1.0                    # first n_comp standard basis vectors
-    else:
-        # Keep only nonzero-variance columns for the fit
-        keep = col_var > 1e-12
-        Xp_red = Xp0[:, keep]
-        Dx_red = int(keep.sum())
-
-        if Dx_red == 0:
-            # All columns were zero-variance after centering
-            n_comp = min(d_x, Dx)
-            Bx = np.zeros((Dx, n_comp), dtype=np.float32)
-            for j in range(n_comp):
-                Bx[j, j] = 1.0
-        else:
-            # Limit components to numeric rank to avoid over-asking
-            n_comp = int(min(d_x, Dx_red, max(1, Xp_red.shape[0] - 1)))
-
-            # For small / ill-conditioned batches, SVD is very stable:
-            # U, S, Vt = np.linalg.svd(Xp_red, full_matrices=False)
-            # B_red = Vt[:n_comp].T
-
-            ipca = IncrementalPCA(n_components=n_comp, batch_size=min(1024, Xp_red.shape[0]), whiten=False)
-            ipca.fit(Xp_red)                   # denominator > 0 now -> no warning
-            B_red = ipca.components_.T         # (Dx_red, n_comp)
-
-            # Lift back to full Dx by inserting zeros at dropped columns
-            Bx = np.zeros((Dx, n_comp), dtype=np.float32)
-            Bx[keep, :] = B_red
-
-    # pad with orthonormal columns in the complement subspace:
-    if Bx.shape[1] < d_x:
-        print(f"Missing {d_x - Bx.shape[1]} axes")
-        k = d_x - Bx.shape[1]
-        pad = np.zeros((Dx, k), dtype=np.float32)
-        for j in range(k):
-            # simple, deterministic padding with standard basis not already used
-            col = (Bx.shape[1] + j) % Dx
-            pad[col, j] = 1.0
-        Bx = np.concatenate([Bx, pad], axis=1)
-
-    # --- 3) reduced z and C stats (means, covs, cross-covs) ---
-    mu_x = Xi_c.mean(axis=0)           # (Dx,)
-    mu_c = Ci_c.mean(axis=0)           # (Dc,)
-    Zc   = (Xi_c - mu_x) @ Bx          # (S_in, d_x)
-    Cc   = (Ci_c - mu_c)               # (S_in, Dc)
-
-    denom = max(1, Zc.shape[0] - 1)
-    # Σ_zz from the projected cloud; more robust than just diag(var)
-    Sig_zz = (Zc.T @ Zc) / denom                       # (d_x, d_x)
-    # ensure SPD
-    Sig_zz = Sig_zz + eps * np.eye(Sig_zz.shape[0])
-
-    Sig_cc = (Cc.T @ Cc) / denom + eps * np.eye(Dc)    # (Dc, Dc)
-    Sig_zc = (Zc.T @ Cc) / denom                       # (d_x, Dc)
-
-    # cluster weight
-    weight = Xi_c.shape[0] / X.shape[0]
-
-    return mu_x, mu_c, Bx, Sig_zz, Sig_zc, Sig_cc, weight
-def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
-                                   eps=1e-3, outlier_q=0.9,
-                                   max_pca_samples=2000, n_jobs=-1):
-    """Parallel per-cluster statistics for DGFM.
-
-    Args:
-        X: (N, Dx) flattened trajectories.
-        C: (N, Dc) environment parameters.
-        clusters: Iterable of sets/iterables with point indices per cluster.
-        d_x: Target rank for the X basis per cluster.
-        eps: Numerical regularization for covariances.
-        outlier_q: Quantile (0..1) for joint [X|C] chi-square outlier cutoff.
-        max_pca_samples: Cap on samples used to fit PCA for speed.
-        n_jobs: Joblib parallel workers (-1 uses all cores).
-
-    Returns:
-        mu_x: (K, Dx)
-        mu_c: (K, Dc)
-        B: (K, Dx, d_x)
-        Sig_zz: (K, d_x, d_x)
-        Sig_zc: (K, d_x, Dc)
-        Sig_cc: (K, Dc, Dc)
-        weights: (K,) mixture weights
-    """
-    N, Dx = X.shape
-    Dc = C.shape[1]
-    Dj = Dx + Dc
-    chi2_thresh = chi2.ppf(outlier_q, df=Dj)
-
-    results = Parallel(n_jobs=n_jobs)(
-        delayed(_process_one_cluster_joint)(
-            X, C, list(c), d_x, eps, chi2_thresh, max_pca_samples
-        ) for c in clusters
-    )
-
-    mu_x, mu_c, B_list, Sig_zz, Sig_zc, Sig_cc, weights = zip(*results)
-    # Stack
-    mu_x  = np.vstack(mu_x)                       # (K, Dx)
-    mu_c  = np.vstack(mu_c)                       # (K, Dc)
-    B     = np.stack(B_list, axis=0)              # (K, Dx, d_x)
-    Sig_zz = np.stack(Sig_zz, axis=0)             # (K, d_x, d_x)
-    Sig_zc = np.stack(Sig_zc, axis=0)             # (K, d_x, Dc)
-    Sig_cc = np.stack(Sig_cc, axis=0)             # (K, Dc, Dc)
-    weights = np.array(weights, dtype=np.float32) # (K,)
-    return mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights
-
-
-def build_joint_interpolants(
-    X_train, C_train, perm_t, M, mf,
-    mixture_sampler, inv_cluster, n_t_global, n_t_local, 
-    seq_len, dof, param_len, device):
-    """
-    Build interpolants for DGFM; global:local = mf:1
-    """
-
-    global_M = M * mf
-
-    # ===== GLOBAL =====
-    x0g             = torch.randn(global_M, seq_len, dof, device=device)
-    x1g_flat, c1g, _ = mixture_sampler.sample_joint(global_M, truncated=True)
-    x1g             = x1g_flat.reshape(global_M, seq_len, dof)
-
-    tg   = torch.rand(global_M * n_t_global, device=device).unsqueeze(-1)
-    x0gr = x0g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-    x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-
-    xtg   = (1 - tg.view(-1,1,1)) * x0gr + tg.view(-1,1,1) * x1gr
-    vg    = 2.0 * (x1gr - x0gr)
-    cg    = c1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
-    t_ing = 0.5 * tg
-
-    # ===== LOCAL =====
-    idx  = perm_t[:M]
-    x1l  = X_train[idx]
-    c1l  = C_train[idx,:]
-
-    pis = torch.tensor(
-        [np.random.choice(inv_cluster[i]) for i in idx.detach().cpu().tolist()],
-        dtype=torch.long,
-        device=device,
-    )
-    x0l_flat, _, _ = mixture_sampler.sample_cond(c1l, truncated=True, pis=pis)
-    x0l            = x0l_flat.reshape(M, seq_len, dof)
-
-    tl   = torch.rand(M * n_t_local, device=device).unsqueeze(-1)
-    x0lr = x0l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-    x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-
-    xtl   = (1 - tl.view(-1,1,1)) * x0lr + tl.view(-1,1,1) * x1lr
-    vl    = 2 * (x1lr - x0lr)
-    cl    = c1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
-    t_inl = 0.5 * tl + 0.5
-
-    # ===== CONCAT =====
-    XT  = torch.cat([xtg,   xtl],   dim=0)
-    VT  = torch.cat([vg,    vl],    dim=0)
-    TIN = torch.cat([t_ing, t_inl], dim=0)
-    CT  = torch.cat([cg,    cl],    dim=0)
-
-    perm = torch.randperm(XT.shape[0], device=device)
-    return XT[perm], TIN[perm], VT[perm], CT[perm]
-
-
-def train_uniform_FM(
-    model,
-    optimizer,
-    scheduler,
-    task_name,
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    n_t,
-    max_epochs,
-    batch_size,
-    device,
-    val_period=5,
-    early_stopping=True,
-    stop_criteria=3,
-    val_trials=25):
-    """Train vanilla Flow Matching with uniform `t`.
-
-    The data term draws (x0, x1) pairs where x0~N(0, I) and x1 is a ground-truth
-    trajectory from the dataset. The network is trained to match v* = x1 - x0 at
-    uniformly sampled times.
-
-    Args:
-        model: Vector field model to train.
-        optimizer: Torch optimizer.
-        scheduler: Optional LR scheduler (callable `.step()` per batch); may be None.
-        task_name: Task key for periodic evaluation.
-        target_trajectories: (N, T, D) ground truth joint trajectories.
-        environment_parameters: (N, P) conditioning parameters.
-        seq_len: T; time steps per trajectory.
-        dof: D; joint dimensionality.
-        param_len: P; conditioning dim.
-        gripper_idx: Indices of gripper joints ignored by the loss (if any).
-        n_t: Number of `t` samples per data pair (multiplies batch size).
-        max_epochs: Training epochs.
-        batch_size: Batch size (on x1 instances).
-        device: Torch device string.
-        val_period: Evaluate every `val_period` epochs.
-        early_stopping: Whether to stop after `stop_criteria` non-improvements.
-        stop_criteria: Number of consecutive validations allowed without improvement.
-
-    Returns:
-        best_model: Deep-copied best performing model (may be None if never improved).
-        last_model: Model at the end of training / interruption.
-        success_rate_recs: Dict[epoch → metrics] logged at validation epochs.
-    """
-    N = target_trajectories.shape[0]
-    best_avg_reward = 0.0
-    best_success_rate = 0.0
-    best_model = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count = 0
-
-    # ---- Build environments sequentially for validation and close them ----
-    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    # start training
-    try: 
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)
-        environment_parameters = environment_parameters.to(device)
-        for epoch in tqdm(range(1, max_epochs + 1),
-                        desc="UniformFM Training",
-                        unit="epoch"):
-            model.train()
-
-            perm_t = torch.randperm(N, device=device)
-            loss_sum = 0
-            for i in range(0, N, batch_size):
-                idx = perm_t[i:min(i+batch_size, N)]
-                x1 = target_trajectories[idx]
-                x0 = torch.randn(len(idx), seq_len, dof, device=device)
-                t = torch.rand(len(idx)*n_t, device=device).unsqueeze(-1) # uniform t sampling
-                env_params = environment_parameters[idx, :]
-
-                x1r = x1.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, seq_len, dof)
-                x0r = x0.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, seq_len, dof)
-                t_col = t.view(-1, 1, 1)
-                xt = (1 - t_col) * x0r + t_col * x1r
-                env_params_r = env_params.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, param_len)
-
-                target_v = x1r - x0r
-                with torch.enable_grad():
-                    pred_v   = model(xt,t, env_params_r)
-                    sq_err = (pred_v - target_v) ** 2
-                    # If the model registered a (1,1,dof) mask that zeros gripper dims, use it:
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss = sq_err.mean()
-
-                optimizer.zero_grad()
-                loss.backward()
-                loss_sum += loss.item()
-                optimizer.step()
-                
-            scheduler.step()
-
-            if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)                
-                success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        else:
-                            stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    return best_model, model, success_rate_recs
-
-
-def train_shifted_FM(
-    model,
-    optimizer,
-    scheduler,
-    task_name,
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    n_t,
-    max_epochs,
-    batch_size,
-    device,
-    val_period=5,
-    early_stopping=True,
-    stop_criteria=3,
-    beta_a = 1.5,
-    beta_b = 1,
-    val_trials =25):
-    """Train Flow Matching with Beta-biased time sampling ("Shifted FM").
-
-    Draw time `t` from Beta(beta_a, beta_b), then reflect to emphasize later
-    parts of the trajectory (`t <- 1 - t`). Useful when later stages carry more
-    task-relevant signal.
-
-    Args are the same as `train_uniform_FM` with two additional parameters:
-        beta_a: Alpha parameter of Beta distribution.
-        beta_b: Beta parameter of Beta distribution.
-
-    Returns:
-        best_model, last_model, success_rate_recs (same semantics as Uniform FM).
-    """
-    N = target_trajectories.shape[0]
-    best_avg_reward = 0.0
-    best_success_rate = 0.0
-    best_model = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count = 0
-
-    # ---- Build environments sequentially for validation and close them ----
-    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    try: 
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)
-        environment_parameters = environment_parameters.to(device)
-        for epoch in tqdm(range(1, max_epochs + 1),
-                        desc="ShiftedFM Training",
-                        unit="epoch"):
-            model.train()
-
-            perm_t = torch.randperm(N, device=device)
-            loss_sum = 0
-
-            for i in range(0, N, batch_size):
-                idx = perm_t[i:min(i+batch_size, N)]
-                x1 = target_trajectories[idx]
-                x0 = torch.randn(len(idx), seq_len, dof, device=device)
-                t  = Beta(beta_a, beta_b).sample((len(idx)*n_t, 1)).to(device)  # Beta t sampling
-                t  = torch.ones_like(t).to(device) - t
-                env_params = environment_parameters[idx, :]
-
-                x1r = x1.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, seq_len, dof)
-                x0r = x0.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, seq_len, dof)
-                t_col = t.view(-1, 1, 1)
-                xt = (1 - t_col) * x0r + t_col * x1r
-                env_params_r = env_params.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, param_len)
-
-                target_v = x1r - x0r
-
-                with torch.enable_grad():
-                    pred_v   = model(xt,t, env_params_r)
-                    sq_err = (pred_v - target_v) ** 2
-                    # If the model registered a (1,1,dof) mask that zeros gripper dims, use it:
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss = sq_err.mean()
-
-                optimizer.zero_grad()
-                loss.backward()
-                loss_sum += loss.item()
-                optimizer.step()
-                
-            scheduler.step()
-
-            if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
-                
-                if not torch.is_grad_enabled():
-                    torch.set_grad_enabled(True)
-                
-                success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        else:
-                            stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    return best_model, model, success_rate_recs
-
-
-def train_DGFM(
-    model,
-    optimizer,
-    scheduler,
-    task_name,
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    mf,                   # global augmentation ratio (multiplication factor)
-    n_t_local,
-    n_t_global,
-    cluster_size,
-    cluster_d,
-    max_epochs,
-    batch_size,
-    device,
-    val_period=5,
-    early_stopping=True,
-    stop_criteria=3,
-    scale_x=1.0,
-    scale_c=1.0,
-    val_trials=25):
-    """Train Dimension-Guided Flow Matching (DGFM, conditional).
-
-    DGFM builds a conditional mixture over (x, c) by clustering joint features
-    and computing per-cluster low-rank statistics on trajectories. Training then
-    alternates two phases per epoch:
-
-      1) Global FM (t ∈ [0, 0.5]):
-         - Draw synthetic pairs (x0 ~ N, (x1, c1) ~ mixture joint).
-         - Train at time 0.5*t with target scaled by 2.
-
-      2) Local FM (t ∈ [0.5, 1]):
-         - For each dataset c_true, draw x_tilde ~ mixture p(x|c_true) near the mode
-           (optionally choosing the component using the data point's cluster).
-         - Train at 0.5*t+0.5 with target scaled by 2 to focus on the refinement.
-
-    Args:
-        model, optimizer, scheduler: Standard training components.
-        task_name: Task key for evaluation.
-        target_trajectories: (N, T, D) dataset.
-        environment_parameters: (N, P) dataset conditioning.
-        seq_len, dof, param_len: T, D, P.
-        gripper_idx: Optional indices ignored by loss.
-        mf: Global synthetic data multiplier (global_N = mf * N).
-        n_t_local: # of time samples per batch item in local phase.
-        n_t_global: # of time samples per batch item in global phase.
-        cluster_size: Local neighborhood size m for clustering.
-        cluster_d: Target rank for per-cluster PCA basis on X.
-        max_epochs, batch_size, device: Usual training hyperparameters.
-        val_period, early_stopping, stop_criteria: Validation / ES settings.
-        scale_x, scale_c: Feature scaling used during clustering.
-
-    Returns:
-        best_model: Best checkpoint by success rate / avg reward.
-        last_model: Final model (or at interruption).
-        success_rate_recs: Dict of validation metrics per epoch.
-    """
-    from Robot_simulation.DGFM_util import MixtureSampler
-
-    # -------- 0) Build mixture on (x, c) --------
-    print("Clustering dataset . . .")
-    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
-    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
-
-    clusters, inv_cluster = cluster_points_joint(
-        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
-        standardize=True, scale_x=scale_x, scale_c=scale_c
-    )
-
-    print(f"{len(clusters)} clusters made! Applying PCA . . .")
-    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
-        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
-        max_pca_samples=2000, n_jobs=-1
-    )
-
-    mixture_sampler = MixtureSampler(
-        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
-    )
-
-    # -------- 1) Train loop (global + local, eval, early stop) --------
-    N                 = target_trajectories.shape[0]
-    joint_N           = (mf + 1) * N
-    best_avg_reward   = 0.0
-    best_success_rate = 0.0
-    best_model        = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count        = 0
-
-    # ---- Build environments sequentially for validation and close them ----
-    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    try:
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)          # (N, T, dof)
-        environment_parameters = environment_parameters.to(device)    # (N, param_len)
-
-        for epoch in tqdm(range(1, max_epochs + 1), desc=f"DGFM_mf{mf} Training", unit="epoch"):
-            model.train()
-
-            perm_t = torch.randperm(X_np.shape[0], device=device)
-
-            # ===== Build joint interpolants =====
-            XT, TIN, VT, CT = build_joint_interpolants(
-                X_train=target_trajectories,
-                C_train=environment_parameters,
-                perm_t=perm_t,      # pass block directly
-                M=N,
-                mf=mf,
-                mixture_sampler=mixture_sampler,
-                inv_cluster=inv_cluster,
-                n_t_global=n_t_global,
-                n_t_local=n_t_local,
-                seq_len=seq_len,
-                dof=dof,
-                param_len=param_len,
-                device=device
-            )
-
-            # ===== Batched training =====
-            loss_sum = 0.0
-            for i in range(0, joint_N, batch_size):
-                m    = min(batch_size, joint_N - i)
-
-                xb   = XT[i:i+batch_size]
-                tb   = TIN[i:i+batch_size]
-                vb   = VT[i:i+batch_size]
-                cb   = CT[i:i+batch_size]
-
-                with torch.enable_grad():
-                    pred   = model(xb, tb, cb)
-                    sq_err = (pred - vb) ** 2
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss   = sq_err.mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    loss_sum += float(loss.item())
-
-            if scheduler is not None:
-                scheduler.step()
-
-            # ===== Validation / early stopping =====
-            if epoch % val_period == 0:
-                model.eval()
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
-                
-                if not torch.is_grad_enabled():
-                    torch.set_grad_enabled(True)
-
-                success_rate_recs[epoch] = {
-                    "success_rate": success_rate,
-                    "avg_reward":   avg_reward,
-                    "loss":         loss_sum / (1+mf),
-                }
-
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                               f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        else:
-                            stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f}")
-
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    return best_model, model, success_rate_recs, mixture_sampler
-
-
-def train_GFM(
-    model,
-    optimizer,
-    scheduler,
-    task_name,
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    mf,                   # global augmentation ratio (multiplication factor)
-    n_t_local,
-    n_t_global,
-    cluster_size,
-    cluster_d,
-    max_epochs,
-    batch_size,
-    device,
-    val_period=5,
-    early_stopping=True,
-    stop_criteria=3,
-    scale_x=1.0,
-    scale_c=1.0,
-    val_trials=25):
-    """Train GFM only
-
-    Logic is same as DGFM
-    """
-    from Robot_simulation.DGFM_util import MixtureSampler
-
-    # -------- 0) Build mixture on (x, c) --------
-    print("Clustering dataset . . .")
-    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
-    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
-
-    clusters, inv_cluster = cluster_points_joint(
-        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
-        standardize=True, scale_x=scale_x, scale_c=scale_c
-    )
-
-    print(f"{len(clusters)} clusters made! Applying PCA . . .")
-    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
-        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
-        max_pca_samples=2000, n_jobs=-1
-    )
-
-    mixture_sampler = MixtureSampler(
-        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
-    )
-
-    N                 = target_trajectories.shape[0]
-    best_avg_reward   = 0.0
-    best_success_rate = 0.0
-    best_model        = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count        = 0    
-
-    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    try:
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)          # (N, T, dof)
-        environment_parameters = environment_parameters.to(device)    # (N, param_len)
-
-        for epoch in tqdm(range(1, max_epochs + 1), desc=f"GFM Training", unit="epoch"):
-            model.train()
-
-            # sample from intermediate GMM
-            x0g              = torch.randn(N, seq_len, dof, device=device)
-            x1g_flat, c1g, _ = mixture_sampler.sample_joint(N, truncated=True)
-            x1g              = x1g_flat.reshape(N, seq_len, dof)
-
-            tg   = torch.rand(N * n_t_global, device=device).unsqueeze(-1)
-            x0gr = x0g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-            x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-
-            XT    = (1 - tg.view(-1,1,1)) * x0gr + tg.view(-1,1,1) * x1gr
-            VT    = x1gr - x0gr
-            CT    = c1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
-            TIN   = tg
-
-            # ===== Batched training =====
-            loss_sum = 0.0
-            for i in range(0, N, batch_size):
-                m    = min(batch_size, N - i)
-
-                xb   = XT[i:i+batch_size]
-                tb   = TIN[i:i+batch_size]
-                vb   = VT[i:i+batch_size]
-                cb   = CT[i:i+batch_size]
-
-                with torch.enable_grad():
-                    pred   = model(xb, tb, cb)
-                    sq_err = (pred - vb) ** 2
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss   = sq_err.mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    loss_sum += float(loss.item())
-
-            if scheduler is not None:
-                scheduler.step()
-
-            # ===== Validation / early stopping =====
-            if epoch % val_period == 0:
-                model.eval()
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
-                
-                if not torch.is_grad_enabled():
-                    torch.set_grad_enabled(True)
-
-                success_rate_recs[epoch] = {
-                    "success_rate": success_rate,
-                    "avg_reward":   avg_reward,
-                    "loss":         loss_sum,
-                }
-
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                               f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        else:
-                            stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    return best_model, model, success_rate_recs, mixture_sampler
-
-
-def train_LFM(
-    model,
-    optimizer,
-    scheduler,
-    task_name,
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    mf,                   # global augmentation ratio (multiplication factor)
-    n_t_local,
-    n_t_global,
-    cluster_size,
-    cluster_d,
-    max_epochs,
-    batch_size,
-    device,
-    val_period=5,
-    early_stopping=True,
-    stop_criteria=3,
-    scale_x=1.0,
-    scale_c=1.0,
-    val_trials=25):
-    """Train LFM only
-
-    Logic is same as DGFM
-    """
-    from Robot_simulation.DGFM_util import MixtureSampler
-
-
-    # -------- 0) Build mixture on (x, c) --------
-    print("Clustering dataset . . .")
-    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
-    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
-
-    clusters, inv_cluster = cluster_points_joint(
-        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
-        standardize=True, scale_x=scale_x, scale_c=scale_c
-    )
-
-    print(f"{len(clusters)} clusters made! Applying PCA . . .")
-    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
-        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
-        max_pca_samples=2000, n_jobs=-1
-    )
-
-    mixture_sampler = MixtureSampler(
-        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
-    )
-
-    N                 = target_trajectories.shape[0]
-    best_avg_reward   = 0.0
-    best_success_rate = 0.0
-    best_model        = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count        = 0    
-
-    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    try:
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)          # (N, T, dof)
-        environment_parameters = environment_parameters.to(device)    # (N, param_len)
-
-        for epoch in tqdm(range(1, max_epochs + 1), desc=f"LFM Training", unit="epoch"):
-            model.train()
-
-            # sample from intermediate GMM
-            perm_t = torch.randperm(X_np.shape[0], device=device)
-            idx    = perm_t[:N]
-            x1l    = target_trajectories[idx]
-            c1l    = environment_parameters[idx,:]
-
-            pis = torch.tensor(
-                [np.random.choice(inv_cluster[i]) for i in idx.detach().cpu().tolist()],
-                dtype=torch.long,
-                device=device,
-            )
-            x0l_flat, _, _ = mixture_sampler.sample_cond(c1l, truncated=True, pis=pis)
-            x0l            = x0l_flat.reshape(N, seq_len, dof)
-
-            tl   = torch.rand(N * n_t_local, device=device).unsqueeze(-1)
-            x0lr = x0l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-            x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-
-            XT    = (1 - tl.view(-1,1,1)) * x0lr + tl.view(-1,1,1) * x1lr
-            VT    = x1lr - x0lr
-            CT    = c1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
-            TIN   = tl
-
-            # ===== Batched training =====
-            loss_sum = 0.0
-            for i in range(0, N, batch_size):
-                m    = min(batch_size, N - i)
-
-                xb   = XT[i:i+batch_size]
-                tb   = TIN[i:i+batch_size]
-                vb   = VT[i:i+batch_size]
-                cb   = CT[i:i+batch_size]
-
-                with torch.enable_grad():
-                    pred   = model(xb, tb, cb)
-                    sq_err = (pred - vb) ** 2
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss   = sq_err.mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    loss_sum += float(loss.item())
-
-            if scheduler is not None:
-                scheduler.step()
-
-            # ===== Validation / early stopping =====
-            if epoch % val_period == 0:
-                model.eval()
-                q_low_flat, _, _ = mixture_sampler.sample_cond(val_params, truncated=True)
-                q_low            = q_low_flat.reshape(val_trials, seq_len, dof)
-                base_mixture     = True
-
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, \
-                                                      trials=val_trials, q_low=q_low, base_mixture=base_mixture)
-                
-                if not torch.is_grad_enabled():
-                    torch.set_grad_enabled(True)
-
-                success_rate_recs[epoch] = {
-                    "success_rate": success_rate,
-                    "avg_reward":   avg_reward,
-                    "loss":         loss_sum,
-                }
-
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                               f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        else:
-                            stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    return best_model, model, success_rate_recs, mixture_sampler
-
-
-def train_GMM(
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    cluster_size,
-    cluster_d,
-    device,
-    scale_x=1.0,
-    scale_c=1.0):
-    """Creates GMM used for DGFM/GFM/LFM
-
-    Logic is same as DGFM
-    """
-    from Robot_simulation.DGFM_util import MixtureSampler
-
-    # -------- 0) Build mixture on (x, c) --------
-    print("Clustering dataset . . .")
-    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
-    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
-
-    clusters, inv_cluster = cluster_points_joint(
-        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
-        standardize=True, scale_x=scale_x, scale_c=scale_c
-    )
-
-    print(f"{len(clusters)} clusters made! Applying PCA . . .")
-    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
-        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
-        max_pca_samples=2000, n_jobs=-1
-    )
-
-    mixture_sampler = MixtureSampler(
-        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
-    )
-
-    return mixture_sampler, inv_cluster
