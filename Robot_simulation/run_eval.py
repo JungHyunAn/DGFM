@@ -57,12 +57,10 @@ Common options:
 - `--evaluation_samples` Number of trials in each evaluation (default: 1000)
 
 FM-specific:
-- **UniformFM / ShiftedFM**: `--n_t` (per-sample t-replications).
-- **DGFM**:
-  - `--mf`           Global synthetic multiplier (batches from the mixture)
-  - `--n_t_global`   Replications for global phase t
-  - `--n_t_local`    Replications for local phase t
-  - Cluster rank / size are auto-set per task from `(seq_len)`; see code.
+- **UniformFM / ShiftedFM / DGFM**: `--n_t` (per-sample t-replications).
+- `--time_sampling` can be `uniform` or `shifted`; shifted uses `--beta_a` / `--beta_b`.
+- **DGFM** uses `--interpolation_path` (default: `piecewise-linear-midpoint`).
+- DGFM cluster rank / size are auto-set per task from `(seq_len)`; see code.
 
 Task conventions
 ----------------
@@ -99,7 +97,8 @@ Shifted FM:
 
 DGFM:
   python -m Robot_simulation.run_eval \
-    --FM_type DGFM --mf 4 --n_t_global 4 --n_t_local 4 --N 5000 ... (paths as above)
+    --FM_type DGFM --n_t 4 --interpolation_path piecewise-linear-midpoint \
+    --N 5000 ... (paths as above)
 
 Behavioral notes & tips
 -----------------------
@@ -239,6 +238,10 @@ def train_and_eval_FM(
     n_t: int = None,
     n_t_global: int = None,
     n_t_local: int = None,
+    time_sampling: str = "uniform",
+    beta_a: float = 1.5,
+    beta_b: float = 1.0,
+    interpolation_path: str = "piecewise-linear-midpoint",
     max_epochs: int = 1000,
     batch_size: int = 200,
     warmup_steps: int = 200,
@@ -341,7 +344,8 @@ def train_and_eval_FM(
         f"max_policy_steps={max_policy_steps} | "
         f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
-        f"n_t={n_t} | n_t_global={n_t_global} | n_t_local={n_t_local} | seed={seed} | device={device}"
+        f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
+        f"seed={seed} | device={device}"
     )
     model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-6)
@@ -359,6 +363,9 @@ def train_and_eval_FM(
         dof=dof,
         condition_dim=param_len,
         gripper_idx=gripper_idx,
+        time_sampling=time_sampling,
+        beta_a=beta_a,
+        beta_b=beta_b,
         device=device,
     )
 
@@ -396,13 +403,12 @@ def train_and_eval_FM(
             best_model, last_model, recs, mixture_sampler = flow.train(
                 target_trajectories=target_trajectories,
                 conditions=env_params,
-                mf=mf,
-                n_t_local=n_t_local,
-                n_t_global=n_t_global,
+                n_t=n_t,
                 cluster_size=cluster_size,
                 cluster_d=cluster_d,
                 max_epochs=max_epochs,
                 batch_size=batch_size,
+                interpolation_path=interpolation_path,
                 val_period=val_period,
                 early_stopping=early_stopping,
                 stop_criteria=stop_criteria,
@@ -487,12 +493,16 @@ def train_and_eval_FM(
             "window_stride":   window_stride,
             "max_policy_steps": max_policy_steps,
             "task_name":       task_name,
-            "n_t":             n_t if FM_type != "DGFM" else None,
-            "mf":              mf if FM_type == "DGFM" else None,
+            "n_t":             n_t,
+            "time_sampling":   time_sampling,
+            "beta_a":          beta_a,
+            "beta_b":          beta_b,
+            "interpolation_path": interpolation_path if FM_type == "DGFM" else None,
+            "mf":              None,
             "cluster_d":       cluster_d if FM_type == "DGFM" else None,
             "cluster_size":    cluster_size if FM_type == "DGFM" else None,
-            "n_t_global":      n_t_global if FM_type == "DGFM" else None,
-            "n_t_local":       n_t_local if FM_type == "DGFM" else None,
+            "n_t_global":      None,
+            "n_t_local":       None,
             "maximum epoch":   max_epochs,
             "warmup steps":    warmup_steps,
             "batch_size":      batch_size,
@@ -584,6 +594,10 @@ if __name__ == "__main__":
     parser.add_argument("--n_t",            type=int,   default=1)
     parser.add_argument("--n_t_global",     type=int,   default=1)
     parser.add_argument("--n_t_local",      type=int,   default=1)
+    parser.add_argument("--time_sampling",  type=str,   default="uniform", choices=["uniform", "shifted"])
+    parser.add_argument("--beta_a",         type=float, default=1.5)
+    parser.add_argument("--beta_b",         type=float, default=1.0)
+    parser.add_argument("--interpolation_path", type=str, default="piecewise-linear-midpoint")
     parser.add_argument("--max_epochs",     type=int,   default=1000)
     parser.add_argument("--batch_size",     type=int,   default=200)
     parser.add_argument("--warmup_steps",    type=int,   default=200)
@@ -630,6 +644,10 @@ if __name__ == "__main__":
         n_t                = args.n_t,
         n_t_global         = args.n_t_global,
         n_t_local          = args.n_t_local,
+        time_sampling      = args.time_sampling,
+        beta_a             = args.beta_a,
+        beta_b             = args.beta_b,
+        interpolation_path = args.interpolation_path,
         max_epochs         = args.max_epochs,
         batch_size         = args.batch_size,
         warmup_steps       = args.warmup_steps,

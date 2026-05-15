@@ -447,301 +447,242 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
     return mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights
 
 
-def build_joint_interpolants(
-    X_train, C_train, perm_t, M, mf,
-    mixture_sampler, inv_cluster, n_t_global, n_t_local, 
-    seq_len, dof, param_len, device):
-    """
-    Build interpolants for DGFM; global:local = mf:1
-    """
-
-    global_M = M * mf
-
-    # ===== GLOBAL =====
-    x0g             = torch.randn(global_M, seq_len, dof, device=device)
-    x1g_flat, c1g, _ = mixture_sampler.sample_joint(global_M, truncated=True)
-    x1g             = x1g_flat.reshape(global_M, seq_len, dof)
-
-    tg   = torch.rand(global_M * n_t_global, device=device).unsqueeze(-1)
-    x0gr = x0g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-    x1gr = x1g.unsqueeze(1).expand(-1, n_t_global, -1, -1).reshape(-1, seq_len, dof)
-
-    xtg   = (1 - tg.view(-1,1,1)) * x0gr + tg.view(-1,1,1) * x1gr
-    vg    = 2.0 * (x1gr - x0gr)
-    cg    = c1g.unsqueeze(1).expand(-1, n_t_global, -1).reshape(-1, param_len)
-    t_ing = 0.5 * tg
-
-    # ===== LOCAL =====
-    idx  = perm_t[:M]
-    x1l  = X_train[idx]
-    c1l  = C_train[idx,:]
-
-    pis = torch.tensor(
-        [np.random.choice(inv_cluster[i]) for i in idx.detach().cpu().tolist()],
-        dtype=torch.long,
-        device=device,
-    )
-    x0l_flat, _, _ = mixture_sampler.sample_cond(c1l, truncated=True, pis=pis)
-    x0l            = x0l_flat.reshape(M, seq_len, dof)
-
-    tl   = torch.rand(M * n_t_local, device=device).unsqueeze(-1)
-    x0lr = x0l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-    x1lr = x1l.unsqueeze(1).expand(-1, n_t_local, -1, -1).reshape(-1, seq_len, dof)
-
-    xtl   = (1 - tl.view(-1,1,1)) * x0lr + tl.view(-1,1,1) * x1lr
-    vl    = 2 * (x1lr - x0lr)
-    cl    = c1l.unsqueeze(1).expand(-1, n_t_local, -1).reshape(-1, param_len)
-    t_inl = 0.5 * tl + 0.5
-
-    # ===== CONCAT =====
-    XT  = torch.cat([xtg,   xtl],   dim=0)
-    VT  = torch.cat([vg,    vl],    dim=0)
-    TIN = torch.cat([t_ing, t_inl], dim=0)
-    CT  = torch.cat([cg,    cl],    dim=0)
-
-    perm = torch.randperm(XT.shape[0], device=device)
-    return XT[perm], TIN[perm], VT[perm], CT[perm]
-
-
-def train_DGFM(
-    model,
-    optimizer,
-    scheduler,
-    task_name,
-    target_trajectories,
-    environment_parameters,
-    seq_len,
-    dof,
-    param_len,
-    gripper_idx,
-    mf,                   # global augmentation ratio (multiplication factor)
-    n_t_local,
-    n_t_global,
-    cluster_size,
-    cluster_d,
-    max_epochs,
-    batch_size,
-    device,
-    val_period=5,
-    early_stopping=True,
-    stop_criteria=3,
-    scale_x=1.0,
-    scale_c=1.0,
-    val_trials=25):
-    """Train Dimension-Guided Flow Matching (DGFM, conditional).
-
-    DGFM builds a conditional mixture over (x, c) by clustering joint features
-    and computing per-cluster low-rank statistics on trajectories. Training then
-    alternates two phases per epoch:
-
-      1) Global FM (t ∈ [0, 0.5]):
-         - Draw synthetic pairs (x0 ~ N, (x1, c1) ~ mixture joint).
-         - Train at time 0.5*t with target scaled by 2.
-
-      2) Local FM (t ∈ [0.5, 1]):
-         - For each dataset c_true, draw x_tilde ~ mixture p(x|c_true) near the mode
-           (optionally choosing the component using the data point's cluster).
-         - Train at 0.5*t+0.5 with target scaled by 2 to focus on the refinement.
-
-    Args:
-        model, optimizer, scheduler: Standard training components.
-        task_name: Task key for evaluation.
-        target_trajectories: (N, T, D) dataset.
-        environment_parameters: (N, P) dataset conditioning.
-        seq_len, dof, param_len: T, D, P.
-        gripper_idx: Optional normalized gripper channel indices. Gripper
-            channels are modeled and included in the loss.
-        mf: Global synthetic data multiplier (global_N = mf * N).
-        n_t_local: # of time samples per batch item in local phase.
-        n_t_global: # of time samples per batch item in global phase.
-        cluster_size: Local neighborhood size m for clustering.
-        cluster_d: Target rank for per-cluster PCA basis on X.
-        max_epochs, batch_size, device: Usual training hyperparameters.
-        val_period, early_stopping, stop_criteria: Validation / ES settings.
-        scale_x, scale_c: Feature scaling used during clustering.
-
-    Returns:
-        best_model: Best checkpoint by success rate / avg reward.
-        last_model: Final model (or at interruption).
-        success_rate_recs: Dict of validation metrics per epoch.
-    """
-    # -------- 0) Build mixture on (x, c) --------
-    print("Clustering dataset . . .")
-    X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)  # (N, Dx)
-    C_np = environment_parameters.detach().cpu().numpy()                                         # (N, Dc)
-
-    clusters, inv_cluster = cluster_points_joint(
-        X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
-        standardize=True, scale_x=scale_x, scale_c=scale_c
-    )
-
-    print(f"{len(clusters)} clusters made! Applying PCA . . .")
-    mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
-        X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
-        max_pca_samples=2000, n_jobs=-1
-    )
-
-    mixture_sampler = MixtureSampler(
-        mu_x, mu_c, B, Szz, Szc, Scc, weights, device=device, reg=1e-6, orth_sigma=0.0
-    )
-
-    # -------- 1) Train loop (global + local, eval, early stop) --------
-    N                 = target_trajectories.shape[0]
-    joint_N           = (mf + 1) * N
-    best_avg_reward   = 0.0
-    best_success_rate = 0.0
-    best_model        = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count        = 0
-
-    do_validation = val_period > 0 and val_trials > 0
-    env_settings_all, val_params = (None, None)
-    if do_validation:
-        env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    try:
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)          # (N, T, dof)
-        environment_parameters = environment_parameters.to(device)    # (N, param_len)
-
-        for epoch in tqdm(range(1, max_epochs + 1), desc=f"DGFM_mf{mf} Training", unit="epoch"):
-            model.train()
-
-            perm_t = torch.randperm(X_np.shape[0], device=device)
-
-            # ===== Build joint interpolants =====
-            XT, TIN, VT, CT = build_joint_interpolants(
-                X_train=target_trajectories,
-                C_train=environment_parameters,
-                perm_t=perm_t,      # pass block directly
-                M=N,
-                mf=mf,
-                mixture_sampler=mixture_sampler,
-                inv_cluster=inv_cluster,
-                n_t_global=n_t_global,
-                n_t_local=n_t_local,
-                seq_len=seq_len,
-                dof=dof,
-                param_len=param_len,
-                device=device
-            )
-
-            # ===== Batched training =====
-            loss_sum = 0.0
-            for i in range(0, joint_N, batch_size):
-                m    = min(batch_size, joint_N - i)
-
-                xb   = XT[i:i+batch_size]
-                tb   = TIN[i:i+batch_size]
-                vb   = VT[i:i+batch_size]
-                cb   = CT[i:i+batch_size]
-
-                with torch.enable_grad():
-                    pred   = model(xb, tb, cb)
-                    sq_err = (pred - vb) ** 2
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-                    loss   = sq_err.mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
-
-                    loss_sum += float(loss.item())
-
-            if scheduler is not None:
-                scheduler.step()
-
-            # ===== Validation / early stopping =====
-            if do_validation and epoch % val_period == 0:
-                model.eval()
-                success_rate, avg_reward = eval_model(model, VectorField, task_name, seq_len, dof, param_len, gripper_idx, val_params, env_settings_all, device, trials=val_trials)
-                
-                if not torch.is_grad_enabled():
-                    torch.set_grad_enabled(True)
-
-                success_rate_recs[epoch] = {
-                    "success_rate": success_rate,
-                    "avg_reward":   avg_reward,
-                    "loss":         loss_sum / (1+mf),
-                }
-
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                               f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        else:
-                            stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
-                                   f"avg reward={avg_reward:.3f}, loss={loss_sum / (1+mf):.3f}")
-
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    if not success_rate_recs:
-        best_model = copy.deepcopy(model)
-    return best_model, model, success_rate_recs, mixture_sampler
-
-
-
-
 class DGFM(VanillaFM):
     """Dimension-guided FM trainer."""
+
+    path_weight_atol = 1e-5
+
+    def _path_weights(self, t, interpolation_path):
+        if interpolation_path != "piecewise-linear-midpoint":
+            raise ValueError(
+                f"Unsupported DGFM interpolation path '{interpolation_path}'. "
+                "Expected 'piecewise-linear-midpoint'."
+            )
+
+        midpoint = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
+        left = t < midpoint
+        right = t > midpoint
+        mid = ~(left | right)
+
+        a = torch.where(left, 1.0 - 2.0 * t, torch.zeros_like(t))
+        b_left = 2.0 * t
+        b_right = 2.0 - 2.0 * t
+        b = torch.where(left | mid, b_left, b_right)
+        c = torch.where(right, 2.0 * t - 1.0, torch.zeros_like(t))
+
+        a_dot = torch.where(left, -2.0 * torch.ones_like(t), torch.zeros_like(t))
+        b_dot = torch.where(left, 2.0 * torch.ones_like(t), -2.0 * torch.ones_like(t))
+        c_dot = torch.where(right, 2.0 * torch.ones_like(t), torch.zeros_like(t))
+
+        a_dot = torch.where(mid, -1.0 * torch.ones_like(t), a_dot)
+        b_dot = torch.where(mid, torch.zeros_like(t), b_dot)
+        c_dot = torch.where(mid, torch.ones_like(t), c_dot)
+        self._check_path_partition(a, b, c)
+        return a, b, c, a_dot, b_dot, c_dot
+
+    def _check_path_partition(self, a, b, c):
+        err = torch.max(torch.abs(a + b + c - 1.0)).item()
+        if err > self.path_weight_atol:
+            raise ValueError(
+                f"DGFM path weights must sum to 1; max |a+b+c-1|={err:.3e}"
+            )
+
+    def _sample_covering_clusters(self, idx, inv_cluster, cluster_sizes):
+        """Choose one covering cluster per sample, weighted by raw cluster size."""
+        choices = []
+        idx_cpu = idx.detach().cpu().tolist()
+        for i in idx_cpu:
+            covering = inv_cluster[i]
+            if not covering:
+                raise ValueError(f"Training sample {i} is not covered by any DGFM cluster")
+            weights = np.asarray([cluster_sizes[k] for k in covering], dtype=np.float64)
+            weights = weights / weights.sum()
+            choices.append(np.random.choice(covering, p=weights))
+        return torch.tensor(choices, dtype=torch.long, device=self.device)
+
+    def _build_joint_interpolants(
+        self,
+        target_trajectories,
+        conditions,
+        perm_t,
+        mixture_sampler,
+        inv_cluster,
+        cluster_sizes,
+        n_t,
+        interpolation_path,
+    ):
+        """Build DGFM interpolants along x_t = a(t)z + b(t)y + c(t)x."""
+        idx = perm_t[:target_trajectories.shape[0]]
+        x = target_trajectories[idx]
+        c = conditions[idx, :]
+        m = x.shape[0]
+
+        z = torch.randn(m, self.horizon, self.dof, device=self.device)
+        pis = self._sample_covering_clusters(idx, inv_cluster, cluster_sizes)
+        y_flat, _, _ = mixture_sampler.sample_cond(c, truncated=True, pis=pis)
+        y = y_flat.reshape(m, self.horizon, self.dof)
+
+        t = self.sample_t(m * n_t)
+        xr = x.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+        yr = y.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+        zr = z.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+        cr = c.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
+
+        a, b, cc, a_dot, b_dot, c_dot = self._path_weights(t, interpolation_path)
+        xt = a.view(-1, 1, 1) * zr + b.view(-1, 1, 1) * yr + cc.view(-1, 1, 1) * xr
+        vt = (
+            a_dot.view(-1, 1, 1) * zr
+            + b_dot.view(-1, 1, 1) * yr
+            + c_dot.view(-1, 1, 1) * xr
+        )
+
+        perm = torch.randperm(xt.shape[0], device=self.device)
+        return xt[perm], t[perm], vt[perm], cr[perm]
 
     def train(
         self,
         target_trajectories,
         conditions,
         *,
-        mf: int,
-        n_t_local: int,
-        n_t_global: int,
+        n_t: int,
         cluster_size: int,
         cluster_d: int,
         max_epochs: int,
         batch_size: int,
+        interpolation_path: str = "piecewise-linear-midpoint",
         val_period: int = 5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
         scale_x: float = 1.0,
         scale_c: float = 1.0,
         val_trials: int = 25,
+        mf: int | None = None,
+        n_t_local: int | None = None,
+        n_t_global: int | None = None,
     ):
-        return train_DGFM(
-            model=self.model,
-            optimizer=self.optimizer,
-            scheduler=self.scheduler,
-            task_name=self.task_name,
-            target_trajectories=target_trajectories,
-            environment_parameters=conditions,
-            seq_len=self.horizon,
-            dof=self.dof,
-            param_len=self.condition_dim,
-            gripper_idx=self.gripper_idx,
-            mf=mf,
-            n_t_local=n_t_local,
-            n_t_global=n_t_global,
-            cluster_size=cluster_size,
-            cluster_d=cluster_d,
-            max_epochs=max_epochs,
-            batch_size=batch_size,
-            device=self.device,
-            val_period=val_period,
-            early_stopping=early_stopping,
-            stop_criteria=stop_criteria,
-            scale_x=scale_x,
-            scale_c=scale_c,
-            val_trials=val_trials,
+        if mf is not None or n_t_local is not None or n_t_global is not None:
+            print("[DGFM] Ignoring deprecated mf/n_t_local/n_t_global; using n_t only.")
+
+        print("Clustering dataset . . .")
+        X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)
+        C_np = conditions.detach().cpu().numpy()
+
+        clusters, inv_cluster = cluster_points_joint(
+            X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
+            standardize=True, scale_x=scale_x, scale_c=scale_c
         )
+        cluster_sizes = np.asarray([len(c) for c in clusters], dtype=np.float64)
+
+        print(f"{len(clusters)} clusters made! Applying PCA . . .")
+        mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
+            X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
+            max_pca_samples=2000, n_jobs=-1
+        )
+
+        mixture_sampler = MixtureSampler(
+            mu_x, mu_c, B, Szz, Szc, Scc, weights, device=self.device, reg=1e-6, orth_sigma=0.0
+        )
+
+        N = target_trajectories.shape[0]
+        joint_N = N * n_t
+        best_avg_reward = 0.0
+        best_success_rate = 0.0
+        best_model = copy.deepcopy(self.model)
+        success_rate_recs = {}
+        stop_count = 0
+
+        do_validation = val_period > 0 and val_trials > 0
+        env_settings_all, val_params = (None, None)
+        if do_validation:
+            env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
+
+        try:
+            self.model = self.model.to(self.device)
+            target_trajectories = target_trajectories.to(self.device)
+            conditions = conditions.to(self.device)
+
+            for epoch in tqdm(range(1, max_epochs + 1), desc="DGFM Training", unit="epoch"):
+                self.model.train()
+                perm_t = torch.randperm(N, device=self.device)
+
+                XT, TIN, VT, CT = self._build_joint_interpolants(
+                    target_trajectories=target_trajectories,
+                    conditions=conditions,
+                    perm_t=perm_t,
+                    mixture_sampler=mixture_sampler,
+                    inv_cluster=inv_cluster,
+                    cluster_sizes=cluster_sizes,
+                    n_t=n_t,
+                    interpolation_path=interpolation_path,
+                )
+
+                loss_sum = 0.0
+                batch_count = 0
+                for i in range(0, joint_N, batch_size):
+                    xb = XT[i:i + batch_size]
+                    tb = TIN[i:i + batch_size]
+                    vb = VT[i:i + batch_size]
+                    cb = CT[i:i + batch_size]
+
+                    with torch.enable_grad():
+                        pred = self.model(xb, tb, cb)
+                        sq_err = (pred - vb) ** 2
+                        if hasattr(self.model, "loss_mask") and self.model.loss_mask is not None:
+                            sq_err = sq_err * self.model.loss_mask
+                        loss = sq_err.mean()
+
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
+
+                        loss_sum += float(loss.item())
+                        batch_count += 1
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                avg_loss = loss_sum / max(1, batch_count)
+                if do_validation and epoch % val_period == 0:
+                    self.model.eval()
+                    success_rate, avg_reward = eval_model(
+                        self.model, VectorField, self.task_name, self.horizon, self.dof,
+                        self.condition_dim, self.gripper_idx, val_params,
+                        env_settings_all, self.device, trials=val_trials
+                    )
+
+                    if not torch.is_grad_enabled():
+                        torch.set_grad_enabled(True)
+
+                    success_rate_recs[epoch] = {
+                        "success_rate": success_rate,
+                        "avg_reward": avg_reward,
+                        "loss": avg_loss,
+                    }
+
+                    if success_rate < best_success_rate:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                   f"avg reward={avg_reward:.3f}, loss={avg_loss:.3f}")
+                        if early_stopping:
+                            if stop_count == stop_criteria:
+                                tqdm.write("Early stopping triggered.")
+                                break
+                            stop_count += 1
+                    else:
+                        if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                            best_avg_reward = avg_reward
+                            best_success_rate = success_rate
+                            best_model = copy.deepcopy(self.model)
+                            stop_count = 0
+                            tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                       f"avg reward={avg_reward:.3f}, loss={avg_loss:.3f} | Best model saved")
+                        else:
+                            tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, "
+                                       f"avg reward={avg_reward:.3f}, loss={avg_loss:.3f}")
+
+        except KeyboardInterrupt:
+            tqdm.write("Training interrupted by user. Returning best model so far...")
+
+        if not success_rate_recs:
+            best_model = copy.deepcopy(self.model)
+        return best_model, self.model, success_rate_recs, mixture_sampler
+

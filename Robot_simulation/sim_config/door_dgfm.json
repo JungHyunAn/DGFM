@@ -1,0 +1,22 @@
+{
+  "FM_type": "DGFM",
+  "N": 20,
+  "task_name": "door",
+  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
+  "device": "cuda",
+  "n_t": 1,
+  "max_epochs": 4500,
+  "batch_size": 500,
+  "warmup_steps": 600,
+  "val_period": 300,
+  "val_trials": 10,
+  "stop_criteria": 3,
+  "evaluation_samples": 100,
+  "horizon": 32,
+  "window_stride": 1,
+  "max_policy_steps": 20,
+  "early_stopping": false,
+  "seed": 1000,
+  "time_sampling": "uniform",
+  "interpolation_path": "piecewise-linear-midpoint"
+}
