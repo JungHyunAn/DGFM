@@ -276,31 +276,53 @@ def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
     return merged_clusters, inv_cluster
 
 
-def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples):
-    """Compute per-cluster low-rank stats on X and full stats on C.
+def _pad_basis_to_rank(Bx, target_rank, Dx):
+    """Pad a basis with deterministic orthonormal-ish fallback axes."""
+    if Bx.shape[1] >= target_rank:
+        return Bx[:, :target_rank].astype(np.float32, copy=False)
 
-    Workflow:
-      - Joint outlier filter using empirical covariance of [X|C].
-      - PCA basis `B_x` on X only (rank = `d_x`), robust to degeneracy.
-      - Covariances: Σ_zz from projected coordinates, Σ_cc full, Σ_zc cross.
+    cols = [Bx[:, j].astype(np.float32, copy=False) for j in range(Bx.shape[1])]
+    for j in range(Dx):
+        if len(cols) >= target_rank:
+            break
+        v = np.zeros(Dx, dtype=np.float32)
+        v[j] = 1.0
+        for q in cols:
+            v = v - np.dot(q, v) * q
+        norm = np.linalg.norm(v)
+        if norm > 1e-6:
+            cols.append(v / norm)
 
-    Args:
-        X: (N, Dx) flattened trajectories for all points.
-        C: (N, Dc) environment parameters for all points.
-        idx: Iterable of indices belonging to this cluster.
-        d_x: Target rank for the low-rank basis on X.
-        eps: Numerical regularization for covariances.
-        chi2_thresh: Chi-square quantile for joint outlier removal in [X|C].
-        max_pca_samples: Subsample size cap for PCA fit for speed.
+    while len(cols) < target_rank:
+        v = np.zeros(Dx, dtype=np.float32)
+        v[len(cols) % Dx] = 1.0
+        cols.append(v)
 
-    Returns:
-        mu_x: (Dx,) mean of X in cluster (after outlier filter).
-        mu_c: (Dc,) mean of C in cluster.
-        Bx: (Dx, d_x) low-rank basis for X.
-        Sig_zz: (d_x, d_x) covariance in latent space.
-        Sig_zc: (d_x, Dc) cross-covariance between latent z and C.
-        Sig_cc: (Dc, Dc) covariance of C.
-        weight: Relative cluster weight (#inliers / N).
+    return np.stack(cols, axis=1).astype(np.float32, copy=False)
+
+
+def _pad_square(mat, target_rank, eps):
+    out = np.zeros((target_rank, target_rank), dtype=np.float32)
+    r = mat.shape[0]
+    out[:r, :r] = mat
+    if r < target_rank:
+        out[r:, r:] = eps * np.eye(target_rank - r, dtype=np.float32)
+    return out
+
+
+def _pad_rows(mat, target_rank):
+    out = np.zeros((target_rank, mat.shape[1]), dtype=np.float32)
+    out[:mat.shape[0], :] = mat
+    return out
+
+
+def _process_one_cluster_joint(X, C, idx, min_d_x, eps, chi2_thresh, max_pca_samples):
+    """Compute per-cluster full PCA stats on X and full stats on C.
+
+    The fitted PCA basis keeps every available principal axis for the cluster.
+    `min_d_x` is only used as a minimum fallback rank when the cluster is
+    degenerate or numerically low-rank; final rank selection happens globally in
+    `compute_cluster_pca_fast_joint`.
     """
     Xi = X[idx]         # (S, Dx)
     Ci = C[idx]         # (S, Dc)
@@ -318,7 +340,7 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
     mask = dists <= chi2_thresh
     Xi_c = Xi[mask]
     Ci_c = Ci[mask]
-    if Xi_c.shape[0] < max(5, d_x + 1):    # fallback if too few inliers
+    if Xi_c.shape[0] < max(5, min_d_x + 1):    # fallback if too few inliers
         Xi_c, Ci_c = Xi, Ci
 
     # Subsample for PCA if huge
@@ -329,100 +351,68 @@ def _process_one_cluster_joint(X, C, idx, d_x, eps, chi2_thresh, max_pca_samples
     else:
         Xp = Xi_c
 
-    # --- 2) PCA on X only (robust) ---
-    # center and check variance
+    # --- 2) PCA on X only (robust), keeping all available components ---
     Xp0 = Xp - Xp.mean(axis=0, keepdims=True)
     col_var = Xp0.var(axis=0)                  # (Dx,)
     total_var = float(col_var.sum())
+    min_rank = min(min_d_x, Dx)
 
     if total_var <= 1e-12 or Xp.shape[0] < 2:
-        # Degenerate cluster: no usable variance. Use a fixed fallback basis.
         print("Degenerate cluster!")
-        n_comp = min(d_x, Dx)
-        Bx = np.zeros((Dx, n_comp), dtype=np.float32)
-        for j in range(n_comp):
-            Bx[j, j] = 1.0                    # first n_comp standard basis vectors
+        Bx = np.zeros((Dx, min_rank), dtype=np.float32)
+        for j in range(min_rank):
+            Bx[j, j] = 1.0
+        eigvals = np.zeros(min_rank, dtype=np.float32)
     else:
-        # Keep only nonzero-variance columns for the fit
         keep = col_var > 1e-12
         Xp_red = Xp0[:, keep]
         Dx_red = int(keep.sum())
 
         if Dx_red == 0:
-            # All columns were zero-variance after centering
-            n_comp = min(d_x, Dx)
-            Bx = np.zeros((Dx, n_comp), dtype=np.float32)
-            for j in range(n_comp):
+            Bx = np.zeros((Dx, min_rank), dtype=np.float32)
+            for j in range(min_rank):
                 Bx[j, j] = 1.0
+            eigvals = np.zeros(min_rank, dtype=np.float32)
         else:
-            # Limit components to numeric rank to avoid over-asking
-            n_comp = int(min(d_x, Dx_red, max(1, Xp_red.shape[0] - 1)))
-
-            # For small / ill-conditioned batches, SVD is very stable:
-            # U, S, Vt = np.linalg.svd(Xp_red, full_matrices=False)
-            # B_red = Vt[:n_comp].T
-
+            n_comp = int(min(Dx_red, max(1, Xp_red.shape[0] - 1)))
             ipca = IncrementalPCA(n_components=n_comp, batch_size=min(1024, Xp_red.shape[0]), whiten=False)
-            ipca.fit(Xp_red)                   # denominator > 0 now -> no warning
+            ipca.fit(Xp_red)
             B_red = ipca.components_.T         # (Dx_red, n_comp)
 
-            # Lift back to full Dx by inserting zeros at dropped columns
             Bx = np.zeros((Dx, n_comp), dtype=np.float32)
             Bx[keep, :] = B_red
+            eigvals = ipca.explained_variance_.astype(np.float32, copy=False)
 
-    # pad with orthonormal columns in the complement subspace:
-    if Bx.shape[1] < d_x:
-        print(f"Missing {d_x - Bx.shape[1]} axes")
-        k = d_x - Bx.shape[1]
-        pad = np.zeros((Dx, k), dtype=np.float32)
-        for j in range(k):
-            # simple, deterministic padding with standard basis not already used
-            col = (Bx.shape[1] + j) % Dx
-            pad[col, j] = 1.0
-        Bx = np.concatenate([Bx, pad], axis=1)
+            if Bx.shape[1] < min_rank:
+                print(f"Missing {min_rank - Bx.shape[1]} minimum axes")
+                Bx = _pad_basis_to_rank(Bx, min_rank, Dx)
+                eigvals = np.pad(eigvals, (0, min_rank - eigvals.shape[0]))
 
-    # --- 3) reduced z and C stats (means, covs, cross-covs) ---
+    # --- 3) full reduced z and C stats (means, covs, cross-covs) ---
     mu_x = Xi_c.mean(axis=0)           # (Dx,)
     mu_c = Ci_c.mean(axis=0)           # (Dc,)
-    Zc   = (Xi_c - mu_x) @ Bx          # (S_in, d_x)
+    Zc   = (Xi_c - mu_x) @ Bx          # (S_in, full_d_x)
     Cc   = (Ci_c - mu_c)               # (S_in, Dc)
 
     denom = max(1, Zc.shape[0] - 1)
-    # Σ_zz from the projected cloud; more robust than just diag(var)
-    Sig_zz = (Zc.T @ Zc) / denom                       # (d_x, d_x)
-    # ensure SPD
-    Sig_zz = Sig_zz + eps * np.eye(Sig_zz.shape[0])
+    Sig_zz = (Zc.T @ Zc) / denom + eps * np.eye(Zc.shape[1])
+    Sig_cc = (Cc.T @ Cc) / denom + eps * np.eye(Dc)
+    Sig_zc = (Zc.T @ Cc) / denom
 
-    Sig_cc = (Cc.T @ Cc) / denom + eps * np.eye(Dc)    # (Dc, Dc)
-    Sig_zc = (Zc.T @ Cc) / denom                       # (d_x, Dc)
-
-    # cluster weight
     weight = Xi_c.shape[0] / X.shape[0]
 
-    return mu_x, mu_c, Bx, Sig_zz, Sig_zc, Sig_cc, weight
+    return mu_x, mu_c, Bx, eigvals, Sig_zz, Sig_zc, Sig_cc, weight
+
+
 def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
                                    eps=1e-3, outlier_q=0.9,
                                    max_pca_samples=2000, n_jobs=-1):
     """Parallel per-cluster statistics for DGFM.
 
-    Args:
-        X: (N, Dx) flattened trajectories.
-        C: (N, Dc) environment parameters.
-        clusters: Iterable of sets/iterables with point indices per cluster.
-        d_x: Target rank for the X basis per cluster.
-        eps: Numerical regularization for covariances.
-        outlier_q: Quantile (0..1) for joint [X|C] chi-square outlier cutoff.
-        max_pca_samples: Cap on samples used to fit PCA for speed.
-        n_jobs: Joblib parallel workers (-1 uses all cores).
-
-    Returns:
-        mu_x: (K, Dx)
-        mu_c: (K, Dc)
-        B: (K, Dx, d_x)
-        Sig_zz: (K, d_x, d_x)
-        Sig_zc: (K, d_x, Dc)
-        Sig_cc: (K, Dc, Dc)
-        weights: (K,) mixture weights
+    Each cluster first fits its full available PCA basis. A global eta threshold
+    is then set to the largest cumulative explained-variance ratio of the top
+    `d_x` components across clusters. Every cluster keeps enough leading axes to
+    reach that eta, with `d_x` as the minimum kept rank.
     """
     N, Dx = X.shape
     Dc = C.shape[1]
@@ -435,13 +425,53 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
         ) for c in clusters
     )
 
-    mu_x, mu_c, B_list, Sig_zz, Sig_zc, Sig_cc, weights = zip(*results)
-    # Stack
+    mu_x, mu_c, B_full, eigvals, Sig_zz_full, Sig_zc_full, Sig_cc, weights = zip(*results)
+
+    eta_candidates = []
+    for vals in eigvals:
+        vals = np.asarray(vals, dtype=np.float64)
+        total = float(vals.sum())
+        if total <= 1e-12:
+            continue
+        top = vals[:min(d_x, vals.shape[0])].sum()
+        eta_candidates.append(float(top / total))
+    eta = min(1.0, max(eta_candidates)) if eta_candidates else 1.0
+
+    ranks = []
+    for vals in eigvals:
+        vals = np.asarray(vals, dtype=np.float64)
+        total = float(vals.sum())
+        if total <= 1e-12:
+            rank = min(d_x, vals.shape[0])
+        else:
+            cumulative = np.cumsum(vals) / total
+            rank = int(np.searchsorted(cumulative, eta, side="left") + 1)
+            rank = min(rank, vals.shape[0])
+        ranks.append(max(d_x, rank))
+
+    packed_d = max(ranks) if ranks else d_x
+    print(
+        f"[DGFM] Global PCA eta={eta:.4f}; keeping {min(ranks)}-{max(ranks)} "
+        f"axes per cluster (packed rank={packed_d})."
+    )
+
+    B_list = []
+    Sig_zz = []
+    Sig_zc = []
+    for Bx, szz, szc, rank in zip(B_full, Sig_zz_full, Sig_zc_full, ranks):
+        B_keep = _pad_basis_to_rank(Bx[:, :min(rank, Bx.shape[1])], rank, Dx)
+        szz_keep = szz[:min(rank, szz.shape[0]), :min(rank, szz.shape[0])]
+        szc_keep = szc[:min(rank, szc.shape[0]), :]
+
+        B_list.append(_pad_basis_to_rank(B_keep, packed_d, Dx))
+        Sig_zz.append(_pad_square(szz_keep, packed_d, eps))
+        Sig_zc.append(_pad_rows(szc_keep, packed_d))
+
     mu_x  = np.vstack(mu_x)                       # (K, Dx)
     mu_c  = np.vstack(mu_c)                       # (K, Dc)
-    B     = np.stack(B_list, axis=0)              # (K, Dx, d_x)
-    Sig_zz = np.stack(Sig_zz, axis=0)             # (K, d_x, d_x)
-    Sig_zc = np.stack(Sig_zc, axis=0)             # (K, d_x, Dc)
+    B     = np.stack(B_list, axis=0)              # (K, Dx, packed_d)
+    Sig_zz = np.stack(Sig_zz, axis=0)             # (K, packed_d, packed_d)
+    Sig_zc = np.stack(Sig_zc, axis=0)             # (K, packed_d, Dc)
     Sig_cc = np.stack(Sig_cc, axis=0)             # (K, Dc, Dc)
     weights = np.array(weights, dtype=np.float32) # (K,)
     return mu_x, mu_c, B, Sig_zz, Sig_zc, Sig_cc, weights
@@ -510,6 +540,9 @@ class DGFM(VanillaFM):
         cluster_sizes,
         n_t,
         interpolation_path,
+        dgfm_truncated=True,
+        dgfm_trunc_low=-1.5,
+        dgfm_trunc_high=1.5,
     ):
         """Build DGFM interpolants along x_t = a(t)z + b(t)y + c(t)x."""
         idx = perm_t[:target_trajectories.shape[0]]
@@ -519,7 +552,12 @@ class DGFM(VanillaFM):
 
         z = torch.randn(m, self.horizon, self.dof, device=self.device)
         pis = self._sample_covering_clusters(idx, inv_cluster, cluster_sizes)
-        y_flat, _, _ = mixture_sampler.sample_cond(c, truncated=True, pis=pis)
+        y_flat, _, _ = mixture_sampler.sample_cond(
+            c,
+            truncated=dgfm_truncated,
+            trunc=(dgfm_trunc_low, dgfm_trunc_high),
+            pis=pis,
+        )
         y = y_flat.reshape(m, self.horizon, self.dof)
 
         t = self.sample_t(m * n_t)
@@ -559,28 +597,54 @@ class DGFM(VanillaFM):
         mf: int | None = None,
         n_t_local: int | None = None,
         n_t_global: int | None = None,
+        cluster_jaccard_thresh: float = 0.8,
+        cluster_merge_k: int = 10,
+        cluster_standardize: bool = True,
+        cluster_eps: float = 1e-3,
+        cluster_outlier_q: float = 0.9,
+        max_pca_samples: int = 2000,
+        pca_n_jobs: int = -1,
+        mixture_reg: float = 1e-6,
+        mixture_orth_sigma: float = 0.0,
+        dgfm_truncated: bool = True,
+        dgfm_trunc_low: float = -1.5,
+        dgfm_trunc_high: float = 1.5,
     ):
         if mf is not None or n_t_local is not None or n_t_global is not None:
             print("[DGFM] Ignoring deprecated mf/n_t_local/n_t_global; using n_t only.")
+        if max_pca_samples <= 0:
+            raise ValueError(f"max_pca_samples must be positive, got {max_pca_samples}")
+        if cluster_merge_k <= 0:
+            raise ValueError(f"cluster_merge_k must be positive, got {cluster_merge_k}")
+        if not 0.0 < cluster_outlier_q < 1.0:
+            raise ValueError(f"cluster_outlier_q must be in (0, 1), got {cluster_outlier_q}")
+        if dgfm_trunc_low >= dgfm_trunc_high:
+            raise ValueError(
+                f"dgfm_trunc_low must be smaller than dgfm_trunc_high, "
+                f"got {dgfm_trunc_low} >= {dgfm_trunc_high}"
+            )
 
         print("Clustering dataset . . .")
         X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)
         C_np = conditions.detach().cpu().numpy()
 
         clusters, inv_cluster = cluster_points_joint(
-            X_np, C_np, m=cluster_size, jaccard_thresh=0.8, merge_k=10,
-            standardize=True, scale_x=scale_x, scale_c=scale_c
+            X_np, C_np, m=cluster_size, jaccard_thresh=cluster_jaccard_thresh,
+            merge_k=cluster_merge_k, standardize=cluster_standardize,
+            scale_x=scale_x, scale_c=scale_c
         )
         cluster_sizes = np.asarray([len(c) for c in clusters], dtype=np.float64)
 
         print(f"{len(clusters)} clusters made! Applying PCA . . .")
         mu_x, mu_c, B, Szz, Szc, Scc, weights = compute_cluster_pca_fast_joint(
-            X_np, C_np, clusters, d_x=cluster_d, eps=1e-3, outlier_q=0.9,
-            max_pca_samples=2000, n_jobs=-1
+            X_np, C_np, clusters, d_x=cluster_d, eps=cluster_eps,
+            outlier_q=cluster_outlier_q, max_pca_samples=max_pca_samples,
+            n_jobs=pca_n_jobs
         )
 
         mixture_sampler = MixtureSampler(
-            mu_x, mu_c, B, Szz, Szc, Scc, weights, device=self.device, reg=1e-6, orth_sigma=0.0
+            mu_x, mu_c, B, Szz, Szc, Scc, weights, device=self.device,
+            reg=mixture_reg, orth_sigma=mixture_orth_sigma
         )
 
         N = target_trajectories.shape[0]
@@ -614,6 +678,9 @@ class DGFM(VanillaFM):
                     cluster_sizes=cluster_sizes,
                     n_t=n_t,
                     interpolation_path=interpolation_path,
+                    dgfm_truncated=dgfm_truncated,
+                    dgfm_trunc_low=dgfm_trunc_low,
+                    dgfm_trunc_high=dgfm_trunc_high,
                 )
 
                 loss_sum = 0.0

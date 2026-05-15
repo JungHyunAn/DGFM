@@ -254,6 +254,23 @@ def train_and_eval_FM(
     horizon: int = 32,
     window_stride: int = 1,
     max_policy_steps: int = 20,
+    cluster_partition: int = 5,
+    cluster_jaccard_thresh: float = 0.8,
+    cluster_merge_k: int = 10,
+    cluster_standardize: bool = True,
+    cluster_scale_x: float = 1.0,
+    cluster_scale_c: float = 1.0,
+    cluster_eps: float = 1e-3,
+    cluster_outlier_q: float = 0.9,
+    max_pca_samples: int = 2000,
+    pca_n_jobs: int = -1,
+    learning_rate: float = 1e-4,
+    weight_decay: float = 1e-6,
+    mixture_reg: float = 1e-6,
+    mixture_orth_sigma: float = 0.0,
+    dgfm_truncated: bool = True,
+    dgfm_trunc_low: float = -1.5,
+    dgfm_trunc_high: float = 1.5,
 ):
     flow_class_map = {
         "UniformFM": UniformFM,
@@ -341,14 +358,15 @@ def train_and_eval_FM(
         f"FM_type={FM_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
         f"horizon_arg={horizon} | window_stride={window_stride} | "
-        f"max_policy_steps={max_policy_steps} | "
+        f"max_policy_steps={max_policy_steps} | cluster_partition={cluster_partition} | "
+        f"learning_rate={learning_rate} | weight_decay={weight_decay} | "
         f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"seed={seed} | device={device}"
     )
     model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-6)
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         warmup_epochs=warmup_steps,
@@ -382,23 +400,24 @@ def train_and_eval_FM(
         cluster_size = None
 
         if FM_type == "DGFM":
+            if cluster_partition <= 0:
+                raise ValueError(f"cluster_partition must be positive, got {cluster_partition}")
+
+            full_dimension = seq_len * dof
             if task_name == "door":
-                cluster_d = seq_len * 2 + 3 # 53 | end effector stays on 1-dimension path + env_params
-                cluster_size = max(int(train_N/5), cluster_d + 5)
+                cluster_d = seq_len * 2 + param_len # end effector stays on 1-dimension path + env_params
             elif task_name == "wipe":
                 cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
-                cluster_size = max(int(train_N/5), cluster_d + 5)
             elif task_name == "two_arm":
                 # cluster_d = seq_len * 6 + 3 # 153 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
                 cluster_d = seq_len * 3 + 3 # 78
-                cluster_size = max(int(train_N/5), cluster_d + 5)
             elif task_name == "nut":
                 cluster_d = int(seq_len * 3.2)  # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
                                                 #      for the rest 0.6 portion, end effector stays on 1=dimension path
-                cluster_size = max(int(train_N/5), cluster_d + 5)
             else:
                 cluster_d = None
-                cluster_size = None
+
+            cluster_size = max(int(train_N/cluster_partition), full_dimension + 5) if cluster_d is not None else None
 
             best_model, last_model, recs, mixture_sampler = flow.train(
                 target_trajectories=target_trajectories,
@@ -409,6 +428,20 @@ def train_and_eval_FM(
                 max_epochs=max_epochs,
                 batch_size=batch_size,
                 interpolation_path=interpolation_path,
+                scale_x=cluster_scale_x,
+                scale_c=cluster_scale_c,
+                cluster_jaccard_thresh=cluster_jaccard_thresh,
+                cluster_merge_k=cluster_merge_k,
+                cluster_standardize=cluster_standardize,
+                cluster_eps=cluster_eps,
+                cluster_outlier_q=cluster_outlier_q,
+                max_pca_samples=max_pca_samples,
+                pca_n_jobs=pca_n_jobs,
+                mixture_reg=mixture_reg,
+                mixture_orth_sigma=mixture_orth_sigma,
+                dgfm_truncated=dgfm_truncated,
+                dgfm_trunc_low=dgfm_trunc_low,
+                dgfm_trunc_high=dgfm_trunc_high,
                 val_period=val_period,
                 early_stopping=early_stopping,
                 stop_criteria=stop_criteria,
@@ -499,8 +532,26 @@ def train_and_eval_FM(
             "beta_b":          beta_b,
             "interpolation_path": interpolation_path if FM_type == "DGFM" else None,
             "mf":              None,
+            "learning_rate":   learning_rate,
+            "weight_decay":    weight_decay,
             "cluster_d":       cluster_d if FM_type == "DGFM" else None,
+            "cluster_partition": cluster_partition if FM_type == "DGFM" else None,
+            "full_dimension":  seq_len * dof if FM_type == "DGFM" else None,
             "cluster_size":    cluster_size if FM_type == "DGFM" else None,
+            "cluster_jaccard_thresh": cluster_jaccard_thresh if FM_type == "DGFM" else None,
+            "cluster_merge_k": cluster_merge_k if FM_type == "DGFM" else None,
+            "cluster_standardize": cluster_standardize if FM_type == "DGFM" else None,
+            "cluster_scale_x": cluster_scale_x if FM_type == "DGFM" else None,
+            "cluster_scale_c": cluster_scale_c if FM_type == "DGFM" else None,
+            "cluster_eps":     cluster_eps if FM_type == "DGFM" else None,
+            "cluster_outlier_q": cluster_outlier_q if FM_type == "DGFM" else None,
+            "max_pca_samples": max_pca_samples if FM_type == "DGFM" else None,
+            "pca_n_jobs":      pca_n_jobs if FM_type == "DGFM" else None,
+            "mixture_reg":     mixture_reg if FM_type == "DGFM" else None,
+            "mixture_orth_sigma": mixture_orth_sigma if FM_type == "DGFM" else None,
+            "dgfm_truncated":  dgfm_truncated if FM_type == "DGFM" else None,
+            "dgfm_trunc_low":  dgfm_trunc_low if FM_type == "DGFM" else None,
+            "dgfm_trunc_high": dgfm_trunc_high if FM_type == "DGFM" else None,
             "n_t_global":      None,
             "n_t_local":       None,
             "maximum epoch":   max_epochs,
@@ -608,6 +659,23 @@ if __name__ == "__main__":
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--window_stride", type=int, default=1)
     parser.add_argument("--max_policy_steps", type=int, default=20)
+    parser.add_argument("--cluster_partition", type=int, default=5)
+    parser.add_argument("--cluster_jaccard_thresh", type=float, default=0.8)
+    parser.add_argument("--cluster_merge_k", type=int, default=10)
+    parser.add_argument("--cluster_standardize", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cluster_scale_x", type=float, default=1.0)
+    parser.add_argument("--cluster_scale_c", type=float, default=1.0)
+    parser.add_argument("--cluster_eps", type=float, default=1e-3)
+    parser.add_argument("--cluster_outlier_q", type=float, default=0.9)
+    parser.add_argument("--max_pca_samples", type=int, default=2000)
+    parser.add_argument("--pca_n_jobs", type=int, default=-1)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-6)
+    parser.add_argument("--mixture_reg", type=float, default=1e-6)
+    parser.add_argument("--mixture_orth_sigma", type=float, default=0.0)
+    parser.add_argument("--dgfm_truncated", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dgfm_trunc_low", type=float, default=-1.5)
+    parser.add_argument("--dgfm_trunc_high", type=float, default=1.5)
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
 
@@ -660,4 +728,21 @@ if __name__ == "__main__":
         horizon            = args.horizon,
         window_stride      = args.window_stride,
         max_policy_steps   = args.max_policy_steps,
+        cluster_partition  = args.cluster_partition,
+        cluster_jaccard_thresh = args.cluster_jaccard_thresh,
+        cluster_merge_k    = args.cluster_merge_k,
+        cluster_standardize = args.cluster_standardize,
+        cluster_scale_x    = args.cluster_scale_x,
+        cluster_scale_c    = args.cluster_scale_c,
+        cluster_eps        = args.cluster_eps,
+        cluster_outlier_q  = args.cluster_outlier_q,
+        max_pca_samples    = args.max_pca_samples,
+        pca_n_jobs         = args.pca_n_jobs,
+        learning_rate      = args.learning_rate,
+        weight_decay       = args.weight_decay,
+        mixture_reg        = args.mixture_reg,
+        mixture_orth_sigma = args.mixture_orth_sigma,
+        dgfm_truncated     = args.dgfm_truncated,
+        dgfm_trunc_low     = args.dgfm_trunc_low,
+        dgfm_trunc_high    = args.dgfm_trunc_high,
     )
