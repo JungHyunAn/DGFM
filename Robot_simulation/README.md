@@ -21,7 +21,7 @@ heuristic_{task_name}.py
 To generate a dataset, run ```bash Robot_simulation.generate_data``` as the following command from the **project root**:
 
 ```bash
-python -m Robot_simulation.generate_data --n 10000 --task_name door --render --num_workers 10 --verbose
+python -m Robot_simulation.generate_data --n 1000 --task_name door --render --num_workers 10 --verbose
 ```
 
 Each call automatically invokes the corresponding heuristic trajectory generator. Generated datasets are saved to:
