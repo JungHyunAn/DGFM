@@ -62,6 +62,7 @@ def generate_door_trajectory(
 
     # ---------- storage ----------
     q_traj = []
+    gripper_traj = []
     dynamic_traj = []
     frontview_frames = []
 
@@ -98,9 +99,12 @@ def generate_door_trajectory(
     environment_parameters = (handle_pos[0], handle_pos[1], yaw)
 
     # ---------- helper for recording ----------
+    gripper_pose = 1.0
+
     def record_q():
         full = env.sim.data.qpos.copy()
         q_traj.append(full[joint_idx].copy())
+        gripper_traj.append(gripper_pose)
         dynamic_traj.append(get_dynamic_state(env, "door"))
 
     # ---------- begin recording ----------
@@ -119,6 +123,7 @@ def generate_door_trajectory(
         q_handle = quat_multiply(q_rot, q_handle)    
 
     # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
+    gripper_pose = 1.0
     step_towards(env=env,
                  eef_id=eef_id,
                  adim=adim,
@@ -131,6 +136,7 @@ def generate_door_trajectory(
                  frames=frontview_frames,
                  camera_name="frontview")
     # ---------- PHASE1‑2: 50-step careful approach to handle ----------
+    gripper_pose = 1.0
     for _ in range(50):
         a = np.zeros(adim)
         a[0:3] = [0, -0.21, 0]
@@ -142,6 +148,7 @@ def generate_door_trajectory(
             frontview_frames.append(np.flipud(img))
 
     # ---------- PHASE2: 10-step grasping handle ----------
+    gripper_pose = 0.0
     for _ in range(10):
         a = np.zeros(adim); a[6] = 1.0
         env.step(a)
@@ -151,6 +158,7 @@ def generate_door_trajectory(
             frontview_frames.append(np.flipud(img))
 
     # ---------- PHASE3: (open_steps)-step turning handle ----------
+    gripper_pose = 0.0
     angle_total = np.pi/2
     drot_step   = angle_total / open_steps
     rot_axis    = R_handle[:,1] / np.linalg.norm(R_handle[:,1])
@@ -181,6 +189,7 @@ def generate_door_trajectory(
             frontview_frames.append(np.flipud(img))
 
     # ---------- PHASE4: (open_steps)-step pulling door ----------
+    gripper_pose = 0.0
     for _ in range(open_steps):
         a = np.zeros(adim); a[0] = -60/open_steps; a[6] = 1.0
         env.step(a)
@@ -207,6 +216,7 @@ def generate_door_trajectory(
         environment_setting,
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
+        np.asarray(gripper_traj, dtype=np.float32),
     )
 
 
@@ -244,13 +254,14 @@ if __name__ == "__main__":
         control_freq=20,
     )
 
-    traj, success, _, init_qpos, env_state, env_param, dynamic_states = generate_door_trajectory(
+    result = generate_door_trajectory(
         env,
         open_steps=50,
         render=True,
         video_folder="Robot_simulation/videos",
         verbose=True
     )
+    traj, success, _, init_qpos, env_state, env_param, dynamic_states = result[:7]
 
     if success:
         print("Door task success!")

@@ -370,8 +370,9 @@ def worker_generate(
         trials += 1
         # generator now returns (actions, success, frames, initial_qpos)
         result = generator(env, render=save_rendered_images)
-        q_traj, success, frames, init_qpos, environment_setting, env_param, dynamic_states = result
-        q_policy = normalize_policy_trajectory(task_name, q_traj)
+        q_traj, success, frames, init_qpos, environment_setting, env_param, dynamic_states = result[:7]
+        gripper_pose = result[7] if len(result) > 7 else None
+        q_policy = normalize_policy_trajectory(task_name, q_traj, gripper_pose=gripper_pose)
         # print(trials, success)
         if success:
             successes.append({

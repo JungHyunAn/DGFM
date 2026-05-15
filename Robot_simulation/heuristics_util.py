@@ -75,8 +75,19 @@ PANDA_GRIPPER_OPEN_QPOS = 0.04
 def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
     """Map Panda finger qpos to normalized gripper pose: 0 closed, 1 open."""
     gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
-    grip = np.mean(gripper_qpos, axis=-1, keepdims=True)
+    grip = np.mean(np.abs(gripper_qpos), axis=-1, keepdims=True)
     return np.clip(grip / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
+
+
+def _gripper_qpos_trace_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
+    """Normalize a recorded gripper trace by aperture within the episode."""
+    aperture = np.mean(np.abs(np.asarray(gripper_qpos, dtype=np.float32)), axis=-1, keepdims=True)
+    lo = np.min(aperture, axis=0, keepdims=True)
+    hi = np.max(aperture, axis=0, keepdims=True)
+    span = hi - lo
+    if float(np.max(span)) > 1e-6:
+        return np.clip((aperture - lo) / span, 0.0, 1.0).astype(np.float32)
+    return np.clip(aperture / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0).astype(np.float32)
 
 
 def _normalized_gripper_to_action(value) -> float:
@@ -90,7 +101,11 @@ def _normalized_gripper_to_qpos(value) -> np.ndarray:
     return np.full((2,), value * PANDA_GRIPPER_OPEN_QPOS, dtype=np.float32)
 
 
-def normalize_policy_trajectory(task_name: str, q_trace: np.ndarray) -> np.ndarray:
+def normalize_policy_trajectory(
+    task_name: str,
+    q_trace: np.ndarray,
+    gripper_pose: np.ndarray | None = None,
+) -> np.ndarray:
     """Convert raw robot qpos traces to compact policy poses with normalized grippers.
 
     Shapes:
@@ -99,18 +114,34 @@ def normalize_policy_trajectory(task_name: str, q_trace: np.ndarray) -> np.ndarr
       wipe:      raw >=7 -> policy 7 = arm only
     """
     q_trace = np.asarray(q_trace, dtype=np.float32)
+    if gripper_pose is not None:
+        gripper_pose = np.asarray(gripper_pose, dtype=np.float32)
     if task_name in ["door", "nut"]:
         if q_trace.shape[-1] < 9:
             raise ValueError(f"{task_name} trajectory must have at least 9 raw qpos dims")
+        if gripper_pose is not None:
+            gripper_pose = gripper_pose.reshape(-1, 1)
+            if gripper_pose.shape[0] != q_trace.shape[0]:
+                raise ValueError("gripper_pose length must match q_trace length")
+            grip = np.clip(gripper_pose, 0.0, 1.0)
+        else:
+            grip = _gripper_qpos_trace_to_normalized(q_trace[:, 7:9])
         return np.concatenate(
-            [q_trace[:, :7], _gripper_qpos_to_normalized(q_trace[:, 7:9])],
+            [q_trace[:, :7], grip],
             axis=-1,
         ).astype(np.float32)
     if task_name == "two_arm":
         if q_trace.shape[-1] < 18:
             raise ValueError("two_arm trajectory must have at least 18 raw qpos dims")
-        left_grip = _gripper_qpos_to_normalized(q_trace[:, 7:9])
-        right_grip = _gripper_qpos_to_normalized(q_trace[:, 16:18])
+        if gripper_pose is not None:
+            gripper_pose = gripper_pose.reshape(q_trace.shape[0], -1)
+            if gripper_pose.shape[1] != 2:
+                raise ValueError("two_arm gripper_pose must have shape (T, 2)")
+            left_grip = np.clip(gripper_pose[:, 0:1], 0.0, 1.0)
+            right_grip = np.clip(gripper_pose[:, 1:2], 0.0, 1.0)
+        else:
+            left_grip = _gripper_qpos_trace_to_normalized(q_trace[:, 7:9])
+            right_grip = _gripper_qpos_trace_to_normalized(q_trace[:, 16:18])
         return np.concatenate(
             [q_trace[:, 0:7], left_grip, q_trace[:, 9:16], right_grip],
             axis=-1,

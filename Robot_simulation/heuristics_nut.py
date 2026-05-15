@@ -57,6 +57,7 @@ def generate_nut_trajectory(
 
     # ---------- storage ----------
     q_traj = []
+    gripper_traj = []
     dynamic_traj = []
     frames = []
 
@@ -101,8 +102,11 @@ def generate_nut_trajectory(
     init_qpos = env.sim.data.qpos[joint_idx].copy()
 
     # ---------- helper for recording ----------
+    gripper_pose = 1.0
+
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
+        gripper_traj.append(gripper_pose)
         # TODO(nut): Replace empty placeholder with nut pose / peg-relative state.
         dynamic_traj.append(get_dynamic_state(env, "nut"))
 
@@ -134,6 +138,7 @@ def generate_nut_trajectory(
         quat0 = quat_multiply(q_rot, quat0)
 
     # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
+    gripper_pose = 1.0
     pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
     step_towards(env, eef_id, adim, record_q,
                  target_pos=pre_grasp,
@@ -155,6 +160,7 @@ def generate_nut_trajectory(
     environment_parameters = (nut_pos[0], nut_pos[1], yaw)
 
     # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
+    gripper_pose = 1.0
     grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
     step_towards(env, eef_id, adim, record_q,
                  target_pos=grasp_height,
@@ -166,6 +172,7 @@ def generate_nut_trajectory(
                  camera_name="frontview")
     
     # ---------- PHASE2: 10‑step grasping handle ----------
+    gripper_pose = 0.0
     for _ in range(10):
         a = np.zeros(adim); a[6] = 1.0
         obs, _, _, _ = env.step(a)
@@ -175,6 +182,7 @@ def generate_nut_trajectory(
             frames.append(np.flipud(img))
 
     # ---------- PHASE3: 50‑step approach to peg end ----------
+    gripper_pose = 0.0
     # Find closest alignment
     if angle > np.pi/2 and np.pi > angle:
         quat1 = quat_multiply(q_cur, np.array([0, 0, -1/np.sqrt(2), 1/np.sqrt(2)]))
@@ -195,6 +203,7 @@ def generate_nut_trajectory(
                  camera_name="frontview")
 
     # ---------- PHASE4: 50‑step decend into peg ----------
+    gripper_pose = 0.0
     insert_height = pre_insert.copy()
     insert_height[2] -= 0.15
     step_towards(env, eef_id, adim, record_q,
@@ -207,6 +216,7 @@ def generate_nut_trajectory(
                  camera_name="frontview")
     
      # ---------- PHASE5: 10-step opening gripper ----------
+    gripper_pose = 1.0
     for _ in range(10):
         a = np.zeros(adim); a[6] = -1.0
         obs, _, _, _ = env.step(a)
@@ -233,6 +243,7 @@ def generate_nut_trajectory(
         environment_setting,
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
+        np.asarray(gripper_traj, dtype=np.float32),
     )
 
 
@@ -260,13 +271,14 @@ if __name__ == "__main__":
     env.table_offset[2] += delta_z
     env.reset()    
     
-    traj, success, _, init_qpos, env_state, env_param, dynamic_states = generate_nut_trajectory(
+    result = generate_nut_trajectory(
         env,
         delta_z,
         render=True,
         video_folder="Robot_simulation/videos",
         verbose=True
     )
+    traj, success, _, init_qpos, env_state, env_param, dynamic_states = result[:7]
 
     if success:
         print("Nut task success!")

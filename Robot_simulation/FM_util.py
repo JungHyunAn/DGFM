@@ -202,12 +202,22 @@ PANDA_GRIPPER_OPEN_QPOS = 0.04
 
 def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
     gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
-    return np.clip(np.mean(gripper_qpos, axis=-1) / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
+    return np.clip(np.mean(np.abs(gripper_qpos), axis=-1) / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
 
 
 def _normalized_gripper_to_action(value) -> float:
     value = float(np.clip(value, 0.0, 1.0))
     return 1.0 - 2.0 * value
+
+
+def _clip_policy_gripper_dims(q: np.ndarray, task_name: str) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32).copy()
+    if task_name in ["door", "nut"] and q.shape[-1] == 8:
+        q[..., 7] = np.clip(q[..., 7], 0.0, 1.0)
+    elif task_name == "two_arm" and q.shape[-1] == 16:
+        q[..., 7] = np.clip(q[..., 7], 0.0, 1.0)
+        q[..., 15] = np.clip(q[..., 15], 0.0, 1.0)
+    return q
 
 
 class VectorField(nn.Module):
@@ -707,7 +717,7 @@ def _state_policy_env_worker(
             if msg.get("type") != "act":
                 raise ValueError(f"Unknown worker message: {msg}")
 
-            q_low = np.asarray(msg["q_low"], dtype=np.float32)
+            q_low = _clip_policy_gripper_dims(msg["q_low"], task_name)
 
             done = False
             for q in q_low:
@@ -910,7 +920,7 @@ def _rollout_batch(
                        training=True)
 
         # Policy windows are already sampled at the environment control rate.
-        q_low  = q_low_batch[i]
+        q_low = _clip_policy_gripper_dims(q_low_batch[i], task_name)
         
         for q in q_low:
             env.step(_to_action_from_q(q, task_name))
@@ -939,6 +949,7 @@ def _rollout_batch(
 
 def _run_flow_batched(
     model,
+    task_name: str,
     cond_batch: np.ndarray,
     seq_len: int,
     dof: int,
@@ -963,13 +974,13 @@ def _run_flow_batched(
         if use_cuda:
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 q_low = run_flow(model, x0, c, device, n_steps=flow_steps)
-            out[s:e] = q_low.float().cpu().numpy()
+            out[s:e] = _clip_policy_gripper_dims(q_low.float().cpu().numpy(), task_name)
             del q_low
             torch.cuda.empty_cache()
         else:
             with torch.inference_mode():
                 q_low = run_flow(model, x0, c, device, n_steps=flow_steps)
-            out[s:e] = q_low.cpu().numpy()
+            out[s:e] = _clip_policy_gripper_dims(q_low.cpu().numpy(), task_name)
     return out
 
 
@@ -1053,6 +1064,7 @@ def _rollout_state_policy_synchronized(
             cond_batch = np.stack([pending_conditions.pop(idx) for idx in ready], axis=0)
             q_low_batch = _run_flow_batched(
                 model,
+                task_name,
                 cond_batch,
                 seq_len,
                 dof,

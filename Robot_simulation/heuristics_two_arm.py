@@ -42,6 +42,7 @@ def generate_two_arm_trajectory(
 
     # ---------- storage ----------
     q_traj, frames = [], []
+    gripper_traj = []
     dynamic_traj = []
 
     # ---------- reset & indices ----------
@@ -79,8 +80,11 @@ def generate_two_arm_trajectory(
     environment_parameters = ((posL[0]+posR[0])/2, (posL[1]+posR[1])/2, yaw)
 
     # ---------- helper for recording ----------
+    gripper_pose = np.array([1.0, 1.0], dtype=np.float32)
+
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
+        gripper_traj.append(gripper_pose.copy())
         # TODO(two_arm): Replace empty placeholder with pot / handle dynamic state.
         dynamic_traj.append(get_dynamic_state(env, "two_arm"))
 
@@ -103,6 +107,7 @@ def generate_two_arm_trajectory(
     start_quat_R = mat2quat(env.sim.data.site_xmat[eefR].reshape(3, 3))
 
     # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
+    gripper_pose = np.array([1.0, 1.0], dtype=np.float32)
     fracs = np.linspace(0.0, 1.0, 101)[1:]
     for f in fracs:
         p_des_L = (1 - f) * start_pos_L + f * tgtL
@@ -152,6 +157,7 @@ def generate_two_arm_trajectory(
             img = env.sim.render(640, 480, camera_name="frontview")
             frames.append(np.flipud(img))
     # ---------- PHASE1‑2: 30-step descend to handle ----------
+    gripper_pose = np.array([1.0, 1.0], dtype=np.float32)
     for _ in range(30):
         a = np.zeros(adim)
         # small downward move
@@ -167,6 +173,7 @@ def generate_two_arm_trajectory(
             frames.append(np.flipud(img))
 
     # ---------- PHASE2: 10-step grasping handle ----------
+    gripper_pose = np.array([0.0, 0.0], dtype=np.float32)
     for _ in range(10):
         a = np.zeros(adim)
         # left gripper at index 6, right at 6+7=13
@@ -179,6 +186,7 @@ def generate_two_arm_trajectory(
             frames.append(np.flipud(img))
 
     # ---------- PHASE3: (lift_steps)-step lifting the pot ----------
+    gripper_pose = np.array([0.0, 0.0], dtype=np.float32)
     # average initial handle height
     hz0 = env.sim.data.site_xpos[handle_ids[0]][2]
     hz1 = env.sim.data.site_xpos[handle_ids[1]][2]
@@ -248,6 +256,7 @@ def generate_two_arm_trajectory(
         env_setting,
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
+        np.stack(gripper_traj, axis=0),
     )
 
 
@@ -270,12 +279,13 @@ if __name__ == "__main__":
         control_freq=20,
     )
 
-    traj, success, _, init_qpos, env_state, env_param, dynamic_states = generate_two_arm_trajectory(
+    result = generate_two_arm_trajectory(
         env,
         render=True,
         video_folder="Robot_simulation/videos",
         verbose=True,
     )
+    traj, success, _, init_qpos, env_state, env_param, dynamic_states = result[:7]
 
     if success:
         print("Two Arm task success!")
