@@ -2,7 +2,7 @@
   "FM_type": "UniformFM",
   "N": 20,
   "task_name": "door",
-  "results_path": "Robot_simulation/eval_results/door",
+  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
   "device": "cuda",
   "n_t": 1,
   "max_epochs": 4500,
