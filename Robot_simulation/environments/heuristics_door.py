@@ -7,7 +7,7 @@ from robosuite.controllers.composite.composite_controller_factory import load_co
 from robosuite.utils.transform_utils import mat2quat, quat_multiply
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
-from Robot_simulation.heuristics_util import get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import get_dynamic_state, step_towards
 
 
 def generate_door_trajectory(

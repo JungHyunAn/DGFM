@@ -64,7 +64,7 @@ Task presets
 
 CLI
 ---
-python -m Robot_simulation.generate_dataset_parallel
+python -m Robot_simulation.environments.generate_data
   --n 250
   --task_name door                # {door, wipe, two_arm, nut}
   --render                        # (optional) write grid MP4
@@ -119,12 +119,12 @@ from typing import List, Optional, Dict, Any, Tuple
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 
-from Robot_simulation.heuristics_door import generate_door_trajectory
-from Robot_simulation.heuristics_wipe import generate_wipe_trajectory
-from Robot_simulation.heuristics_two_arm import generate_two_arm_trajectory
-from Robot_simulation.heuristics_nut import generate_nut_trajectory
+from Robot_simulation.environments.heuristics_door import generate_door_trajectory
+from Robot_simulation.environments.heuristics_wipe import generate_wipe_trajectory
+from Robot_simulation.environments.heuristics_two_arm import generate_two_arm_trajectory
+from Robot_simulation.environments.heuristics_nut import generate_nut_trajectory
 from Robot_simulation.env_util import make_env
-from Robot_simulation.heuristics_util import normalize_policy_trajectory, write_grid_video, render_trajectory
+from Robot_simulation.environments.heuristics_util import normalize_policy_trajectory, write_grid_video, render_trajectory
 from Robot_simulation import DEFAULT_DATASET_DIR
 
 DOWNSAMPLE_RATIOS  = {"door"    : 2,

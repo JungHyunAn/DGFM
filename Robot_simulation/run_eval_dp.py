@@ -13,6 +13,7 @@ import json
 import h5py
 import random
 import argparse
+import time
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -32,13 +33,10 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers):
     robosuite_logger.removeHandler(h)
 
-from Robot_simulation.FM_util import (
-    VectorField,
-    _get_environment_params,
-    _align_handle_to_nut,
-)
-from Robot_simulation.Diffusion_util import train_DP, eval_model_DP
-from Robot_simulation.heuristics_util import make_env
+from Robot_simulation.models.VanillaFM_class import VectorField
+from Robot_simulation.models.FM_util import _align_handle_to_nut
+from Robot_simulation.models.DP_class import train_DP, eval_model_DP
+from Robot_simulation.environments.heuristics_util import _get_environment_params, make_env
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
@@ -172,7 +170,10 @@ def train_and_eval_DP(
 
     print(f"[{datetime.now(ZoneInfo('Asia/Seoul')).isoformat()}] Starting DP training for {task_name} with {N} samples…")
 
+    training_thread_time_seconds = None
+
     if model_path is None:
+        train_time_start = time.thread_time()
         best_model, last_model, recs = train_DP(
             model=model,
             optimizer=optimizer,
@@ -192,6 +193,8 @@ def train_and_eval_DP(
             early_stopping=early_stopping,
             stop_criteria=stop_criteria,
         )
+        training_thread_time_seconds = time.thread_time() - train_time_start
+        print(f"Training thread time: {training_thread_time_seconds:.3f}s")
     else:
         best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
         state = torch.load(model_path, map_location=device)
@@ -257,6 +260,7 @@ def train_and_eval_DP(
             "eval_samples": evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
+            "training_thread_time_seconds": training_thread_time_seconds,
             "records": recs,
         }
         with open(json_path, "w") as f:

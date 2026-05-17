@@ -5,7 +5,7 @@ The implementation currently re-exports the established helpers from
 builders through the trajectory helper module.
 """
 
-from Robot_simulation.heuristics_util import (
+from Robot_simulation.environments.heuristics_util import (
     make_env,
     restore_environment,
     restore_mj_state,

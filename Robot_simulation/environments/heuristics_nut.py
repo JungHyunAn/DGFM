@@ -5,7 +5,7 @@ import numpy as np
 from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
-from Robot_simulation.heuristics_util import get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import get_dynamic_state, step_towards
 
 def generate_nut_trajectory(
     env,

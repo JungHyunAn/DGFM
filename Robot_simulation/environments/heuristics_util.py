@@ -75,8 +75,11 @@ PANDA_GRIPPER_OPEN_QPOS = 0.04
 def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
     """Map Panda finger qpos to normalized gripper pose: 0 closed, 1 open."""
     gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
-    grip = np.mean(np.abs(gripper_qpos), axis=-1, keepdims=True)
-    return np.clip(grip / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
+    return np.clip(
+        np.mean(np.abs(gripper_qpos), axis=-1) / PANDA_GRIPPER_OPEN_QPOS,
+        0.0,
+        1.0,
+    )
 
 
 def _gripper_qpos_trace_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
@@ -94,6 +97,16 @@ def _normalized_gripper_to_action(value) -> float:
     """Map normalized gripper pose to controller command: 0 closed, 1 open."""
     value = float(np.clip(value, 0.0, 1.0))
     return 1.0 - 2.0 * value
+
+
+def _clip_policy_gripper_dims(q: np.ndarray, task_name: str) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32).copy()
+    if task_name in ["door", "nut"] and q.shape[-1] == 8:
+        q[..., 7] = np.clip(q[..., 7], 0.0, 1.0)
+    elif task_name == "two_arm" and q.shape[-1] == 16:
+        q[..., 7] = np.clip(q[..., 7], 0.0, 1.0)
+        q[..., 15] = np.clip(q[..., 15], 0.0, 1.0)
+    return q
 
 
 def _normalized_gripper_to_qpos(value) -> np.ndarray:
@@ -594,25 +607,27 @@ def write_grid_video(
         AssertionError: If the number of episodes exceeds rows*cols.
 
     Behavior:
-        - Truncates all episodes to the shortest length so they align in time.
+        - Runs until the longest episode finishes.
+        - Holds shorter episodes on their final frame.
         - Fills empty grid slots (if any) with black frames.
     """
 
     rows, cols = grid_shape
     num_eps = len(episodes_frames)
     assert num_eps <= rows*cols, "Too many episodes for grid!"
-    min_len = min(len(frames) for frames in episodes_frames)
+    max_len = max(len(frames) for frames in episodes_frames)
     H, W, _ = episodes_frames[0][0].shape
 
     grid_frames = []
-    for t in range(min_len):
+    for t in range(max_len):
         rows_imgs = []
         for r in range(rows):
             cells = []
             for c in range(cols):
                 idx = r*cols + c
                 if idx < num_eps:
-                    cells.append(episodes_frames[idx][t])
+                    frames = episodes_frames[idx]
+                    cells.append(frames[min(t, len(frames) - 1)])
                 else:
                     cells.append(np.zeros((H, W, 3), dtype=np.uint8))
             rows_imgs.append(np.concatenate(cells, axis=1))
@@ -764,8 +779,89 @@ def compute_smooth_trajectory_wipper(
     return q_high
 
 
+def _get_environment_params(
+    env,
+    task_name: str):
+    """Extract compact task parameters used as static policy conditions.
+
+    Each task exposes the object/target pose information needed by training and
+    evaluation, e.g. handle pose for door or nut/peg pose for nut assembly.
+    """
+    assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
+    if task_name == "door":
+        handle_id  = env.door_handle_site_id
+        handle_pos = env._handle_xpos.copy()
+        R_handle   = env.sim.data.site_xmat[handle_id].reshape(3,3)
+        yaw = np.arctan2(R_handle[1,0], R_handle[0,0])
+        environment_parameters = (handle_pos[0], handle_pos[1], yaw)
+    elif task_name == "wipe":
+        max_radius, center, _ = env._get_wipe_information()
+        environment_parameters = (center[0], center[1], max_radius)
+    elif task_name == "two_arm":
+        handle_names = [n for n in env.sim.model.site_names if "handle" in n]
+        handle_ids   = [env.sim.model.site_name2id(n) for n in handle_names]
+        hidL, hidR = handle_ids[:2]
+        posL = env.sim.data.site_xpos[hidL].copy()
+        posR = env.sim.data.site_xpos[hidR].copy()
+        R0   = env.sim.data.site_xmat[hidL].reshape(3,3)
+        yaw  = np.arctan2(R0[1,0], R0[0,0])
+        environment_parameters = ((posL[0]+posR[0])/2, (posL[1]+posR[1])/2, yaw)
+    else:
+        nut_handle_id = env.object_site_ids[0]
+        nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
+        nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
+        R0 = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
+        yaw = np.arctan2(R0[1,0], R0[0,0])
+
+        peg_id  = env.peg1_body_id
+        peg_pos = env.sim.data.body_xpos[peg_id].copy()
+        environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1])
+
+    return environment_parameters
+
+
+def _current_robot_q(env, task_name: str) -> np.ndarray:
+    """Return the current robot pose in the compact policy representation.
+
+    Gripper finger qpos values are collapsed into normalized open/close channels
+    so state-conditioned policies see the same format they generate.
+    """
+    full_qpos = env.sim.data.qpos.copy()
+    if task_name in ["door", "nut"]:
+        return np.concatenate([full_qpos[:7], [float(_gripper_qpos_to_normalized(full_qpos[7:9]))]])
+    if task_name == "wipe":
+        return full_qpos[:7]
+    return np.concatenate(
+        [
+            full_qpos[0:7],
+            [float(_gripper_qpos_to_normalized(full_qpos[7:9]))],
+            full_qpos[9:16],
+            [float(_gripper_qpos_to_normalized(full_qpos[16:18]))],
+        ]
+    )
+
+
+def _state_policy_success(env, task_name: str) -> bool:
+    """Apply task-specific success checks for state-conditioned rollouts.
+
+    Most tasks defer to robosuite success; two-arm lift adds a handle-height
+    consistency check so partial or uneven grasps are not counted as success.
+    """
+    if not env._check_success():
+        return False
+    if task_name == "two_arm":
+        z0 = env._handle0_xpos[2]
+        z1 = env._handle1_xpos[2]
+        return abs(z1 - z0) < 0.05
+    return True
+
+
 def _to_action_from_q(q, task_name):
-    """Match exactly the action packing in env.step(...)."""
+    """Pack a compact policy pose into the action vector expected by env.step.
+
+    This centralizes task-specific arm / gripper action layouts for replay and
+    rollout code.
+    """
     q = np.asarray(q, dtype=np.float32)
     if task_name in ["door", "nut"]:
         arm_q = q[:7]

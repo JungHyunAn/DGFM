@@ -15,7 +15,7 @@ from robosuite.utils.transform_utils import mat2quat
 from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 
-from Robot_simulation.heuristics_util import get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import get_dynamic_state, step_towards
 
 
 def generate_wipe_trajectory(

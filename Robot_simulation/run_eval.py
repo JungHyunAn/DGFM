@@ -123,6 +123,7 @@ from typing import Tuple, List
 import json
 import h5py
 import argparse
+import time
 import matplotlib.pyplot as plt
 from zoneinfo import ZoneInfo
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -135,17 +136,17 @@ robosuite_logger.propagate = False
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
 
-from Robot_simulation.FM_util import (
-    ShiftedFM,
-    UniformFM,
-    VectorField,
+from Robot_simulation.models.VanillaFM_class import VectorField
+from Robot_simulation.models.UniformFM_class import UniformFM
+from Robot_simulation.models.ShiftedFM_class import ShiftedFM
+from Robot_simulation.models.FM_util import (
     _align_handle_to_nut,
-    _get_environment_params,
     build_state_conditioned_windows,
     eval_model,
 )
-from Robot_simulation.DGFM_util import DGFM
+from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.env_util import make_env
+from Robot_simulation.environments.heuristics_util import _get_environment_params
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 
 
@@ -393,11 +394,14 @@ def train_and_eval_FM(
         f"Starting {FM_type} training for {task_name} with {num_demos} demos -> {train_N} windows..."
     )
     
+    training_thread_time_seconds = None
+
     if model_path is None:
         best_model = None
         mixture_sampler = None
         cluster_d = None
         cluster_size = None
+        train_time_start = time.thread_time()
 
         if FM_type == "DGFM":
             if cluster_partition <= 0:
@@ -459,6 +463,8 @@ def train_and_eval_FM(
                 stop_criteria=stop_criteria,
                 val_trials=val_trials,
             )
+        training_thread_time_seconds = time.thread_time() - train_time_start
+        print(f"Training thread time: {training_thread_time_seconds:.3f}s")
     else:
         best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
         state = torch.load(model_path, map_location=device)
@@ -564,6 +570,7 @@ def train_and_eval_FM(
             "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
+            "training_thread_time_seconds": training_thread_time_seconds,
             "records":         recs,
         }
         with open(json_path, "w") as f:

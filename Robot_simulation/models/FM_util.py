@@ -13,7 +13,7 @@ What this module provides
   state-conditioned policies.
 - **Evaluation**: 'eval_model' runs many parallel rollouts in RoboSuite,
   reports success rate / average reward, and (optionally) renders a grid video.
-- **Utilities**: helpers like 'run_flow' for integrating the learned vector field from t=0→1.
+- **Utilities**: evaluation helpers for integrating and rolling out learned policies.
 
 Key design choices & assumptions
 --------------------------------
@@ -27,37 +27,32 @@ Key design choices & assumptions
 2) **Trainers**
    - **UniformFM**: sample t ~ Uniform[0,1], regress v_t (standard FM).
    - **ShiftedFM**: shift / warp t to emphasize early (or late) time steps via Beta distribution.
-   - **DGFM** lives in `Robot_simulation.DGFM_util`.
+   - **DGFM** lives in `Robot_simulation.models.DGFM_class`.
    - Schedules: cosine with warmup; Adam optimizer; early stopping supported.
 
 3) **Evaluation loop**
    - Before training: build env, extract env params c
-   - For each trial: restore env, sample a trajectory by integrating the vector field (via `run_flow`), 
+   - For each trial: restore env, sample a trajectory by integrating the vector field, 
      upsample / smooth externally, replay, then compute success / reward. 
      Multiprocessing is used for speed.
    - Rendering (optional) uses the external utilities from
-     'Robot_simulation.heuristics_util' (not defined here).
+     'Robot_simulation.environments.heuristics_util' (not defined here).
 
 Note
 ----
 This module focuses on learning and evaluation. Environment construction,
 state restoration, trajectory smoothing, and rendering are provided by
-'Robot_simulation.heuristics_util'.
+'Robot_simulation.environments.heuristics_util'.
 For nut assembly task, grasping the nut is ensured by lifting the nut in '_align_handle_to_nut'
 """
 
 import numpy as np
 import os
-import copy
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 from multiprocessing import get_context
 from concurrent.futures import ProcessPoolExecutor
-from tqdm import tqdm
 from typing import Tuple, List
-from torch.distributions import Beta
 import logging
 logging.disable(logging.WARNING)
 robosuite_logger = logging.getLogger("robosuite")
@@ -68,253 +63,18 @@ for h in list(robosuite_logger.handlers):
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
 
 from Robot_simulation.env_util import make_env
-from Robot_simulation.heuristics_util import get_dynamic_state, render_trajectory, write_grid_video, step_towards
-
-
-class FiLM(nn.Module):
-    """Feature-wise Linear Modulation (FiLM) for 1D feature maps.
-
-    Applies a per-channel affine transform conditioned on a context vector.
-
-    Args:
-    in_channels: Number of channels in the feature map to be modulated. (C)
-    condition_dim: Dimensionality of the conditioning vector.
-
-    Forward Args:
-    x: Tensor of shape (B, C, T), feature map to modulate.
-    condition: Tensor of shape (B, condition_dim), conditioning vector.
-
-    Returns:
-    Tensor of shape (B, C, T) after FiLM modulation.
-    """
-    def __init__(self, in_channels, condition_dim):
-        super().__init__()
-        self.scale_shift = nn.Sequential(
-            nn.Linear(condition_dim, in_channels * 2),
-            nn.ReLU(),
-            nn.Linear(in_channels * 2, in_channels * 2)
-        )
-
-    def forward(self, x, condition):
-        # x: (B, C, T), condition: (B, cond_dim)
-        scale_shift = self.scale_shift(condition)           # (B, 2*C)
-        scale, shift = scale_shift.chunk(2, dim=-1)         # each (B, C)
-        scale = scale.unsqueeze(-1)                        # (B, C, 1)
-        shift = shift.unsqueeze(-1)                        # (B, C, 1)
-        return x * (1 + scale) + shift
-
-
-class ConvBlock(nn.Module):
-    """Conv → GroupNorm → ReLU → FiLM block for 1D sequences.
-
-    Args:
-    in_channels: Input channels to the conv layer.
-    out_channels: Output channels for the conv layer.
-    condition_dim: Dimensionality of the conditioning vector used by FiLM.
-
-    Forward Args:
-    x: (B, C_in, T) input tensor.
-    condition: (B, condition_dim) conditioning vector.
-
-    Returns:
-    (B, C_out, T) tensor after convolution, normalization, activation, and FiLM.
-    """
-    def __init__(self, in_channels, out_channels, condition_dim):
-        super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.norm = nn.GroupNorm(8, out_channels)
-        self.film = FiLM(out_channels, condition_dim)
-
-    def forward(self, x, condition):
-        x = self.conv(x)
-        x = self.norm(x)
-        x = F.relu(x)
-        x = self.film(x, condition)
-        return x
-
-
-class UNet1D(nn.Module):
-    """A 1D U-Net with FiLM conditioning.
-
-    This backbone models per-timestep dynamics across joint sequences.
-
-    Args:
-    dof: Number of channels == robot DoF to model (typically arm DoF only).
-    condition_dim: Dimensionality of the environmental condition fed into FiLM.
-    channels: Encoder channel progression; decoder mirrors these.
-
-    Forward Args:
-    x: (B, dof, T) input sequence (channels first).
-    condition: (B, condition_dim) vector.
-
-    Returns:
-    (B, dof, T) tensor of predicted velocities.
-    """
-    def __init__(self, dof, condition_dim, channels=[160, 320, 640, 640]):
-        super().__init__()
-        self.channels = channels
-        # Encoder
-        self.enc_blocks = nn.ModuleList()
-        in_ch = dof
-        for ch in channels:
-            self.enc_blocks.append(ConvBlock(in_ch, ch, condition_dim))
-            in_ch = ch
-
-        # Bottleneck
-        self.bottleneck = ConvBlock(channels[-1], channels[-1], condition_dim)
-
-        # Decoder
-        self.dec_blocks = nn.ModuleList()
-        prev_ch = channels[-1]
-        for skip_ch in reversed(channels):
-            in_ch = prev_ch + skip_ch
-            out_ch = skip_ch
-            self.dec_blocks.append(ConvBlock(in_ch, out_ch, condition_dim))
-            prev_ch = out_ch
-
-        # Final layer
-        self.final_conv = nn.Conv1d(channels[0], dof, kernel_size=1)
-
-    def forward(self, x, condition):
-        # x: (B, dof, seq_len), condition: (B, cond_dim)
-        skips = []
-        # Encoding path
-        for enc in self.enc_blocks:
-            x = enc(x, condition)
-            skips.append(x)
-            x = F.avg_pool1d(x, kernel_size=2, ceil_mode=True)
-
-        # Bottleneck
-        x = self.bottleneck(x, condition)
-
-        # Decoding path
-        for dec, skip in zip(self.dec_blocks, reversed(skips)):
-            x = F.interpolate(x, size=skip.shape[-1], mode='linear', align_corners=False)
-            x = torch.cat([x, skip], dim=1)
-            x = dec(x, condition)
-
-        # Final projection
-        return self.final_conv(x)
-
-
-PANDA_GRIPPER_OPEN_QPOS = 0.04
-
-
-def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
-    gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
-    return np.clip(np.mean(np.abs(gripper_qpos), axis=-1) / PANDA_GRIPPER_OPEN_QPOS, 0.0, 1.0)
-
-
-def _normalized_gripper_to_action(value) -> float:
-    value = float(np.clip(value, 0.0, 1.0))
-    return 1.0 - 2.0 * value
-
-
-def _clip_policy_gripper_dims(q: np.ndarray, task_name: str) -> np.ndarray:
-    q = np.asarray(q, dtype=np.float32).copy()
-    if task_name in ["door", "nut"] and q.shape[-1] == 8:
-        q[..., 7] = np.clip(q[..., 7], 0.0, 1.0)
-    elif task_name == "two_arm" and q.shape[-1] == 16:
-        q[..., 7] = np.clip(q[..., 7], 0.0, 1.0)
-        q[..., 15] = np.clip(q[..., 15], 0.0, 1.0)
-    return q
-
-
-class VectorField(nn.Module):
-    """Conditional vector field v(x, t, c) over joint trajectories.
-
-    The model predicts a velocity field for every policy channel, including
-    normalized gripper pose channels. Time is encoded via a small MLP and
-    concatenated with (optionally scaled) environment parameters for FiLM
-    conditioning.
-
-    Args:
-        seq_len: Number of time steps (T) per trajectory.
-        dof: Total joint DoF per time step (includes grippers if present).
-        param_len: Dimensionality of environment parameter vector `c`.
-        gripper_idx: Optional gripper channel indices, kept for compatibility.
-            These channels are still modeled and included in the loss.
-
-    Attributes:
-        loss_mask (Tensor): (1, 1, dof) all-ones mask kept for compatibility.
-
-    Forward Args:
-        x: (B, T, dof) current state on the straight path between x0 and x1.
-        t: (B, 1) time in [0, 1].
-        env_params: (B, param_len) environment parameters (scaled by 100 internally).
-
-    Returns:
-        (B, T, dof) velocity field for all policy channels.
-    """
-
-    def __init__(self, seq_len, dof, param_len, gripper_idx=None):
-        super().__init__()
-        self.seq_len = seq_len
-        self.dof = dof
-        self.param_len = param_len
-
-        if gripper_idx is None:
-            gripper_idx = []
-        if isinstance(gripper_idx, list):
-            gripper_idx = torch.tensor(gripper_idx, dtype=torch.long)
-        self.register_buffer("gripper_idx", gripper_idx, persistent=False)
-
-        loss_mask = torch.ones(dof, dtype=torch.float32)
-        self.register_buffer("loss_mask", loss_mask.view(1, 1, dof), persistent=False)
-
-        # Time embedding for FiLM conditioning
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, 32), nn.ReLU(),
-            nn.Linear(32, 32)
-        )
-
-        # additional encoding if needed
-        """
-        self.param_embed = nn.Sequential(
-            nn.Linear(param_len, 16), nn.ReLU(),
-            nn.Linear(16, 16)
-        )
-        """
-
-        # Condition dimension = param_len + time embedding dim
-        condition_dim = 32 + param_len
-
-        # 1D U-Net for sequence modeling
-        self.unet = UNet1D(dof=dof, condition_dim=condition_dim)
-
-    def forward(self, x, t, env_params):
-        # x: (B, seq_len, dof), t: (B, 1), env_params: (B, param_len)
-        dev, dt = x.device, x.dtype
-        if torch.is_tensor(t):
-            t = t.to(dev)
-            if torch.is_floating_point(t):
-                t = t.to(dt)
-            else:
-                t = torch.as_tensor(t, device=dev, dtype=dt)
-
-        if torch.is_tensor(env_params):
-            env_params = env_params.to(dev)
-            if torch.is_floating_point(env_params):
-                env_params = env_params.to(dt)
-        else:
-            env_params = torch.as_tensor(env_params, device=dev, dtype=dt)
-
-        B, seq_len, dof = x.shape
-        assert seq_len == self.seq_len and dof == self.dof, "Shape mismatch"
-
-        # Normalize environment parameters (optional preprocessing)
-        env_params_norm = env_params * 100
-
-        # Encode timestep
-        t_embed = self.time_embed(t)
-        # p_embed = self.param_embed(env_params_norm) # in cased of additional encoding
-        p_embed = env_params_norm # without environment parameter encoding
-
-        # Create conditioning vector
-        condition = torch.cat([p_embed, t_embed], dim=-1)  # (B, cond_dim)
-
-        v = self.unet(x.permute(0, 2, 1).contiguous(), condition)
-        return v.permute(0, 2, 1).contiguous()
+from Robot_simulation.models.VanillaFM_class import VanillaFM
+from Robot_simulation.environments.heuristics_util import (
+    _clip_policy_gripper_dims,
+    _current_robot_q,
+    _get_environment_params,
+    _state_policy_success,
+    _to_action_from_q,
+    get_dynamic_state,
+    render_trajectory,
+    step_towards,
+    write_grid_video,
+)
 
 
 def build_state_conditioned_windows(
@@ -374,288 +134,6 @@ def make_policy_condition(
     )
 
 
-class VanillaFM:
-    """State-conditioned Flow Matching trainer for fixed-horizon policies."""
-
-    def __init__(
-        self,
-        model,
-        optimizer,
-        scheduler,
-        *,
-        task_name: str,
-        horizon: int,
-        dof: int,
-        condition_dim: int,
-        gripper_idx=None,
-        time_sampling: str = "uniform",
-        beta_a: float = 1.5,
-        beta_b: float = 1.0,
-        device: str = "cuda",
-    ):
-        self.model = model
-        self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.task_name = task_name
-        self.horizon = horizon
-        self.dof = dof
-        self.condition_dim = condition_dim
-        self.gripper_idx = gripper_idx
-        self.time_sampling = time_sampling
-        self.beta_a = beta_a
-        self.beta_b = beta_b
-        self.device = device
-
-    def sample_t(self, n: int) -> torch.Tensor:
-        if self.time_sampling == "shifted":
-            t = Beta(self.beta_a, self.beta_b).sample((n, 1)).to(self.device)
-            return torch.ones_like(t) - t
-        return torch.rand(n, device=self.device).unsqueeze(-1)
-
-    def train(
-        self,
-        target_trajectories,
-        conditions,
-        *,
-        n_t: int,
-        max_epochs: int,
-        batch_size: int,
-        val_period: int = 5,
-        early_stopping: bool = True,
-        stop_criteria: int = 3,
-        val_trials: int = 25,
-    ):
-        N = target_trajectories.shape[0]
-        best_avg_reward = 0.0
-        best_success_rate = 0.0
-        best_model = copy.deepcopy(self.model)
-        records = {}
-        stop_count = 0
-
-        do_validation = val_period > 0 and val_trials > 0
-        env_settings_all, val_params = (None, None)
-        if do_validation:
-            env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
-
-        try:
-            self.model = self.model.to(self.device)
-            target_trajectories = target_trajectories.to(self.device)
-            conditions = conditions.to(self.device)
-            for epoch in tqdm(range(1, max_epochs + 1), desc=f"{self.time_sampling.title()}FM Training", unit="epoch"):
-                self.model.train()
-                perm_t = torch.randperm(N, device=self.device)
-                loss_sum = 0.0
-                for i in range(0, N, batch_size):
-                    idx = perm_t[i:min(i + batch_size, N)]
-                    x1 = target_trajectories[idx]
-                    x0 = torch.randn(len(idx), self.horizon, self.dof, device=self.device)
-                    t = self.sample_t(len(idx) * n_t)
-                    cond = conditions[idx, :]
-
-                    x1r = x1.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
-                    x0r = x0.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
-                    t_col = t.view(-1, 1, 1)
-                    xt = (1 - t_col) * x0r + t_col * x1r
-                    cond_r = cond.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
-                    target_v = x1r - x0r
-
-                    pred_v = self.model(xt, t, cond_r)
-                    sq_err = (pred_v - target_v) ** 2
-                    if hasattr(self.model, "loss_mask") and self.model.loss_mask is not None:
-                        sq_err = sq_err * self.model.loss_mask
-                    loss = sq_err.mean()
-
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    self.optimizer.step()
-                    loss_sum += float(loss.item())
-
-                if self.scheduler is not None:
-                    self.scheduler.step()
-
-                if do_validation and epoch % val_period == 0:
-                    success_rate, avg_reward = eval_model(
-                        self.model,
-                        VectorField,
-                        self.task_name,
-                        self.horizon,
-                        self.dof,
-                        self.condition_dim,
-                        self.gripper_idx,
-                        val_params,
-                        env_settings_all,
-                        self.device,
-                        trials=val_trials,
-                    )
-                    records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
-                    if success_rate < best_success_rate:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-                        if early_stopping:
-                            if stop_count == stop_criteria:
-                                tqdm.write("Early stopping triggered.")
-                                break
-                            stop_count += 1
-                    elif (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(self.model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-        except KeyboardInterrupt:
-            tqdm.write("Training interrupted by user. Returning best model so far...")
-
-        if not records:
-            best_model = copy.deepcopy(self.model)
-        return best_model, self.model, records
-
-
-class UniformFM(VanillaFM):
-    def __init__(self, *args, **kwargs):
-        kwargs["time_sampling"] = "uniform"
-        super().__init__(*args, **kwargs)
-
-
-class ShiftedFM(VanillaFM):
-    def __init__(self, *args, **kwargs):
-        kwargs["time_sampling"] = "shifted"
-        super().__init__(*args, **kwargs)
-
-@torch.no_grad()
-def run_flow(model, x, c, device, n_steps=100):
-    """Generates samples by transporting noisy samples through the given vector field
-
-    Uses Euler integration for the neural vector field v(x, c).
-
-    Args:
-        model: Neural vector field model.
-        x: Samples from the base distribution.
-        c: Environment parameters.
-        n_steps: number of Euler steps.
-
-    Returns:
-        output x with same size as input x
-    """
-    dt = 1.0 / n_steps
-
-    t = torch.empty((x.shape[0], 1), device=device, dtype=x.dtype)
-
-    for i in range(n_steps):
-        t.fill_(i * dt)
-        v = model(x, t, c)
-        x.add_(v, alpha=dt)
-
-    return x
-
-
-def _get_environment_params(
-    env,
-    task_name: str):
-    """Extract environment parameters used for conditioning.
-
-    The function returns a 3‑tuple tailored to each task:
-      - door:  (handle_x, handle_y, handle_yaw)
-      - wipe:  (center_x, center_y, max_radius)
-      - two_arm: ((x_L+x_R)/2, (y_L+y_R)/2, yaw_L)
-      - nut:   (nut_x, nut_y, nut_yaw)
-
-    Args:
-        env: A RoboSuite environment instance.
-        task_name: One of {"door", "wipe", "two_arm", "nut"}.
-
-    Returns:
-        Tuple[float, float, float]: Environment summary for conditioning. (all conditions have length of 3)
-
-    Raises:
-        AssertionError: If `task_name` is unsupported.
-    """
-    assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
-    if task_name == "door":
-        handle_id  = env.door_handle_site_id
-        handle_pos = env._handle_xpos.copy()
-        R_handle   = env.sim.data.site_xmat[handle_id].reshape(3,3)
-        yaw = np.arctan2(R_handle[1,0], R_handle[0,0])
-        environment_parameters = (handle_pos[0], handle_pos[1], yaw)
-    elif task_name == "wipe":
-        max_radius, center, _ = env._get_wipe_information()
-        environment_parameters = (center[0], center[1], max_radius)
-    elif task_name == "two_arm":
-        handle_names = [n for n in env.sim.model.site_names if "handle" in n]
-        handle_ids   = [env.sim.model.site_name2id(n) for n in handle_names]
-        hidL, hidR = handle_ids[:2]
-        posL = env.sim.data.site_xpos[hidL].copy()
-        posR = env.sim.data.site_xpos[hidR].copy()
-        R0   = env.sim.data.site_xmat[hidL].reshape(3,3)
-        yaw  = np.arctan2(R0[1,0], R0[0,0])
-        environment_parameters = ((posL[0]+posR[0])/2, (posL[1]+posR[1])/2, yaw)
-    else:
-        nut_handle_id = env.object_site_ids[0]
-        nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
-        nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
-        R0 = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
-        yaw = np.arctan2(R0[1,0], R0[0,0])
-
-        peg_id  = env.peg1_body_id
-        peg_pos = env.sim.data.body_xpos[peg_id].copy()
-        environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1])
-
-    return environment_parameters
-
-
-def _to_action_from_q(q, task_name):
-    """Pack a joint vector into the action format expected by the controller.
-
-    The packing mirrors existing controller wrappers for each task. In particular,
-    compact policy gripper channels are normalized poses where 0 is closed and
-    1 is open; these are mapped to the controller's close/open command.
-
-    Args:
-        q: (D,) joint configuration for the whole system.
-        task_name: One of {"door", "nut", "wipe", "two_arm"}.
-
-    Returns:
-        np.ndarray: Action vector compatible with `env.step(action)` for the task.
-    """
-    q = np.asarray(q, dtype=np.float32)
-    if task_name in ["door", "nut"]:
-        arm_q = q[:7]
-        if q.shape[0] == 8:
-            grip_sc = _normalized_gripper_to_action(q[7])
-        else:
-            grip_sc = float((q[7] + q[8]) / 2.0)
-        return np.concatenate([arm_q, [grip_sc]])
-    elif task_name == "wipe":
-        return q[:7]
-    else:  # two_arm
-        arm1 = q[0:7]
-        if q.shape[0] == 16:
-            grip1 = _normalized_gripper_to_action(q[7])
-            arm2 = q[8:15]
-            grip2 = _normalized_gripper_to_action(q[15])
-        else:
-            grip1 = float((q[7] + q[8]) / 2.0)
-            arm2 = q[9:16]
-            grip2 = float((q[16] + q[17]) / 2.0)
-        return np.concatenate([arm1, [grip1], arm2, [grip2]])
-
-
-def _current_robot_q(env, task_name: str) -> np.ndarray:
-    full_qpos = env.sim.data.qpos.copy()
-    if task_name in ["door", "nut"]:
-        return np.concatenate([full_qpos[:7], [float(_gripper_qpos_to_normalized(full_qpos[7:9]))]])
-    if task_name == "wipe":
-        return full_qpos[:7]
-    return np.concatenate(
-        [
-            full_qpos[0:7],
-            [float(_gripper_qpos_to_normalized(full_qpos[7:9]))],
-            full_qpos[9:16],
-            [float(_gripper_qpos_to_normalized(full_qpos[16:18]))],
-        ]
-    )
-
-
 def _condition_from_env(env, task_name: str, static_c: np.ndarray, param_len: int) -> tuple[np.ndarray, np.ndarray]:
     q0 = _current_robot_q(env, task_name)
     dyn = get_dynamic_state(env, task_name)
@@ -677,14 +155,6 @@ def _condition_from_env(env, task_name: str, static_c: np.ndarray, param_len: in
     return cond.astype(np.float32), q0
 
 
-def _state_policy_success(env, task_name: str) -> bool:
-    if not env._check_success():
-        return False
-    if task_name == "two_arm":
-        z0 = env._handle0_xpos[2]
-        z1 = env._handle1_xpos[2]
-        return abs(z1 - z0) < 0.05
-    return True
 
 
 def _state_policy_env_worker(
@@ -947,6 +417,26 @@ def _rollout_batch(
     return successes, reward_sum, success_info, fail_info
 
 
+def _make_flow_runner(
+    model,
+    task_name: str,
+    seq_len: int,
+    dof: int,
+    condition_dim: int,
+    device: str,
+) -> VanillaFM:
+    return VanillaFM(
+        model,
+        optimizer=None,
+        scheduler=None,
+        task_name=task_name,
+        horizon=seq_len,
+        dof=dof,
+        condition_dim=condition_dim,
+        device=device,
+    )
+
+
 def _run_flow_batched(
     model,
     task_name: str,
@@ -965,6 +455,7 @@ def _run_flow_batched(
     n = cond_batch.shape[0]
     out = np.empty((n, seq_len, dof), dtype=np.float32)
     chunk = n if gpu_chunk_size is None or gpu_chunk_size <= 0 else gpu_chunk_size
+    flow = _make_flow_runner(model, task_name, seq_len, dof, cond_batch.shape[1], device)
 
     for s in range(0, n, chunk):
         e = min(n, s + chunk)
@@ -973,13 +464,13 @@ def _run_flow_batched(
         c = torch.from_numpy(cond_batch[s:e].astype(np.float32)).to(device)
         if use_cuda:
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                q_low = run_flow(model, x0, c, device, n_steps=flow_steps)
+                q_low = flow.run_flow(x0, c, n_steps=flow_steps)
             out[s:e] = _clip_policy_gripper_dims(q_low.float().cpu().numpy(), task_name)
             del q_low
             torch.cuda.empty_cache()
         else:
             with torch.inference_mode():
-                q_low = run_flow(model, x0, c, device, n_steps=flow_steps)
+                q_low = flow.run_flow(x0, c, n_steps=flow_steps)
             out[s:e] = _clip_policy_gripper_dims(q_low.cpu().numpy(), task_name)
     return out
 
@@ -1202,6 +693,9 @@ def eval_model(
 
     # pre-allocate to collect all q_low on CPU
     q_low_all = np.empty((trials, seq_len, dof), dtype=np.float32)
+    flow = None
+    if model is not None:
+        flow = _make_flow_runner(model, task_name, seq_len, dof, param_len, device)
 
     if q_low is None and model is not None:
         model.eval()
@@ -1211,12 +705,12 @@ def eval_model(
             c  = torch.from_numpy(val_params).to(device)
             if use_cuda:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                    q_low = run_flow(model, x0, c, device)          # (N, T, D) on CUDA
+                    q_low = flow.run_flow(x0, c)          # (N, T, D) on CUDA
                 q_low_all[:] = q_low.float().cpu().numpy()
                 del q_low; torch.cuda.empty_cache()
             else:
                 with torch.inference_mode():
-                    q_low = run_flow(model, x0, c, device)          # CPU path
+                    q_low = flow.run_flow(x0, c)          # CPU path
                 q_low_all[:] = q_low.cpu().numpy()
         else:
             # chunked single pass to cap VRAM
@@ -1228,12 +722,12 @@ def eval_model(
                 c  = torch.from_numpy(val_params[s:e]).to(device)
                 if use_cuda:
                     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                        q_low = run_flow(model, x0, c, device)
+                        q_low = flow.run_flow(x0, c)
                     q_low_all[s:e] = q_low.float().cpu().numpy()
                     del q_low; torch.cuda.empty_cache()
                 else:
                     with torch.inference_mode():
-                        q_low = run_flow(model, x0, c, device)
+                        q_low = flow.run_flow(x0, c)
                     q_low_all[s:e] = q_low.cpu().numpy()
     elif q_low is not None:
         q_low_all = q_low.cpu().numpy()
@@ -1245,12 +739,12 @@ def eval_model(
 
             if use_cuda:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
-                    q_low = run_flow(model, x0, c, device)          # (N, T, D) on CUDA
+                    q_low = flow.run_flow(x0, c)          # (N, T, D) on CUDA
                 q_low_all[:] = q_low.float().cpu().numpy()
                 del q_low; torch.cuda.empty_cache()
             else:
                 with torch.inference_mode():
-                    q_low = run_flow(model, x0, c, device)          # CPU path
+                    q_low = flow.run_flow(x0, c)          # CPU path
                 q_low_all[:] = q_low.cpu().numpy()
 
 

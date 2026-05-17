@@ -18,10 +18,10 @@ For each task, a dataset of arbitrary-size demonstrations can be generated using
 heuristic_{task_name}.py
 ```
 
-To generate a dataset, run ```bash Robot_simulation.generate_data``` as the following command from the **project root**:
+To generate a dataset, run ```bash Robot_simulation.environments.generate_data``` as the following command from the **project root**:
 
 ```bash
-python -m Robot_simulation.generate_data --n 1000 --task_name door --render --num_workers 10 --verbose
+python -m Robot_simulation.environments.generate_data --n 1000 --task_name door --render --num_workers 10 --verbose
 ```
 
 Each call automatically invokes the corresponding heuristic trajectory generator. Generated datasets are saved to:

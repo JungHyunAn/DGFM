@@ -8,8 +8,8 @@ from multiprocessing import get_context
 import copy
 from tqdm import tqdm
 from Robot_simulation.env_util import make_env
-from Robot_simulation.heuristics_util import render_trajectory, write_grid_video
-from Robot_simulation.FM_util import _rollout_batch, _generate_val_env
+from Robot_simulation.environments.heuristics_util import render_trajectory, write_grid_video
+from Robot_simulation.models.FM_util import _rollout_batch, _generate_val_env
 
 
 def cosine_beta_schedule(T: int, s: float = 0.008, max_beta: float = 0.999):

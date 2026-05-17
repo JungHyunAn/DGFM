@@ -6,7 +6,7 @@ from typing import List, Dict, Tuple
 from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_slerp, quat_multiply, quat_inverse
-from Robot_simulation.heuristics_util import get_dynamic_state
+from Robot_simulation.environments.heuristics_util import get_dynamic_state
 
 
 def generate_two_arm_trajectory(
