@@ -455,6 +455,17 @@ def _run_flow_batched(
     n = cond_batch.shape[0]
     out = np.empty((n, seq_len, dof), dtype=np.float32)
     chunk = n if gpu_chunk_size is None or gpu_chunk_size <= 0 else gpu_chunk_size
+
+    if hasattr(model, "sample"):
+        for s in range(0, n, chunk):
+            e = min(n, s + chunk)
+            with torch.inference_mode():
+                q_low = model.sample(cond_batch[s:e].astype(np.float32))
+            if isinstance(q_low, torch.Tensor):
+                q_low = q_low.detach().cpu().numpy()
+            out[s:e] = _clip_policy_gripper_dims(np.asarray(q_low, dtype=np.float32), task_name)
+        return out
+
     flow = _make_flow_runner(model, task_name, seq_len, dof, cond_batch.shape[1], device)
 
     for s in range(0, n, chunk):

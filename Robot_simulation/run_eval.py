@@ -345,27 +345,18 @@ def train_and_eval_model(
             data_static_env.append(grp["environment_parameters"]["values"][:])
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
 
-        if model_type == "MPPCA":
-            episode_traj = np.asarray([q[:seq_len] for q in data_trajectories], dtype=np.float32)
-            episode_cond = np.asarray(data_static_env, dtype=np.float32)
-            data_trajectories = torch.from_numpy(episode_traj).float().to(device)
-            data_env_params = torch.from_numpy(episode_cond).float().to(device)
-            param_len = episode_cond.shape[1]
-            num_demos = len(selected_ep_keys)
-            num_windows = episode_traj.shape[0]
-        else:
-            window_traj, window_cond = build_state_conditioned_windows(
-                data_trajectories,
-                data_dynamic,
-                data_static_env,
-                horizon=seq_len,
-                stride=window_stride,
-            )
-            data_trajectories = torch.from_numpy(window_traj).float().to(device)
-            data_env_params = torch.from_numpy(window_cond).float().to(device)
-            param_len = window_cond.shape[1]
-            num_demos = len(selected_ep_keys)
-            num_windows = window_traj.shape[0]
+        window_traj, window_cond = build_state_conditioned_windows(
+            data_trajectories,
+            data_dynamic,
+            data_static_env,
+            horizon=seq_len,
+            stride=window_stride,
+        )
+        data_trajectories = torch.from_numpy(window_traj).float().to(device)
+        data_env_params = torch.from_numpy(window_cond).float().to(device)
+        param_len = window_cond.shape[1]
+        num_demos = len(selected_ep_keys)
+        num_windows = window_traj.shape[0]
 
     # sample the target trajectories & its environment parameters
     torch.manual_seed(seed)
@@ -470,6 +461,9 @@ def train_and_eval_model(
                 pca_n_jobs=pca_n_jobs,
                 mixture_reg=mixture_reg,
                 mixture_orth_sigma=mixture_orth_sigma,
+                dgfm_truncated=dgfm_truncated,
+                dgfm_trunc_low=dgfm_trunc_low,
+                dgfm_trunc_high=dgfm_trunc_high,
             )
 
             if model_type == "DGFM":
@@ -479,9 +473,6 @@ def train_and_eval_model(
                     max_epochs=max_epochs,
                     batch_size=batch_size,
                     interpolation_path=interpolation_path,
-                    dgfm_truncated=dgfm_truncated,
-                    dgfm_trunc_low=dgfm_trunc_low,
-                    dgfm_trunc_high=dgfm_trunc_high,
                     val_period=val_period,
                     early_stopping=early_stopping,
                     stop_criteria=stop_criteria,
@@ -535,14 +526,7 @@ def train_and_eval_model(
     eval_params = np.asarray(env_params_list, dtype=np.float32)
 
     q_low = None
-    eval_model_obj = best_model
-    if model_type == "MPPCA":
-        q_low = flow.sample(
-            eval_params,
-            truncated=dgfm_truncated,
-            trunc=(dgfm_trunc_low, dgfm_trunc_high),
-        )
-        eval_model_obj = None
+    eval_model_obj = flow if model_type == "MPPCA" else best_model
 
     success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
                                                 model_class=VectorField,

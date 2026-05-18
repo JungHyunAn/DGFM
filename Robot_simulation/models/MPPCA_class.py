@@ -29,6 +29,8 @@ class MPPCA:
         self.device = device
         self.gripper_idx = gripper_idx
         self.mixture_sampler = None
+        self.sample_truncated = True
+        self.sample_trunc = (-1.5, 1.5)
 
     def train(
         self,
@@ -48,6 +50,9 @@ class MPPCA:
         pca_n_jobs: int = -1,
         mixture_reg: float = 1e-6,
         mixture_orth_sigma: float = 0.0,
+        dgfm_truncated: bool = True,
+        dgfm_trunc_low: float = -1.5,
+        dgfm_trunc_high: float = 1.5,
         **_,
     ):
         if max_pca_samples <= 0:
@@ -56,6 +61,13 @@ class MPPCA:
             raise ValueError(f"cluster_merge_k must be positive, got {cluster_merge_k}")
         if not 0.0 < cluster_outlier_q < 1.0:
             raise ValueError(f"cluster_outlier_q must be in (0, 1), got {cluster_outlier_q}")
+        if dgfm_trunc_low >= dgfm_trunc_high:
+            raise ValueError(
+                f"dgfm_trunc_low must be smaller than dgfm_trunc_high, "
+                f"got {dgfm_trunc_low} >= {dgfm_trunc_high}"
+            )
+        self.sample_truncated = dgfm_truncated
+        self.sample_trunc = (dgfm_trunc_low, dgfm_trunc_high)
 
         print("Clustering dataset for MPPCA . . .")
         x_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)
@@ -104,11 +116,16 @@ class MPPCA:
         conditions,
         *,
         deterministic_component: bool = False,
-        truncated: bool = True,
-        trunc=(-1.5, 1.5),
+        truncated: bool | None = None,
+        trunc=None,
     ):
         if self.mixture_sampler is None:
             raise RuntimeError("MPPCA must be trained before sampling.")
+
+        if truncated is None:
+            truncated = self.sample_truncated
+        if trunc is None:
+            trunc = self.sample_trunc
 
         x_flat, _, _ = self.mixture_sampler.sample_cond(
             conditions,
@@ -138,6 +155,9 @@ class MPPCA:
             "reg": sampler.reg,
             "orth_sigma": sampler.orth_sigma,
         }
+
+    def eval(self):
+        return self
 
     def save(self, path: str):
         torch.save(self.state_dict(), path)
