@@ -13,6 +13,8 @@
   "evaluation_samples": 1,
   "horizon": 16,
   "window_stride": 1,
+  "recorded_control_freq": 20,
+  "trajectory_control_freq": 20,
   "max_policy_steps": 20,
   "early_stopping": false,
   "seed": 2002

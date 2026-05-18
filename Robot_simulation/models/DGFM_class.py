@@ -474,8 +474,8 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
             f"rank min/p25/median/p75/max={ranks_arr.min()}/{rank_p25:.1f}/"
             f"{rank_median:.1f}/{rank_p75:.1f}/{ranks_arr.max()}, "
             f"mean={ranks_arr.mean():.2f}, packed rank={packed_d}, "
-            f"rank counts={rank_counts}, retained eta min/mean={retained_arr.min():.4f}/"
-            f"{retained_arr.mean():.4f}, degenerate clusters={degenerate_clusters}."
+            f"retained eta min/mean={retained_arr.min():.4f}/{retained_arr.mean():.4f}, /"
+            f"degenerate clusters={degenerate_clusters}."
         )
     else:
         print(f"[DGFM] Global PCA eta={eta:.4f}; no clusters found (packed rank={packed_d}).")
@@ -508,32 +508,80 @@ class DGFM(VanillaFM):
     path_weight_atol = 1e-5
 
     def _path_weights(self, t, interpolation_path):
-        if interpolation_path != "piecewise-linear-midpoint":
-            raise ValueError(
+        if interpolation_path == "piecewise-linear-midpoint":
+            midpoint = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
+            left = t < midpoint
+            right = t > midpoint
+            mid = ~(left | right)
+
+            a = torch.where(left, 1.0 - 2.0 * t, torch.zeros_like(t))
+            b_left = 2.0 * t
+            b_right = 2.0 - 2.0 * t
+            b = torch.where(left | mid, b_left, b_right)
+            c = torch.where(right, 2.0 * t - 1.0, torch.zeros_like(t))
+
+            a_dot = torch.where(left, -2.0 * torch.ones_like(t), torch.zeros_like(t))
+            b_dot = torch.where(left, 2.0 * torch.ones_like(t), -2.0 * torch.ones_like(t))
+            c_dot = torch.where(right, 2.0 * torch.ones_like(t), torch.zeros_like(t))
+
+            a_dot = torch.where(mid, -1.0 * torch.ones_like(t), a_dot)
+            b_dot = torch.where(mid, torch.zeros_like(t), b_dot)
+            c_dot = torch.where(mid, torch.ones_like(t), c_dot)
+            self._check_path_partition(a, b, c)
+            return a, b, c, a_dot, b_dot, c_dot
+        
+        if interpolation_path == "cosine-midpoint":
+            # Fixed injection point tau = 0.5:
+            # x0 -> y for t in [0, 0.5], then y -> x1 for t in [0.5, 1].
+            tau = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
+            left = t <= tau
+            right = ~left
+
+            # Smoothstep: s(r) = (1 - cos(pi r)) / 2
+            # s'(r) = (pi / 2) sin(pi r)
+            pi = torch.as_tensor(torch.pi, dtype=t.dtype, device=t.device)
+
+            r_left = torch.clamp(t / tau, 0.0, 1.0)
+            r_right = torch.clamp((t - tau) / (1.0 - tau), 0.0, 1.0)
+
+            s_left = 0.5 * (1.0 - torch.cos(pi * r_left))
+            s_right = 0.5 * (1.0 - torch.cos(pi * r_right))
+
+            sdot_left = 0.5 * pi * torch.sin(pi * r_left) / tau
+            sdot_right = 0.5 * pi * torch.sin(pi * r_right) / (1.0 - tau)
+
+            # Left segment: x_t = (1 - s)x0 + s y
+            a_left = 1.0 - s_left
+            b_left = s_left
+            c_left = torch.zeros_like(t)
+
+            a_dot_left = -sdot_left
+            b_dot_left = sdot_left
+            c_dot_left = torch.zeros_like(t)
+
+            # Right segment: x_t = (1 - s)y + s x1
+            a_right = torch.zeros_like(t)
+            b_right = 1.0 - s_right
+            c_right = s_right
+
+            a_dot_right = torch.zeros_like(t)
+            b_dot_right = -sdot_right
+            c_dot_right = sdot_right
+
+            a = torch.where(left, a_left, a_right)
+            b = torch.where(left, b_left, b_right)
+            c = torch.where(left, c_left, c_right)
+
+            a_dot = torch.where(left, a_dot_left, a_dot_right)
+            b_dot = torch.where(left, b_dot_left, b_dot_right)
+            c_dot = torch.where(left, c_dot_left, c_dot_right)
+
+            self._check_path_partition(a, b, c)
+            return a, b, c, a_dot, b_dot, c_dot
+        
+        raise ValueError(
                 f"Unsupported DGFM interpolation path '{interpolation_path}'. "
-                "Expected 'piecewise-linear-midpoint'."
             )
-
-        midpoint = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
-        left = t < midpoint
-        right = t > midpoint
-        mid = ~(left | right)
-
-        a = torch.where(left, 1.0 - 2.0 * t, torch.zeros_like(t))
-        b_left = 2.0 * t
-        b_right = 2.0 - 2.0 * t
-        b = torch.where(left | mid, b_left, b_right)
-        c = torch.where(right, 2.0 * t - 1.0, torch.zeros_like(t))
-
-        a_dot = torch.where(left, -2.0 * torch.ones_like(t), torch.zeros_like(t))
-        b_dot = torch.where(left, 2.0 * torch.ones_like(t), -2.0 * torch.ones_like(t))
-        c_dot = torch.where(right, 2.0 * torch.ones_like(t), torch.zeros_like(t))
-
-        a_dot = torch.where(mid, -1.0 * torch.ones_like(t), a_dot)
-        b_dot = torch.where(mid, torch.zeros_like(t), b_dot)
-        c_dot = torch.where(mid, torch.ones_like(t), c_dot)
-        self._check_path_partition(a, b, c)
-        return a, b, c, a_dot, b_dot, c_dot
 
     def _check_path_partition(self, a, b, c):
         err = torch.max(torch.abs(a + b + c - 1.0)).item()
@@ -634,6 +682,8 @@ class DGFM(VanillaFM):
         dgfm_truncated: bool = True,
         dgfm_trunc_low: float = -1.5,
         dgfm_trunc_high: float = 1.5,
+        recorded_control_freq: int | float | None = None,
+        trajectory_control_freq: int | float | None = None,
     ):
         if mf is not None or n_t_local is not None or n_t_global is not None:
             print("[DGFM] Ignoring deprecated mf/n_t_local/n_t_global; using n_t only.")
@@ -739,7 +789,9 @@ class DGFM(VanillaFM):
                     success_rate, avg_reward = eval_model(
                         self.model, VectorField, self.task_name, self.horizon, self.dof,
                         self.condition_dim, self.gripper_idx, val_params,
-                        env_settings_all, self.device, trials=val_trials
+                        env_settings_all, self.device, trials=val_trials,
+                        recorded_control_freq=recorded_control_freq,
+                        trajectory_control_freq=trajectory_control_freq
                     )
 
                     if not torch.is_grad_enabled():

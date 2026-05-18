@@ -25,6 +25,8 @@ def run_trained(
     vision_encoder_class = None,
     video_name: str = "run",
     seed: int = 42,
+    recorded_control_freq: int | float = 20,
+    trajectory_control_freq: int | float = 20,
 ):
     """
     Load a trained flow model and render a single trajectory rollout to video.
@@ -132,7 +134,9 @@ def run_trained(
                                                 trials=evaluation_samples,
                                                 render_width=4,
                                                 render_num=8,
-                                                base_seed=seed)
+                                                base_seed=seed,
+                                                recorded_control_freq=recorded_control_freq,
+                                                trajectory_control_freq=trajectory_control_freq)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
     return
@@ -156,6 +160,8 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cpu",
                         help="Device to run the model on, e.g., 'cpu' or 'cuda'")
     parser.add_argument("--eval_samples", type=int, default=100)
+    parser.add_argument("--recorded_control_freq", type=float, default=20)
+    parser.add_argument("--trajectory_control_freq", type=float, default=20)
     parser.add_argument("--use_vision", action="store_true")
     parser.add_argument("--vision_encoder_path", type=str, default=None)
     parser.add_argument("--vision_encoder_class", type=str, default=None)
@@ -183,5 +189,7 @@ if __name__ == "__main__":
         use_vision=args.use_vision,
         vision_encoder_path=args.vision_encoder_path,
         vision_encoder_class=args.vision_encoder_class,
-        seed=args.seed
+        seed=args.seed,
+        recorded_control_freq=args.recorded_control_freq,
+        trajectory_control_freq=args.trajectory_control_freq
     )

@@ -22,6 +22,8 @@
   "evaluation_samples": 100,
   "horizon": 32,
   "window_stride": 1,
+  "recorded_control_freq": 20,
+  "trajectory_control_freq": 20,
   "max_policy_steps": 20,
   "seed": 1000
 }

@@ -50,6 +50,7 @@ import numpy as np
 import os
 import torch
 
+from scipy.interpolate import CubicSpline
 from multiprocessing import get_context
 from concurrent.futures import ProcessPoolExecutor
 from typing import Tuple, List
@@ -77,23 +78,79 @@ from Robot_simulation.environments.heuristics_util import (
 )
 
 
+def get_trajectory_sample_step(
+    recorded_control_freq: int | float | None,
+    trajectory_control_freq: int | float | None,
+) -> int:
+    if recorded_control_freq is None:
+        recorded_control_freq = trajectory_control_freq
+    if trajectory_control_freq is None:
+        trajectory_control_freq = recorded_control_freq
+    if recorded_control_freq is None or trajectory_control_freq is None:
+        return 1
+    if recorded_control_freq <= 0:
+        raise ValueError("recorded_control_freq must be positive")
+    if trajectory_control_freq <= 0:
+        raise ValueError("trajectory_control_freq must be positive")
+    if trajectory_control_freq > recorded_control_freq:
+        raise ValueError(
+            "trajectory_control_freq cannot exceed recorded_control_freq when sampling recorded trajectories"
+        )
+    ratio = recorded_control_freq / trajectory_control_freq
+    sample_step = int(round(ratio))
+    if not np.isclose(ratio, sample_step):
+        raise ValueError(
+            "recorded_control_freq must be an integer multiple of trajectory_control_freq; "
+            f"got {recorded_control_freq} and {trajectory_control_freq}"
+        )
+    return sample_step
+
+
+def _upsample_policy_trajectory(
+    q_low: np.ndarray,
+    task_name: str,
+    recorded_control_freq: int | float | None,
+    trajectory_control_freq: int | float | None,
+) -> np.ndarray:
+    sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
+    q_low = _clip_policy_gripper_dims(np.asarray(q_low, dtype=np.float32), task_name)
+    if sample_step == 1:
+        return q_low
+    if q_low.shape[0] < 2:
+        return np.repeat(q_low, sample_step, axis=0)
+
+    t_low = np.arange(q_low.shape[0], dtype=np.float32) / float(trajectory_control_freq)
+    target_len = (q_low.shape[0] - 1) * sample_step + 1
+    t_high = np.linspace(t_low[0], t_low[-1], target_len, dtype=np.float32)
+    spline = CubicSpline(t_low, q_low, axis=0, extrapolate=False)
+    q_high = spline(t_high).astype(np.float32)
+    return _clip_policy_gripper_dims(q_high, task_name)
+
+
 def build_state_conditioned_windows(
     trajectories: np.ndarray,
     dynamic_states: np.ndarray | None,
     static_env_params: np.ndarray,
     horizon: int,
     stride: int = 1,
+    recorded_control_freq: int | float | None = None,
+    trajectory_control_freq: int | float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert full episodes into diffusion-policy-style FM training windows.
 
     Each training item maps
     ``[current_joint_angles, current_dynamic_state, static_environment_params]``
     to the next fixed-horizon joint trajectory.
+
+    If ``trajectory_control_freq`` is lower than ``recorded_control_freq``, each
+    episode is downsampled before windows are built. For example, 20 Hz recorded
+    data with a 5 Hz trajectory rate keeps one sample every four recorded steps.
     """
     if horizon <= 0:
         raise ValueError("horizon must be positive")
     if stride <= 0:
         raise ValueError("stride must be positive")
+    sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
 
     xs, cs = [], []
     n_eps = len(trajectories)
@@ -106,6 +163,9 @@ def build_state_conditioned_windows(
             dyn = np.asarray(dyn, dtype=np.float32)
             if dyn.shape[0] != len(q):
                 raise ValueError(f"dynamic_states[{ep}] length {dyn.shape[0]} != trajectory length {len(q)}")
+        if sample_step > 1:
+            q = q[::sample_step]
+            dyn = dyn[::sample_step]
         env_c = np.asarray(static_env_params[ep], dtype=np.float32)
         for start in range(0, len(q) - horizon + 1, stride):
             xs.append(q[start:start + horizon])
@@ -166,6 +226,8 @@ def _state_policy_env_worker(
     seq_len: int,
     param_len: int,
     max_policy_steps: int,
+    recorded_control_freq: int | float | None,
+    trajectory_control_freq: int | float | None,
 ):
     env = None
     executed = []
@@ -187,7 +249,12 @@ def _state_policy_env_worker(
             if msg.get("type") != "act":
                 raise ValueError(f"Unknown worker message: {msg}")
 
-            q_low = _clip_policy_gripper_dims(msg["q_low"], task_name)
+            q_low = _upsample_policy_trajectory(
+                msg["q_low"],
+                task_name,
+                recorded_control_freq,
+                trajectory_control_freq,
+            )
 
             done = False
             for q in q_low:
@@ -373,7 +440,9 @@ def _rollout_batch(
     task_name: str,
     q_low_batch: np.ndarray,          # (m, T, D) on CPU
     env_settings: List[dict],         # length m
-    print_true: bool) -> Tuple[int, float, list, list]:
+    print_true: bool,
+    recorded_control_freq: int | float | None = None,
+    trajectory_control_freq: int | float | None = None) -> Tuple[int, float, list, list]:
     """Worker: restore envs from settings, upsample to controller rate, roll out CPU-only."""
     successes, reward_sum = 0, 0.0
     success_info, fail_info = [], []
@@ -389,8 +458,12 @@ def _rollout_batch(
                        environment_setting=setting,
                        training=True)
 
-        # Policy windows are already sampled at the environment control rate.
-        q_low = _clip_policy_gripper_dims(q_low_batch[i], task_name)
+        q_low = _upsample_policy_trajectory(
+            q_low_batch[i],
+            task_name,
+            recorded_control_freq,
+            trajectory_control_freq,
+        )
         
         for q in q_low:
             env.step(_to_action_from_q(q, task_name))
@@ -501,6 +574,8 @@ def _rollout_state_policy_synchronized(
     max_policy_steps: int,
     flow_steps: int,
     gpu_chunk_size: int | None = None,
+    recorded_control_freq: int | float | None = None,
+    trajectory_control_freq: int | float | None = None,
 ) -> Tuple[float, float, list, list]:
     """Synchronize state-conditioned environments and batch flow inference in the parent."""
     rng = np.random.RandomState(base_seed)
@@ -529,6 +604,8 @@ def _rollout_state_policy_synchronized(
                     seq_len,
                     param_len,
                     max_policy_steps,
+                    recorded_control_freq,
+                    trajectory_control_freq,
                 ),
             )
             proc.start()
@@ -610,7 +687,9 @@ def eval_model(
     q_low = None,
     base_mixture = False,
     max_policy_steps: int = 20,
-    flow_steps: int = 100) -> Tuple[float, float]:
+    flow_steps: int = 100,
+    recorded_control_freq: int | float | None = None,
+    trajectory_control_freq: int | float | None = None) -> Tuple[float, float]:
     """ Evaluates a flow model on given environments.
 
     Multiprocessing is used by calling _rollout_batch to evaluate multiple environments in parallel.
@@ -662,6 +741,8 @@ def eval_model(
             max_policy_steps=max_policy_steps,
             flow_steps=flow_steps,
             gpu_chunk_size=gpu_chunk_size,
+            recorded_control_freq=recorded_control_freq,
+            trajectory_control_freq=trajectory_control_freq,
         )
         success_info = success_all[:render_num]
         fail_slots = max(0, render_width * render_width - render_num)
@@ -786,7 +867,9 @@ def eval_model(
                 task_name,
                 q_low_all[s:e],                 # numpy slice (copies view to child)
                 env_settings_all[s:e],
-                s == 0
+                s == 0,
+                recorded_control_freq,
+                trajectory_control_freq
             ))
         for fut in futs:
             succ, rew, info_s, info_f = fut.result()

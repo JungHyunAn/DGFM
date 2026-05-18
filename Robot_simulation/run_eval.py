@@ -143,6 +143,7 @@ from Robot_simulation.models.FM_util import (
     _align_handle_to_nut,
     build_state_conditioned_windows,
     eval_model,
+    get_trajectory_sample_step,
 )
 from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.MPPCA_class import MPPCA
@@ -273,6 +274,8 @@ def train_and_eval_model(
     seed: int = 2002,
     horizon: int = 32,
     window_stride: int = 1,
+    recorded_control_freq: int | float = 20,
+    trajectory_control_freq: int | float = 20,
     max_policy_steps: int = 20,
     cluster_partition: int = 5,
     cluster_jaccard_thresh: float = 0.8,
@@ -329,7 +332,9 @@ def train_and_eval_model(
 
         full_len, dof = traj0.shape
         dyn_dim = dyn0.shape[1]
-        seq_len = min(horizon, full_len)
+        sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
+        downsampled_full_len = len(traj0[::sample_step])
+        seq_len = min(horizon, downsampled_full_len)
         data_trajectories = []
         data_dynamic = []
         data_static_env = []
@@ -351,6 +356,8 @@ def train_and_eval_model(
             data_static_env,
             horizon=seq_len,
             stride=window_stride,
+            recorded_control_freq=recorded_control_freq,
+            trajectory_control_freq=trajectory_control_freq,
         )
         data_trajectories = torch.from_numpy(window_traj).float().to(device)
         data_env_params = torch.from_numpy(window_cond).float().to(device)
@@ -381,6 +388,8 @@ def train_and_eval_model(
         f"model_type={model_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
         f"horizon_arg={horizon} | window_stride={window_stride} | "
+        f"recorded_control_freq={recorded_control_freq} | "
+        f"trajectory_control_freq={trajectory_control_freq} | sample_step={sample_step} | "
         f"max_policy_steps={max_policy_steps} | cluster_partition={cluster_partition} | "
         f"learning_rate={learning_rate} | weight_decay={weight_decay} | "
         f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
@@ -477,6 +486,8 @@ def train_and_eval_model(
                     early_stopping=early_stopping,
                     stop_criteria=stop_criteria,
                     val_trials=val_trials,
+                    recorded_control_freq=recorded_control_freq,
+                    trajectory_control_freq=trajectory_control_freq,
                 )
             else:
                 best_model, last_model, recs, mixture_sampler = flow.train(**train_kwargs)
@@ -491,6 +502,8 @@ def train_and_eval_model(
                 early_stopping=early_stopping,
                 stop_criteria=stop_criteria,
                 val_trials=val_trials,
+                recorded_control_freq=recorded_control_freq,
+                trajectory_control_freq=trajectory_control_freq,
             )
         training_thread_time_seconds = time.thread_time() - train_time_start
         print(f"Training thread time: {training_thread_time_seconds:.3f}s")
@@ -546,7 +559,9 @@ def train_and_eval_model(
                                                 base_seed=seed+1,
                                                 q_low=q_low,
                                                 base_mixture=False,
-                                                max_policy_steps=max_policy_steps)
+                                                max_policy_steps=max_policy_steps,
+                                                recorded_control_freq=recorded_control_freq,
+                                                trajectory_control_freq=trajectory_control_freq)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
 
@@ -562,6 +577,9 @@ def train_and_eval_model(
             "num_windows":     num_windows,
             "horizon":         seq_len,
             "window_stride":   window_stride,
+            "recorded_control_freq": recorded_control_freq,
+            "trajectory_control_freq": trajectory_control_freq,
+            "trajectory_sample_step": sample_step,
             "max_policy_steps": max_policy_steps,
             "task_name":       task_name,
             "n_t":             n_t,
@@ -705,6 +723,8 @@ if __name__ == "__main__":
     parser.add_argument("--evaluation_samples", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--window_stride", type=int, default=1)
+    parser.add_argument("--recorded_control_freq", type=float, default=20)
+    parser.add_argument("--trajectory_control_freq", type=float, default=20)
     parser.add_argument("--max_policy_steps", type=int, default=20)
     parser.add_argument("--cluster_partition", type=int, default=5)
     parser.add_argument("--cluster_jaccard_thresh", type=float, default=0.8)
@@ -779,6 +799,8 @@ if __name__ == "__main__":
         seed               = args.seed,
         horizon            = args.horizon,
         window_stride      = args.window_stride,
+        recorded_control_freq = args.recorded_control_freq,
+        trajectory_control_freq = args.trajectory_control_freq,
         max_policy_steps   = args.max_policy_steps,
         cluster_partition  = args.cluster_partition,
         cluster_jaccard_thresh = args.cluster_jaccard_thresh,

@@ -297,6 +297,8 @@ class VanillaFM:
         early_stopping: bool = True,
         stop_criteria: int = 3,
         val_trials: int = 25,
+        recorded_control_freq: int | float | None = None,
+        trajectory_control_freq: int | float | None = None,
     ):
         N = target_trajectories.shape[0]
         best_avg_reward = 0.0
@@ -362,6 +364,8 @@ class VanillaFM:
                         env_settings_all,
                         self.device,
                         trials=val_trials,
+                        recorded_control_freq=recorded_control_freq,
+                        trajectory_control_freq=trajectory_control_freq,
                     )
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                     if success_rate < best_success_rate:
