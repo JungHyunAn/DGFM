@@ -40,7 +40,7 @@ What this script does
 Command-line arguments
 ----------------------
 Required:
-- `--FM_type`          ∈ {UniformFM, ShiftedFM, DGFM}
+- `--model_type`       in {UniformFM, ShiftedFM, DGFM, MPPCA}
 - `--N`                Number of episodes to draw from the dataset
 - `--dataset_path`     Path to HDF5 produced by the data generator
 - `--task_name`        ∈ {door, wipe, two_arm, nut}
@@ -85,7 +85,7 @@ Example invocations
 -------------------
 Uniform FM:
   python -m Robot_simulation.run_eval \
-    --FM_type UniformFM --N 5000 \
+    --model_type UniformFM --N 5000 \
     --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
     --task_name door --results_path Robot_simulation/eval_results \
     --device cuda --val_period 5 --batch_size 250 --n_t 4 \
@@ -93,11 +93,11 @@ Uniform FM:
 
 Shifted FM:
   python -m Robot_simulation.run_eval \
-    --FM_type ShiftedFM --N 5000 ... (same as above)
+    --model_type ShiftedFM --N 5000 ... (same as above)
 
 DGFM:
   python -m Robot_simulation.run_eval \
-    --FM_type DGFM --n_t 4 --interpolation_path piecewise-linear-midpoint \
+    --model_type DGFM --n_t 4 --interpolation_path piecewise-linear-midpoint \
     --N 5000 ... (paths as above)
 
 Behavioral notes & tips
@@ -145,6 +145,7 @@ from Robot_simulation.models.FM_util import (
     eval_model,
 )
 from Robot_simulation.models.DGFM_class import DGFM
+from Robot_simulation.models.MPPCA_class import MPPCA
 from Robot_simulation.env_util import make_env
 from Robot_simulation.environments.heuristics_util import _get_environment_params
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
@@ -177,6 +178,24 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
         return min_lr_scale + (1.0 - min_lr_scale) * cosine
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+def _default_cluster_rank(task_name: str, seq_len: int, param_len: int) -> int | None:
+    if task_name == "door":
+        return seq_len * 2 + param_len
+    if task_name == "wipe":
+        return seq_len * 3
+    if task_name == "two_arm":
+        return seq_len * 3 + 3
+    if task_name == "nut":
+        return int(seq_len * 3.2)
+    return None
+
+
+def _default_cluster_size(train_N: int, full_dimension: int, cluster_partition: int, cluster_d: int | None) -> int | None:
+    if cluster_d is None:
+        return None
+    return max(int(train_N / cluster_partition), full_dimension + 5)
 
 
 def _spawn_env_once(task_name: str, seed: int, idx: int,
@@ -227,8 +246,8 @@ def _spawn_env_once(task_name: str, seed: int, idx: int,
     return idx, setting, params, vision
         
 
-def train_and_eval_FM(
-    FM_type: str,
+def train_and_eval_model(
+    model_type: str,
     N: int,
     dataset_path: str,
     task_name: str,
@@ -273,13 +292,16 @@ def train_and_eval_FM(
     dgfm_trunc_low: float = -1.5,
     dgfm_trunc_high: float = 1.5,
 ):
-    flow_class_map = {
+    fm_class_map = {
         "UniformFM": UniformFM,
         "ShiftedFM": ShiftedFM,
         "DGFM": DGFM,
     }
-    if FM_type not in flow_class_map:
-        raise ValueError(f"Unsupported FM_type={FM_type}. Expected one of {sorted(flow_class_map)}")
+    supported_model_types = sorted([*fm_class_map, "MPPCA"])
+    if model_type not in supported_model_types:
+        raise ValueError(f"Unsupported model type={model_type}. Expected one of {supported_model_types}")
+    if model_type == "MPPCA" and model_path is not None:
+        raise ValueError("Loading a saved MPPCA sampler from --model_path is not supported yet.")
 
     timestamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime("%Y%m%dT%H%M%S")
 
@@ -323,18 +345,27 @@ def train_and_eval_FM(
             data_static_env.append(grp["environment_parameters"]["values"][:])
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
 
-        window_traj, window_cond = build_state_conditioned_windows(
-            data_trajectories,
-            data_dynamic,
-            data_static_env,
-            horizon=seq_len,
-            stride=window_stride,
-        )
-        data_trajectories = torch.from_numpy(window_traj).float().to(device)
-        data_env_params = torch.from_numpy(window_cond).float().to(device)
-        param_len = window_cond.shape[1]
-        num_demos = len(selected_ep_keys)
-        num_windows = window_traj.shape[0]
+        if model_type == "MPPCA":
+            episode_traj = np.asarray([q[:seq_len] for q in data_trajectories], dtype=np.float32)
+            episode_cond = np.asarray(data_static_env, dtype=np.float32)
+            data_trajectories = torch.from_numpy(episode_traj).float().to(device)
+            data_env_params = torch.from_numpy(episode_cond).float().to(device)
+            param_len = episode_cond.shape[1]
+            num_demos = len(selected_ep_keys)
+            num_windows = episode_traj.shape[0]
+        else:
+            window_traj, window_cond = build_state_conditioned_windows(
+                data_trajectories,
+                data_dynamic,
+                data_static_env,
+                horizon=seq_len,
+                stride=window_stride,
+            )
+            data_trajectories = torch.from_numpy(window_traj).float().to(device)
+            data_env_params = torch.from_numpy(window_cond).float().to(device)
+            param_len = window_cond.shape[1]
+            num_demos = len(selected_ep_keys)
+            num_windows = window_traj.shape[0]
 
     # sample the target trajectories & its environment parameters
     torch.manual_seed(seed)
@@ -356,7 +387,7 @@ def train_and_eval_FM(
     # define models
     print(
         "[config] "
-        f"FM_type={FM_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
+        f"model_type={model_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
         f"horizon_arg={horizon} | window_stride={window_stride} | "
         f"max_policy_steps={max_policy_steps} | cluster_partition={cluster_partition} | "
@@ -366,32 +397,44 @@ def train_and_eval_FM(
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"seed={seed} | device={device}"
     )
-    model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer=optimizer,
-        warmup_epochs=warmup_steps,
-        total_epochs=max_epochs
-    )
-    flow = flow_class_map[FM_type](
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        task_name=task_name,
-        horizon=seq_len,
-        dof=dof,
-        condition_dim=param_len,
-        gripper_idx=gripper_idx,
-        time_sampling=time_sampling,
-        beta_a=beta_a,
-        beta_b=beta_b,
-        device=device,
-    )
+    model = None
+    flow = None
+    if model_type in fm_class_map:
+        model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            warmup_epochs=warmup_steps,
+            total_epochs=max_epochs
+        )
+        flow = fm_class_map[model_type](
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            task_name=task_name,
+            horizon=seq_len,
+            dof=dof,
+            condition_dim=param_len,
+            gripper_idx=gripper_idx,
+            time_sampling=time_sampling,
+            beta_a=beta_a,
+            beta_b=beta_b,
+            device=device,
+        )
+    elif model_type == "MPPCA":
+        flow = MPPCA(
+            task_name=task_name,
+            horizon=seq_len,
+            dof=dof,
+            condition_dim=param_len,
+            gripper_idx=gripper_idx,
+            device=device,
+        )
 
     # train model
     print(
         f"[{datetime.now(ZoneInfo('Asia/Seoul')).isoformat()}] "
-        f"Starting {FM_type} training for {task_name} with {num_demos} demos -> {train_N} windows..."
+        f"Starting {model_type} training for {task_name} with {num_demos} demos -> {train_N} windows..."
     )
     
     training_thread_time_seconds = None
@@ -403,35 +446,19 @@ def train_and_eval_FM(
         cluster_size = None
         train_time_start = time.thread_time()
 
-        if FM_type == "DGFM":
+        if model_type in ("DGFM", "MPPCA"):
             if cluster_partition <= 0:
                 raise ValueError(f"cluster_partition must be positive, got {cluster_partition}")
 
             full_dimension = seq_len * dof
-            if task_name == "door":
-                cluster_d = seq_len * 2 + param_len # end effector stays on 1-dimension path + env_params
-            elif task_name == "wipe":
-                cluster_d = seq_len * 3 # 75 | end effector stays on 2-dimension path (only x, y movement)
-            elif task_name == "two_arm":
-                # cluster_d = seq_len * 6 + 3 # 153 | two end effectors stays on 4-dimension path (free x,y,z and z-rotation)
-                cluster_d = seq_len * 3 + 3 # 78
-            elif task_name == "nut":
-                cluster_d = int(seq_len * 3.2)  # 80 | for 10/25=0.4 portion, end effector stays on 4-dimension path (free x,y,z and z-rotation)
-                                                #      for the rest 0.6 portion, end effector stays on 1=dimension path
-            else:
-                cluster_d = None
+            cluster_d = _default_cluster_rank(task_name, seq_len, param_len)
+            cluster_size = _default_cluster_size(train_N, full_dimension, cluster_partition, cluster_d)
 
-            cluster_size = max(int(train_N/cluster_partition), full_dimension + 5) if cluster_d is not None else None
-
-            best_model, last_model, recs, mixture_sampler = flow.train(
+            train_kwargs = dict(
                 target_trajectories=target_trajectories,
                 conditions=env_params,
-                n_t=n_t,
                 cluster_size=cluster_size,
                 cluster_d=cluster_d,
-                max_epochs=max_epochs,
-                batch_size=batch_size,
-                interpolation_path=interpolation_path,
                 scale_x=cluster_scale_x,
                 scale_c=cluster_scale_c,
                 cluster_jaccard_thresh=cluster_jaccard_thresh,
@@ -443,14 +470,25 @@ def train_and_eval_FM(
                 pca_n_jobs=pca_n_jobs,
                 mixture_reg=mixture_reg,
                 mixture_orth_sigma=mixture_orth_sigma,
-                dgfm_truncated=dgfm_truncated,
-                dgfm_trunc_low=dgfm_trunc_low,
-                dgfm_trunc_high=dgfm_trunc_high,
-                val_period=val_period,
-                early_stopping=early_stopping,
-                stop_criteria=stop_criteria,
-                val_trials=val_trials,
             )
+
+            if model_type == "DGFM":
+                best_model, last_model, recs, mixture_sampler = flow.train(
+                    **train_kwargs,
+                    n_t=n_t,
+                    max_epochs=max_epochs,
+                    batch_size=batch_size,
+                    interpolation_path=interpolation_path,
+                    dgfm_truncated=dgfm_truncated,
+                    dgfm_trunc_low=dgfm_trunc_low,
+                    dgfm_trunc_high=dgfm_trunc_high,
+                    val_period=val_period,
+                    early_stopping=early_stopping,
+                    stop_criteria=stop_criteria,
+                    val_trials=val_trials,
+                )
+            else:
+                best_model, last_model, recs, mixture_sampler = flow.train(**train_kwargs)
         else:
             best_model, last_model, recs = flow.train(
                 target_trajectories=target_trajectories,
@@ -496,7 +534,17 @@ def train_and_eval_FM(
     # stack to (N, Dc) float32 (order matches idx)
     eval_params = np.asarray(env_params_list, dtype=np.float32)
 
-    success_rate_best, avg_reward_best = eval_model(model=best_model,
+    q_low = None
+    eval_model_obj = best_model
+    if model_type == "MPPCA":
+        q_low = flow.sample(
+            eval_params,
+            truncated=dgfm_truncated,
+            trunc=(dgfm_trunc_low, dgfm_trunc_high),
+        )
+        eval_model_obj = None
+
+    success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
                                                 model_class=VectorField,
                                                 task_name=task_name,
                                                 seq_len=seq_len,
@@ -512,7 +560,7 @@ def train_and_eval_FM(
                                                 render_width=4,
                                                 render_num=8,
                                                 base_seed=seed+1,
-                                                q_low=None,
+                                                q_low=q_low,
                                                 base_mixture=False,
                                                 max_policy_steps=max_policy_steps)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
@@ -524,7 +572,7 @@ def train_and_eval_FM(
         output = {
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
             "seed":            seed,
-            "FM_type":         FM_type,
+            "model_type":      model_type,
             "N":               N,
             "num_demos":       num_demos,
             "num_windows":     num_windows,
@@ -536,28 +584,28 @@ def train_and_eval_FM(
             "time_sampling":   time_sampling,
             "beta_a":          beta_a,
             "beta_b":          beta_b,
-            "interpolation_path": interpolation_path if FM_type == "DGFM" else None,
+            "interpolation_path": interpolation_path if model_type == "DGFM" else None,
             "mf":              None,
             "learning_rate":   learning_rate,
             "weight_decay":    weight_decay,
-            "cluster_d":       cluster_d if FM_type == "DGFM" else None,
-            "cluster_partition": cluster_partition if FM_type == "DGFM" else None,
-            "full_dimension":  seq_len * dof if FM_type == "DGFM" else None,
-            "cluster_size":    cluster_size if FM_type == "DGFM" else None,
-            "cluster_jaccard_thresh": cluster_jaccard_thresh if FM_type == "DGFM" else None,
-            "cluster_merge_k": cluster_merge_k if FM_type == "DGFM" else None,
-            "cluster_standardize": cluster_standardize if FM_type == "DGFM" else None,
-            "cluster_scale_x": cluster_scale_x if FM_type == "DGFM" else None,
-            "cluster_scale_c": cluster_scale_c if FM_type == "DGFM" else None,
-            "cluster_eps":     cluster_eps if FM_type == "DGFM" else None,
-            "cluster_outlier_q": cluster_outlier_q if FM_type == "DGFM" else None,
-            "max_pca_samples": max_pca_samples if FM_type == "DGFM" else None,
-            "pca_n_jobs":      pca_n_jobs if FM_type == "DGFM" else None,
-            "mixture_reg":     mixture_reg if FM_type == "DGFM" else None,
-            "mixture_orth_sigma": mixture_orth_sigma if FM_type == "DGFM" else None,
-            "dgfm_truncated":  dgfm_truncated if FM_type == "DGFM" else None,
-            "dgfm_trunc_low":  dgfm_trunc_low if FM_type == "DGFM" else None,
-            "dgfm_trunc_high": dgfm_trunc_high if FM_type == "DGFM" else None,
+            "cluster_d":       cluster_d if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_partition": cluster_partition if model_type in ("DGFM", "MPPCA") else None,
+            "full_dimension":  seq_len * dof if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_size":    cluster_size if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_jaccard_thresh": cluster_jaccard_thresh if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_merge_k": cluster_merge_k if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_standardize": cluster_standardize if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_scale_x": cluster_scale_x if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_scale_c": cluster_scale_c if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_eps":     cluster_eps if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_outlier_q": cluster_outlier_q if model_type in ("DGFM", "MPPCA") else None,
+            "max_pca_samples": max_pca_samples if model_type in ("DGFM", "MPPCA") else None,
+            "pca_n_jobs":      pca_n_jobs if model_type in ("DGFM", "MPPCA") else None,
+            "mixture_reg":     mixture_reg if model_type in ("DGFM", "MPPCA") else None,
+            "mixture_orth_sigma": mixture_orth_sigma if model_type in ("DGFM", "MPPCA") else None,
+            "dgfm_truncated":  dgfm_truncated if model_type in ("DGFM", "MPPCA") else None,
+            "dgfm_trunc_low":  dgfm_trunc_low if model_type in ("DGFM", "MPPCA") else None,
+            "dgfm_trunc_high": dgfm_trunc_high if model_type in ("DGFM", "MPPCA") else None,
             "n_t_global":      None,
             "n_t_local":       None,
             "maximum epoch":   max_epochs,
@@ -589,7 +637,7 @@ def train_and_eval_FM(
             ln1 = ax1.plot(epochs, rates, linewidth=2, label="success_rate")
             ax1.set_xlabel("Epoch")
             ax1.set_ylabel("Success Rate")
-            ax1.set_title(f"{FM_type} Training Curves")
+            ax1.set_title(f"{model_type} Training Curves")
 
             # second axis for losses
             ax2 = ax1.twinx()
@@ -612,9 +660,14 @@ def train_and_eval_FM(
             print(f"[Saved plot to {plot_path}]")
 
         # save model parameters
-        model_path = os.path.join(exp_dir, 'model.pt')
-        torch.save(best_model.state_dict(), model_path)
-        print(f"[Saved model to {model_path}]")
+        if model_type == "MPPCA":
+            sampler_path = os.path.join(exp_dir, "mppca_sampler.pt")
+            flow.save(sampler_path)
+            print(f"[Saved MPPCA sampler to {sampler_path}]")
+        else:
+            model_path = os.path.join(exp_dir, 'model.pt')
+            torch.save(best_model.state_dict(), model_path)
+            print(f"[Saved model to {model_path}]")
     else:
         recs = None
         json_path = os.path.join(exp_dir, 'results_eval_trained.json')
@@ -635,11 +688,14 @@ if __name__ == "__main__":
     config_parser.add_argument("--config", type=str, default=None)
     config_args, _ = config_parser.parse_known_args()
 
-    parser = argparse.ArgumentParser("train_and_eval_FM")
+    parser = argparse.ArgumentParser("train_and_eval_model")
     parser.add_argument("--config",         type=str,   default=None,
                         help="JSON config with all run options except dataset_path.")
+    parser.add_argument("--model_type",     type=str,   default=None,
+                        choices=["UniformFM","ShiftedFM","DGFM","MPPCA"])
     parser.add_argument("--FM_type",        type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM"])
+                        choices=["UniformFM","ShiftedFM","DGFM","MPPCA"],
+                        help=argparse.SUPPRESS)
     parser.add_argument("--N",              type=int,   default=None)
     parser.add_argument("--dataset_path",   type=str,   default=None)
     parser.add_argument("--task_name",      type=str,   default=None,
@@ -689,7 +745,12 @@ if __name__ == "__main__":
     _apply_config_defaults(parser, _load_json_config(config_args.config))
     args = parser.parse_args()
 
-    missing = [name for name in ("FM_type", "N", "task_name") if getattr(args, name) is None]
+    if args.model_type is None:
+        args.model_type = args.FM_type
+    elif args.FM_type is not None and args.FM_type != args.model_type:
+        parser.error("--model_type and --FM_type disagree")
+
+    missing = [name for name in ("model_type", "N", "task_name") if getattr(args, name) is None]
     if missing:
         parser.error(f"Missing required option(s): {', '.join('--' + name for name in missing)}")
     if args.N <= 0:
@@ -707,8 +768,8 @@ if __name__ == "__main__":
     if dataset_path is None:
         dataset_path = os.path.join(DEFAULT_DATASET_DIR, f"{args.task_name}_dataset_{args.N}.hdf5")
 
-    train_and_eval_FM(
-        FM_type            = args.FM_type,
+    train_and_eval_model(
+        model_type         = args.model_type,
         N                  = args.N,
         dataset_path       = dataset_path,
         task_name          = args.task_name,
