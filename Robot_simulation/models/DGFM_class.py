@@ -429,32 +429,56 @@ def compute_cluster_pca_fast_joint(X, C, clusters, d_x,
     mu_x, mu_c, B_full, eigvals, Sig_zz_full, Sig_zc_full, Sig_cc, weights = zip(*results)
 
     eta_candidates = []
+    degenerate_clusters = 0
     for vals in eigvals:
         vals = np.asarray(vals, dtype=np.float64)
         total = float(vals.sum())
         if total <= 1e-12:
+            degenerate_clusters += 1
             continue
         top = vals[:min(d_x, vals.shape[0])].sum()
         eta_candidates.append(float(top / total))
     eta = min(1.0, max(eta_candidates)) if eta_candidates else 1.0
 
     ranks = []
+    retained_etas = []
     for vals in eigvals:
         vals = np.asarray(vals, dtype=np.float64)
         total = float(vals.sum())
         if total <= 1e-12:
             rank = min(d_x, vals.shape[0])
+            retained_eta = 1.0
         else:
             cumulative = np.cumsum(vals) / total
             rank = int(np.searchsorted(cumulative, eta, side="left") + 1)
             rank = min(rank, vals.shape[0])
+            retained_eta = float(cumulative[rank - 1])
         ranks.append(max(d_x, rank))
+        retained_etas.append(retained_eta)
 
     packed_d = max(ranks) if ranks else d_x
-    print(
-        f"[DGFM] Global PCA eta={eta:.4f}; keeping {min(ranks)}-{max(ranks)} "
-        f"axes per cluster (packed rank={packed_d})."
-    )
+    if ranks:
+        ranks_arr = np.asarray(ranks)
+        retained_arr = np.asarray(retained_etas, dtype=np.float64)
+        eta_min = min(eta_candidates) if eta_candidates else 1.0
+        eta_max = max(eta_candidates) if eta_candidates else 1.0
+        eta_mean = float(np.mean(eta_candidates)) if eta_candidates else 1.0
+        rank_counts = {
+            int(rank): int(count)
+            for rank, count in zip(*np.unique(ranks_arr, return_counts=True))
+        }
+        rank_p25, rank_median, rank_p75 = np.percentile(ranks_arr, [25, 50, 75])
+        print(
+            f"[DGFM] Global PCA eta={eta:.4f} "
+            f"(top-{d_x} eta min/mean/max={eta_min:.4f}/{eta_mean:.4f}/{eta_max:.4f}); "
+            f"rank min/p25/median/p75/max={ranks_arr.min()}/{rank_p25:.1f}/"
+            f"{rank_median:.1f}/{rank_p75:.1f}/{ranks_arr.max()}, "
+            f"mean={ranks_arr.mean():.2f}, packed rank={packed_d}, "
+            f"rank counts={rank_counts}, retained eta min/mean={retained_arr.min():.4f}/"
+            f"{retained_arr.mean():.4f}, degenerate clusters={degenerate_clusters}."
+        )
+    else:
+        print(f"[DGFM] Global PCA eta={eta:.4f}; no clusters found (packed rank={packed_d}).")
 
     B_list = []
     Sig_zz = []
