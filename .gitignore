@@ -4,6 +4,8 @@ Synthetic_data/__pycache__/
 Synthetic_data/analysis_results/
 .vscode/
 Robot_simulation/__pycache__/
+Robot_simulation/environments/__pycache__/
+Robot_simulation/models/__pycache__/
 Robot_simulation/heuristic_dataset/
 Robot_simulation/videos/
 Robot_simulation/train_sac_door.py
@@ -19,6 +21,7 @@ Miniconda3-latest-Linux-x86_64.sh
 Synthetic_configs/
 synth_eval.log
 sim_eval.log
+sim_eval_0.log
 logs/
 synth_eval.lock
 synth_eval.pid
