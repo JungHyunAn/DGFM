@@ -340,12 +340,19 @@ def worker_generate(
         seed: Base RNG seed; worker_id is added to make streams independent.
 
     Returns:
-        A list of dicts, each containing:
+        A dict containing the worker attempt count and successful trajectory
+        entries:
             {
-              "joint_angles": (K, dof),
-              "key_inds":     (K,),
-              "initial_pose": (dof,),
-              "environment_setting": dict of arrays
+              "trials": int,
+              "successes": [
+                {
+                  "joint_angles": (K, dof),
+                  "key_inds":     (K,),
+                  "initial_pose": (dof,),
+                  "environment_setting": dict of arrays
+                },
+                ...
+              ]
             }
     """
 
@@ -386,7 +393,10 @@ def worker_generate(
             })
 
     env.close()
-    return successes
+    return {
+        "trials": trials,
+        "successes": successes,
+    }
 
 
 def wait_first(futures):
@@ -485,6 +495,8 @@ def generate_data_parallel(
 
     episode_idx = 0
     success_count = 0
+    heuristic_trials = 0
+    heuristic_successes = 0
     episodes_frames: List[List[np.ndarray]] = []
 
     if verbose:
@@ -511,7 +523,10 @@ def generate_data_parallel(
         while success_count < n and futures:
             done, futures = wait_first(futures)
             for fut in done:
-                batch = fut.result()
+                worker_result = fut.result()
+                batch = worker_result["successes"]
+                heuristic_trials += worker_result["trials"]
+                heuristic_successes += len(batch)
                 for entry in batch:
                     if success_count >= n:
                         break
@@ -553,6 +568,14 @@ def generate_data_parallel(
 
     hf.attrs["num_episodes"] = success_count
     hf.close()
+
+    if heuristic_trials:
+        heuristic_success_rate = heuristic_successes / heuristic_trials
+        print(
+            "Heuristic trajectory success rate: "
+            f"{heuristic_success_rate:.2%} "
+            f"({heuristic_successes}/{heuristic_trials})"
+        )
 
     # Single-process render & grid video
     if render:
