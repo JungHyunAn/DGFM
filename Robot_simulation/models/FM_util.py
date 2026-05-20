@@ -406,7 +406,7 @@ def _generate_val_env(task_name, val_trials):
     if (task_name == "nut"):
         for _ in range(val_trials):
             for i in range(100):
-                env = make_env(task_name)
+                env = make_env(task_name, training=True)
                 env.reset()
                 env_setting, env_param, check_grasp = _align_handle_to_nut(env)
                 env.close()  
@@ -419,7 +419,7 @@ def _generate_val_env(task_name, val_trials):
                     print("Nut environment failed grasping!")
     else:
         for _ in range(val_trials):
-            env = make_env(task_name, use_joint_control=True)
+            env = make_env(task_name, use_joint_control=True, training=True)
             env.reset()
 
             env_settings_all.append({

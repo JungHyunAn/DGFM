@@ -65,7 +65,7 @@ def _spawn_env_once(task_name: str, seed: int, idx: int,
 
     if task_name == "nut":
         for i in range(100):
-            env = make_env(task_name, has_offscreen_renderer=use_vision)
+            env = make_env(task_name, has_offscreen_renderer=use_vision, training=True)
             env.reset()
 
             setting, params, check_grasp, vision = _align_handle_to_nut(
@@ -78,7 +78,7 @@ def _spawn_env_once(task_name: str, seed: int, idx: int,
             if i == 99:
                 print("Nut environment failed grasping!")
     else:
-        env = make_env(task_name)
+        env = make_env(task_name, training=True)
         env.reset()
 
         setting = {

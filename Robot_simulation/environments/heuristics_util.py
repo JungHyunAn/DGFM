@@ -374,6 +374,7 @@ def make_env(
         environment_setting: Dict with keys {"qpos","qvel","body_pos","body_quat"}
             (all np.ndarray) that fully specify a saved simulator state. When
             given, it is copied into the env after reset to recreate the scene.
+        training: If the environment is used for training&eval stage
 
     Returns:
         env: The initialized (and possibly restored) robosuite environment.
@@ -422,6 +423,11 @@ def make_env(
                 "output_min": [-np.pi]*7,
                 "gripper": grip_spec,
             })
+
+        initialization_noise_magnitude = 0.5 # more variance for dataset generation
+        if training:
+            initialization_noise_magnitude = 0.2
+
         env = Door(
             robots="Panda",
             controller_configs=cfg,
@@ -429,7 +435,7 @@ def make_env(
             use_latch=True,
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
-            initialization_noise={'magnitude': 0.2, 'type': "uniform"},
+            initialization_noise={'magnitude': initialization_noise_magnitude, 'type': "uniform"},
             use_camera_obs=use_camera_obs,
             camera_names=["frontview"],
             camera_heights=[480],
