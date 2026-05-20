@@ -424,9 +424,10 @@ def make_env(
                 "gripper": grip_spec,
             })
 
-        initialization_noise_magnitude = 0.5 # more variance for dataset generation
-        if training:
-            initialization_noise_magnitude = 0.2
+        # initialization_noise_magnitude = 0.5 # more variance for dataset generation
+        #if training:
+        #    initialization_noise_magnitude = 0.2
+        initialization_noise_magnitude = 0.2
 
         env = Door(
             robots="Panda",

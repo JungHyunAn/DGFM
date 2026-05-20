@@ -579,6 +579,88 @@ class DGFM(VanillaFM):
             self._check_path_partition(a, b, c)
             return a, b, c, a_dot, b_dot, c_dot
         
+        if interpolation_path == "residual-cosine-midpoint":
+            # This keeps the cosine schedule smooth, while preventing zero velocity
+            # at the midpoint by adding a small direct x0 -> x1 component.
+
+            tau = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
+            lam = torch.as_tensor(0.2, dtype=t.dtype, device=t.device)  # try 0.2 first
+
+            left = t <= tau
+            right = ~left
+
+            pi = torch.as_tensor(torch.pi, dtype=t.dtype, device=t.device)
+
+            r_left = torch.clamp(t / tau, 0.0, 1.0)
+            r_right = torch.clamp((t - tau) / (1.0 - tau), 0.0, 1.0)
+
+            # Cosine smoothstep:
+            # s(r) = (1 - cos(pi r)) / 2
+            # s'(r) = (pi / 2) sin(pi r)
+            s_left = 0.5 * (1.0 - torch.cos(pi * r_left))
+            s_right = 0.5 * (1.0 - torch.cos(pi * r_right))
+
+            sdot_left = 0.5 * pi * torch.sin(pi * r_left) / tau
+            sdot_right = 0.5 * pi * torch.sin(pi * r_right) / (1.0 - tau)
+
+            # ------------------------------------------------------------
+            # 1. Cosine-DGFM base weights
+            # ------------------------------------------------------------
+
+            # Left segment: x_t^D = (1 - s)x0 + s y
+            a_left_D = 1.0 - s_left
+            b_left_D = s_left
+            c_left_D = torch.zeros_like(t)
+
+            a_dot_left_D = -sdot_left
+            b_dot_left_D = sdot_left
+            c_dot_left_D = torch.zeros_like(t)
+
+            # Right segment: x_t^D = (1 - s)y + s x1
+            a_right_D = torch.zeros_like(t)
+            b_right_D = 1.0 - s_right
+            c_right_D = s_right
+
+            a_dot_right_D = torch.zeros_like(t)
+            b_dot_right_D = -sdot_right
+            c_dot_right_D = sdot_right
+
+            a_D = torch.where(left, a_left_D, a_right_D)
+            b_D = torch.where(left, b_left_D, b_right_D)
+            c_D = torch.where(left, c_left_D, c_right_D)
+
+            a_dot_D = torch.where(left, a_dot_left_D, a_dot_right_D)
+            b_dot_D = torch.where(left, b_dot_left_D, b_dot_right_D)
+            c_dot_D = torch.where(left, c_dot_left_D, c_dot_right_D)
+
+            # ------------------------------------------------------------
+            # 2. Residual vanilla/OT path weights
+            # ------------------------------------------------------------
+
+            # x_t^FM = (1 - t)x0 + t x1
+            a_FM = 1.0 - t
+            b_FM = torch.zeros_like(t)
+            c_FM = t
+
+            a_dot_FM = -torch.ones_like(t)
+            b_dot_FM = torch.zeros_like(t)
+            c_dot_FM = torch.ones_like(t)
+
+            # ------------------------------------------------------------
+            # 3. Soft mixture
+            # ------------------------------------------------------------
+
+            a = (1.0 - lam) * a_D + lam * a_FM
+            b = (1.0 - lam) * b_D + lam * b_FM
+            c = (1.0 - lam) * c_D + lam * c_FM
+
+            a_dot = (1.0 - lam) * a_dot_D + lam * a_dot_FM
+            b_dot = (1.0 - lam) * b_dot_D + lam * b_dot_FM
+            c_dot = (1.0 - lam) * c_dot_D + lam * c_dot_FM
+
+            self._check_path_partition(a, b, c)
+            return a, b, c, a_dot, b_dot, c_dot
+        
         raise ValueError(
                 f"Unsupported DGFM interpolation path '{interpolation_path}'. "
             )

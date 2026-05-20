@@ -114,7 +114,7 @@ def generate_door_trajectory(
     curr_pos   = env.sim.data.site_xpos[eef_id].copy()
     
     handle_off = np.random.uniform(0.03, 0.08)
-    pre_grasp  = handle_pos + np.array([handle_off, 0.03, 0.0])
+    pre_grasp  = handle_pos + np.array([handle_off, 0.1, 0.0])
     
     q_handle   = mat2quat(R_handle)
     for axis, ang in [(R_handle[:,0], -np.pi/2), (R_handle[:,1], np.pi/2)]:
@@ -139,7 +139,7 @@ def generate_door_trajectory(
     gripper_pose = 1.0
     for _ in range(50):
         a = np.zeros(adim)
-        a[0:3] = [0, -0.1, 0]
+        a[0:3] = [0, -0.21, 0]
         env.step(a)
         # print(env._gripper_to_handle)
         record_q()
@@ -244,7 +244,7 @@ if __name__ == "__main__":
         use_latch=True,
         has_renderer=False,
         has_offscreen_renderer=True,
-        initialization_noise={'magnitude': 0.5, 'type': "uniform"},
+        initialization_noise={'magnitude': 0.2, 'type': "uniform"},
         # specify which cameras to instantiate
         camera_names=cams,
         camera_heights=[480]*3,
