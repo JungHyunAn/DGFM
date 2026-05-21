@@ -1,3 +1,4 @@
+import copy
 import math
 import numpy as np
 import torch
@@ -5,11 +6,15 @@ import os
 from typing import Tuple, List
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
-import copy
 from tqdm import tqdm
 from Robot_simulation.env_util import make_env
 from Robot_simulation.environments.heuristics_util import render_trajectory, write_grid_video
-from Robot_simulation.models.FM_util import _rollout_batch, _generate_val_env
+from Robot_simulation.models.FM_util import (
+    _clip_policy_gripper_dims,
+    _generate_val_env,
+    _rollout_batch,
+    _state_policy_env_worker,
+)
 
 
 def cosine_beta_schedule(T: int, s: float = 0.008, max_beta: float = 0.999):
@@ -126,6 +131,167 @@ def run_diffusion(
 
     return x
 
+@torch.no_grad()
+def _run_diffusion_batched(
+    model,
+    task_name: str,
+    cond_batch: np.ndarray,
+    seq_len: int,
+    dof: int,
+    device: str,
+    rng: np.random.RandomState,
+    gpu_chunk_size: int | None = None,
+    *,
+    T_diff: int = 100,
+    schedule_type: str = "cosine",
+    ddim_steps: int | None = None,
+    eta: float = 0.0,
+    pred_type: str = "x0",
+) -> np.ndarray:
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    if not use_cuda:
+        device = "cpu"
+
+    n = cond_batch.shape[0]
+    out = np.empty((n, seq_len, dof), dtype=np.float32)
+    chunk = n if gpu_chunk_size is None or gpu_chunk_size <= 0 else gpu_chunk_size
+
+    for s in range(0, n, chunk):
+        e = min(n, s + chunk)
+        bs = e - s
+        xT = torch.from_numpy(rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
+        c = torch.from_numpy(cond_batch[s:e].astype(np.float32)).to(device)
+        q_low = run_diffusion(
+            model,
+            xT,
+            c,
+            device,
+            T_diff=T_diff,
+            schedule_type=schedule_type,
+            ddim_steps=ddim_steps,
+            eta=eta,
+            pred_type=pred_type,
+        )
+        out[s:e] = _clip_policy_gripper_dims(q_low.float().cpu().numpy(), task_name)
+        del q_low
+        if use_cuda:
+            torch.cuda.empty_cache()
+    return out
+
+
+def _rollout_state_policy_synchronized_dp(
+    model,
+    task_name: str,
+    seq_len: int,
+    dof: int,
+    param_len: int,
+    static_params: np.ndarray,
+    env_settings: List[dict],
+    device: str,
+    trials: int,
+    num_workers: int,
+    base_seed: int,
+    max_policy_steps: int,
+    gpu_chunk_size: int | None = None,
+    recorded_control_freq: int | float | None = None,
+    trajectory_control_freq: int | float | None = None,
+    *,
+    T_diff: int = 100,
+    schedule_type: str = "cosine",
+    ddim_steps: int | None = None,
+    eta: float = 0.0,
+    pred_type: str = "x0",
+) -> Tuple[float, float, list, list]:
+    rng = np.random.RandomState(base_seed)
+    total_success = 0
+    total_reward = 0.0
+    success_info: List[dict] = []
+    failure_info: List[dict] = []
+    ctx = get_context("spawn")
+
+    for batch_start in range(0, trials, max(1, num_workers)):
+        batch_end = min(trials, batch_start + max(1, num_workers))
+        conns = {}
+        procs = {}
+        active = set()
+
+        for idx in range(batch_start, batch_end):
+            parent_conn, child_conn = ctx.Pipe()
+            proc = ctx.Process(
+                target=_state_policy_env_worker,
+                args=(
+                    child_conn,
+                    idx,
+                    task_name,
+                    env_settings[idx],
+                    static_params[idx],
+                    seq_len,
+                    param_len,
+                    max_policy_steps,
+                    recorded_control_freq,
+                    trajectory_control_freq,
+                ),
+            )
+            proc.start()
+            child_conn.close()
+            conns[idx] = parent_conn
+            procs[idx] = proc
+            active.add(idx)
+
+        pending_conditions = {}
+        while active:
+            for idx in list(active):
+                if idx in pending_conditions:
+                    continue
+                msg = conns[idx].recv()
+                mtype = msg.get("type")
+                if mtype == "cond":
+                    pending_conditions[idx] = msg["cond"]
+                elif mtype == "result":
+                    active.remove(idx)
+                    if msg["success"]:
+                        total_success += 1
+                        success_info.append({"traj": msg["traj"], "setting": msg["setting"]})
+                    else:
+                        failure_info.append({"traj": msg["traj"], "setting": msg["setting"]})
+                    total_reward += msg["reward"]
+                elif mtype == "error":
+                    raise RuntimeError(f"State rollout worker {idx} failed: {msg['error']}")
+                else:
+                    raise RuntimeError(f"Unexpected state rollout message from {idx}: {msg}")
+
+            ready = [idx for idx in sorted(active) if idx in pending_conditions]
+            if not ready:
+                continue
+
+            cond_batch = np.stack([pending_conditions.pop(idx) for idx in ready], axis=0)
+            q_low_batch = _run_diffusion_batched(
+                model,
+                task_name,
+                cond_batch,
+                seq_len,
+                dof,
+                device,
+                rng,
+                gpu_chunk_size,
+                T_diff=T_diff,
+                schedule_type=schedule_type,
+                ddim_steps=ddim_steps,
+                eta=eta,
+                pred_type=pred_type,
+            )
+            for local_i, idx in enumerate(ready):
+                conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})
+
+        for conn in conns.values():
+            conn.close()
+        for idx, proc in procs.items():
+            proc.join()
+            if proc.exitcode not in (0, None):
+                raise RuntimeError(f"State rollout worker {idx} exited with code {proc.exitcode}")
+
+    return total_success / trials, total_reward / trials, success_info, failure_info
+
 
 def eval_model_DP(
     model,
@@ -152,10 +318,92 @@ def eval_model_DP(
     ddim_steps: int | None = None,
     eta: float = 0.0,
     pred_type: str = "x0",
+    max_policy_steps: int = 20,
+    recorded_control_freq: int | float | None = None,
+    trajectory_control_freq: int | float | None = None,
 ) -> Tuple[float, float]:
     """
     Same evaluation pipeline as eval_model, but trajectory generation uses diffusion.
     """
+
+    state_conditioned = val_params.shape[1] != param_len
+    if state_conditioned:
+        if model is None:
+            raise ValueError("State-conditioned DP evaluation requires a model.")
+        model.eval()
+        success_rate, mean_reward, success_all, failure_all = _rollout_state_policy_synchronized_dp(
+            model=model,
+            task_name=task_name,
+            seq_len=seq_len,
+            dof=dof,
+            param_len=param_len,
+            static_params=val_params,
+            env_settings=env_settings_all,
+            device=device,
+            trials=trials,
+            num_workers=num_workers,
+            base_seed=base_seed,
+            max_policy_steps=max_policy_steps,
+            gpu_chunk_size=gpu_chunk_size,
+            recorded_control_freq=recorded_control_freq,
+            trajectory_control_freq=trajectory_control_freq,
+            T_diff=T_diff,
+            schedule_type=schedule_type,
+            ddim_steps=ddim_steps,
+            eta=eta,
+            pred_type=pred_type,
+        )
+        success_info = success_all[:render_num]
+        fail_slots = max(0, render_width * render_width - render_num)
+        failure_info = failure_all[:fail_slots]
+        s_count = len(success_info)
+        f_count = len(failure_info)
+
+        episode_frames = []
+        s_left = min(s_count, render_num)
+        f_left = min(f_count, fail_slots)
+
+        while s_left > 0:
+            env_r = make_env(task_name,
+                             has_offscreen_renderer=True,
+                             use_camera_obs=False,
+                             use_joint_control=True,
+                             environment_setting=success_info[s_left - 1]["setting"],
+                             training=True)
+            frames = render_trajectory(env_r,
+                                       task_name,
+                                       success_info[s_left - 1]["traj"],
+                                       success_info[s_left - 1]["traj"][0, :],
+                                       camera_name="frontview",
+                                       hold_init=False,
+                                       set_init=False)
+            episode_frames.append(frames)
+            env_r.close()
+            s_left -= 1
+
+        while f_left > 0:
+            env_r = make_env(task_name,
+                             has_offscreen_renderer=True,
+                             use_camera_obs=False,
+                             use_joint_control=True,
+                             environment_setting=failure_info[f_left - 1]["setting"],
+                             training=True)
+            frames = render_trajectory(env_r,
+                                       task_name,
+                                       failure_info[f_left - 1]["traj"],
+                                       failure_info[f_left - 1]["traj"][0, :],
+                                       camera_name="frontview",
+                                       hold_init=False,
+                                       set_init=False)
+            episode_frames.append(frames)
+            env_r.close()
+            f_left -= 1
+
+        if render_num and episode_frames:
+            grid_path = os.path.join(render_dir, f"{task_name}_grid_{video_name}.mp4")
+            write_grid_video(episode_frames, grid_path,
+                             grid_shape=(render_width, render_width))
+        return success_rate, mean_reward
 
     np_rng = np.random.RandomState(base_seed)
 
@@ -224,7 +472,9 @@ def eval_model_DP(
                 task_name,
                 q_low_all[s:e],
                 env_settings_all[s:e],
-                s == 0
+                s == 0,
+                recorded_control_freq,
+                trajectory_control_freq
             ))
         for fut in futs:
             succ, rew, info_s, info_f = fut.result()
@@ -290,6 +540,179 @@ def eval_model_DP(
     return success_rate, mean_reward
 
 
+
+class DiffusionPolicy:
+    """State-conditioned diffusion-policy trainer matching the FM policy interface."""
+
+    def __init__(
+        self,
+        model,
+        optimizer,
+        scheduler,
+        *,
+        task_name: str,
+        horizon: int,
+        dof: int,
+        condition_dim: int,
+        gripper_idx=None,
+        device: str = "cuda",
+        T_diff: int = 100,
+        schedule_type: str = "cosine",
+        ddim_steps: int | None = None,
+        eta: float = 0.0,
+        pred_type: str = "x0",
+    ):
+        self.model = model
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.task_name = task_name
+        self.horizon = horizon
+        self.dof = dof
+        self.condition_dim = condition_dim
+        self.gripper_idx = gripper_idx
+        self.device = device
+        self.T_diff = T_diff
+        self.schedule_type = schedule_type
+        self.ddim_steps = ddim_steps
+        self.eta = eta
+        self.pred_type = pred_type
+
+    @torch.no_grad()
+    def run_diffusion(self, x, c):
+        return run_diffusion(
+            self.model,
+            x,
+            c,
+            self.device,
+            T_diff=self.T_diff,
+            schedule_type=self.schedule_type,
+            ddim_steps=self.ddim_steps,
+            eta=self.eta,
+            pred_type=self.pred_type,
+        )
+
+    def train(
+        self,
+        target_trajectories,
+        conditions,
+        *,
+        n_t: int,
+        max_epochs: int,
+        batch_size: int,
+        val_period: int = 5,
+        early_stopping: bool = True,
+        stop_criteria: int = 3,
+        val_trials: int = 25,
+        recorded_control_freq: int | float | None = None,
+        trajectory_control_freq: int | float | None = None,
+    ):
+        """Train the diffusion baseline with the same data contract as FM trainers."""
+        N = target_trajectories.shape[0]
+        best_avg_reward = 0.0
+        best_success_rate = 0.0
+        best_model = copy.deepcopy(self.model)
+        records = {}
+        stop_count = 0
+
+        do_validation = val_period > 0 and val_trials > 0
+        env_settings_all, val_params = (None, None)
+        if do_validation:
+            env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
+
+        try:
+            self.model = self.model.to(self.device)
+            target_trajectories = target_trajectories.to(self.device)
+            conditions = conditions.to(self.device)
+            sched = DiffusionSchedule(
+                T=self.T_diff,
+                device=torch.device(self.device),
+                schedule=self.schedule_type,
+            )
+
+            for epoch in tqdm(range(1, max_epochs + 1), desc="DiffusionPolicy Training", unit="epoch"):
+                self.model.train()
+                perm = torch.randperm(N, device=self.device)
+                loss_sum = 0.0
+                batch_count = 0
+
+                for i in range(0, N, batch_size):
+                    idx = perm[i:min(i + batch_size, N)]
+                    x0_clean = target_trajectories[idx]
+                    cond = conditions[idx, :]
+                    bsz = x0_clean.shape[0]
+
+                    x0r = x0_clean.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+                    cr = cond.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
+                    k = torch.randint(0, self.T_diff, (bsz * n_t,), device=self.device, dtype=torch.long)
+                    eps = torch.randn_like(x0r)
+                    abar_k = sched._gather(sched.alphas_bar, k, x0r.shape)
+                    xk = torch.sqrt(abar_k) * x0r + torch.sqrt(1.0 - abar_k) * eps
+                    t = ((k.float() + 1.0) / float(self.T_diff)).unsqueeze(-1)
+
+                    pred = self.model(xk, t, cr)
+                    target = x0r if self.pred_type == "x0" else eps
+                    sq_err = (pred - target) ** 2
+                    if hasattr(self.model, "loss_mask") and self.model.loss_mask is not None:
+                        sq_err = sq_err * self.model.loss_mask
+                    loss = sq_err.mean()
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+                    loss_sum += float(loss.item())
+                    batch_count += 1
+
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
+                avg_loss = loss_sum / max(1, batch_count)
+                if do_validation and epoch % val_period == 0:
+                    self.model.eval()
+                    success_rate, avg_reward = eval_model_DP(
+                        model=self.model,
+                        model_class=None,
+                        task_name=self.task_name,
+                        seq_len=self.horizon,
+                        dof=self.dof,
+                        param_len=self.condition_dim,
+                        gripper_idx=self.gripper_idx,
+                        val_params=val_params,
+                        env_settings_all=env_settings_all,
+                        device=self.device,
+                        trials=val_trials,
+                        T_diff=self.T_diff,
+                        schedule_type=self.schedule_type,
+                        ddim_steps=self.ddim_steps,
+                        eta=self.eta,
+                        pred_type=self.pred_type,
+                        recorded_control_freq=recorded_control_freq,
+                        trajectory_control_freq=trajectory_control_freq,
+                    )
+                    records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": avg_loss}
+
+                    if success_rate < best_success_rate:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={avg_loss:.3f}")
+                        if early_stopping:
+                            if stop_count == stop_criteria:
+                                tqdm.write("Early stopping triggered.")
+                                break
+                            stop_count += 1
+                    elif (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                        best_avg_reward = avg_reward
+                        best_success_rate = success_rate
+                        best_model = copy.deepcopy(self.model)
+                        stop_count = 0
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={avg_loss:.3f} | Best model saved")
+                    else:
+                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={avg_loss:.3f}")
+        except KeyboardInterrupt:
+            tqdm.write("Training interrupted by user. Returning best model so far...")
+
+        if not records:
+            best_model = copy.deepcopy(self.model)
+        return best_model, self.model, records
+
+
 def train_DP(
     model,
     optimizer,
@@ -310,124 +733,35 @@ def train_DP(
     stop_criteria=3,
     val_trials=25,
     pred_type: str = "x0",
+    T_diff: int = 100,
+    schedule_type: str = "cosine",
+    ddim_steps: int | None = None,
+    eta: float = 0.0,
 ):
-    """
-    Train Diffusion Policy baseline. Same format as train_uniform_FM.
-
-    pred_type="x0"     : model predicts clean trajectory directly (recommended).
-                         Works better with a weak time embedding because xk's
-                         noise magnitude already encodes the noise level.
-    pred_type="epsilon": classic epsilon prediction.
-
-    Returns:
-        best_model, last_model, success_rate_recs
-    """
-
-    # --- diffusion hyperparams (kept internal to preserve I/O) ---
-    T_diff = 100
-    schedule_type = "cosine"
-    # evaluation sampler choices (can be tuned for speed/accuracy)
-    ddim_steps_eval = None   # set to e.g. 50 or 100 if you want faster eval
-    eta_eval = 0.0           # deterministic DDIM
-
-    N = target_trajectories.shape[0]
-    best_avg_reward = 0.0
-    best_success_rate = 0.0
-    best_model = copy.deepcopy(model)
-    success_rate_recs = {}
-    stop_count = 0
-
-    env_settings_all, val_params = _generate_val_env(task_name, val_trials)
-
-    try:
-        model = model.to(device)
-        target_trajectories = target_trajectories.to(device)
-        environment_parameters = environment_parameters.to(device)
-
-        sched = DiffusionSchedule(T=T_diff, device=torch.device(device), schedule=schedule_type)
-
-        for epoch in tqdm(range(1, max_epochs + 1), desc="DiffusionPolicy Training", unit="epoch"):
-            model.train()
-            perm = torch.randperm(N, device=device)
-            loss_sum = 0.0
-
-            for i in range(0, N, batch_size):
-                idx = perm[i:min(i + batch_size, N)]
-                x0_clean = target_trajectories[idx]          # (B, Tseq, dof)
-                env_params = environment_parameters[idx, :]  # (B, P)
-
-                B = x0_clean.shape[0]
-
-                # replicate by n_t (same semantics as FM code)
-                x0r = x0_clean.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, seq_len, dof)      # (B*n_t,T,D)
-                cr  = env_params.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, param_len)           # (B*n_t,P)
-
-                # sample diffusion step k uniformly and noise eps
-                k = torch.randint(0, T_diff, (B * n_t,), device=device, dtype=torch.long)          # (B*n_t,)
-                eps = torch.randn_like(x0r)                                                        # (B*n_t,T,D)
-
-                # forward noising: x_k
-                abar_k = sched._gather(sched.alphas_bar, k, x0r.shape)
-                xk = torch.sqrt(abar_k) * x0r + torch.sqrt(1.0 - abar_k) * eps
-
-                # reuse model's time conditioning; treat time as normalized step
-                t = ((k.float() + 1.0) / float(T_diff)).unsqueeze(-1)  # (B*n_t,1)
-
-                with torch.enable_grad():
-                    pred = model(xk, t, cr)
-                    target = x0r if pred_type == "x0" else eps
-                    sq_err = (pred - target) ** 2
-                    if hasattr(model, "loss_mask") and model.loss_mask is not None:
-                        sq_err = sq_err * model.loss_mask
-
-                    loss = sq_err.mean()
-
-                optimizer.zero_grad()
-                loss.backward()
-                loss_sum += float(loss.item())
-                optimizer.step()
-
-            scheduler.step()
-
-            if epoch % val_period == 0:
-                success_rate, avg_reward = eval_model_DP(
-                    model=model,
-                    model_class=None,
-                    task_name=task_name,
-                    seq_len=seq_len,
-                    dof=dof,
-                    param_len=param_len,
-                    gripper_idx=gripper_idx,
-                    val_params=val_params,
-                    env_settings_all=env_settings_all,
-                    device=device,
-                    trials=val_trials,
-                    T_diff=T_diff,
-                    schedule_type=schedule_type,
-                    ddim_steps=ddim_steps_eval,
-                    eta=eta_eval,
-                    pred_type=pred_type,
-                )
-                success_rate_recs[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
-
-                if success_rate < best_success_rate:
-                    tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-                    if early_stopping:
-                        if stop_count == stop_criteria:
-                            tqdm.write("Early stopping triggered.")
-                            break
-                        stop_count += 1
-                else:
-                    if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
-                        best_avg_reward = avg_reward
-                        best_success_rate = success_rate
-                        best_model = copy.deepcopy(model)
-                        stop_count = 0
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
-                    else:
-                        tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")
-
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted by user. Returning best model so far...")
-
-    return best_model, model, success_rate_recs
+    policy = DiffusionPolicy(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        task_name=task_name,
+        horizon=seq_len,
+        dof=dof,
+        condition_dim=param_len,
+        gripper_idx=gripper_idx,
+        device=device,
+        T_diff=T_diff,
+        schedule_type=schedule_type,
+        ddim_steps=ddim_steps,
+        eta=eta,
+        pred_type=pred_type,
+    )
+    return policy.train(
+        target_trajectories=target_trajectories,
+        conditions=environment_parameters,
+        n_t=n_t,
+        max_epochs=max_epochs,
+        batch_size=batch_size,
+        val_period=val_period,
+        early_stopping=early_stopping,
+        stop_criteria=stop_criteria,
+        val_trials=val_trials,
+    )

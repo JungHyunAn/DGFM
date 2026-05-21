@@ -23,8 +23,8 @@ What this script does
 3) **Train** one of:
    - `UniformFM`: uniform t∈[0,1].
    - `ShiftedFM`: back-loaded t via Beta, emphasizing late times.
-   - `DGFM`: Dimension-Guided FM that builds a low-rank mixture over (x, c) and
-     mixes **global** and **local** flow phases (requires more args; see below).
+   - `DGFM`: Dimension-Guided FM that builds a low-rank mixture over (x, c).
+   - `DP`: diffusion policy baseline using the same backbone and data pipeline.
 
 4) **Evaluate**:
    - Uses `eval_model` to run many trials in parallel RoboSuite envs and
@@ -40,7 +40,7 @@ What this script does
 Command-line arguments
 ----------------------
 Required:
-- `--model_type`       in {UniformFM, ShiftedFM, DGFM, MPPCA}
+- `--model_type`       in {UniformFM, ShiftedFM, DGFM, DP, MPPCA}
 - `--N`                Number of episodes to draw from the dataset
 - `--dataset_path`     Path to HDF5 produced by the data generator
 - `--task_name`        ∈ {door, wipe, two_arm, nut}
@@ -57,7 +57,7 @@ Common options:
 - `--evaluation_samples` Number of trials in each evaluation (default: 1000)
 
 FM-specific:
-- **UniformFM / ShiftedFM / DGFM**: `--n_t` (per-sample t-replications).
+- **UniformFM / ShiftedFM / DGFM / DP**: `--n_t` (per-sample t-replications).
 - `--time_sampling` can be `uniform` or `shifted`; shifted uses `--beta_a` / `--beta_b`.
 - **DGFM** uses `--interpolation_path` (default: `piecewise-linear-midpoint`).
 - DGFM cluster rank / size are auto-set per task from `(seq_len)`; see code.
@@ -146,6 +146,7 @@ from Robot_simulation.models.FM_util import (
     get_trajectory_sample_step,
 )
 from Robot_simulation.models.DGFM_class import DGFM
+from Robot_simulation.models.DP_class import DiffusionPolicy, eval_model_DP
 from Robot_simulation.models.MPPCA_class import MPPCA
 from Robot_simulation.env_util import make_env
 from Robot_simulation.environments.heuristics_util import _get_environment_params
@@ -294,13 +295,18 @@ def train_and_eval_model(
     dgfm_truncated: bool = True,
     dgfm_trunc_low: float = -1.5,
     dgfm_trunc_high: float = 1.5,
+    dp_T_diff: int = 100,
+    dp_schedule_type: str = "cosine",
+    dp_ddim_steps: int | None = None,
+    dp_eta: float = 0.0,
+    dp_pred_type: str = "x0",
 ):
     fm_class_map = {
         "UniformFM": UniformFM,
         "ShiftedFM": ShiftedFM,
         "DGFM": DGFM,
     }
-    supported_model_types = sorted([*fm_class_map, "MPPCA"])
+    supported_model_types = sorted([*fm_class_map, "DP", "MPPCA"])
     if model_type not in supported_model_types:
         raise ValueError(f"Unsupported model type={model_type}. Expected one of {supported_model_types}")
     if model_type == "MPPCA" and model_path is not None:
@@ -395,11 +401,13 @@ def train_and_eval_model(
         f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
+        f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
+        f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
         f"seed={seed} | device={device}"
     )
     model = None
     flow = None
-    if model_type in fm_class_map:
+    if model_type in fm_class_map or model_type == "DP":
         model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
@@ -407,20 +415,38 @@ def train_and_eval_model(
             warmup_epochs=warmup_steps,
             total_epochs=max_epochs
         )
-        flow = fm_class_map[model_type](
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            task_name=task_name,
-            horizon=seq_len,
-            dof=dof,
-            condition_dim=param_len,
-            gripper_idx=gripper_idx,
-            time_sampling=time_sampling,
-            beta_a=beta_a,
-            beta_b=beta_b,
-            device=device,
-        )
+        if model_type == "DP":
+            flow = DiffusionPolicy(
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                task_name=task_name,
+                horizon=seq_len,
+                dof=dof,
+                condition_dim=param_len,
+                gripper_idx=gripper_idx,
+                device=device,
+                T_diff=dp_T_diff,
+                schedule_type=dp_schedule_type,
+                ddim_steps=dp_ddim_steps,
+                eta=dp_eta,
+                pred_type=dp_pred_type,
+            )
+        else:
+            flow = fm_class_map[model_type](
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                task_name=task_name,
+                horizon=seq_len,
+                dof=dof,
+                condition_dim=param_len,
+                gripper_idx=gripper_idx,
+                time_sampling=time_sampling,
+                beta_a=beta_a,
+                beta_b=beta_b,
+                device=device,
+            )
     elif model_type == "MPPCA":
         flow = MPPCA(
             task_name=task_name,
@@ -541,27 +567,55 @@ def train_and_eval_model(
     q_low = None
     eval_model_obj = flow if model_type == "MPPCA" else best_model
 
-    success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
-                                                model_class=VectorField,
-                                                task_name=task_name,
-                                                seq_len=seq_len,
-                                                dof=dof,
-                                                param_len=param_len,
-                                                gripper_idx=gripper_idx,
-                                                render_dir=exp_dir,
-                                                video_name="best",
-                                                val_params=eval_params,
-                                                env_settings_all=env_settings_all,
-                                                device=device,
-                                                trials=evaluation_samples,
-                                                render_width=4,
-                                                render_num=8,
-                                                base_seed=seed+1,
-                                                q_low=q_low,
-                                                base_mixture=False,
-                                                max_policy_steps=max_policy_steps,
-                                                recorded_control_freq=recorded_control_freq,
-                                                trajectory_control_freq=trajectory_control_freq)
+    if model_type == "DP":
+        success_rate_best, avg_reward_best = eval_model_DP(
+            model=best_model,
+            model_class=VectorField,
+            task_name=task_name,
+            seq_len=seq_len,
+            dof=dof,
+            param_len=param_len,
+            gripper_idx=gripper_idx,
+            render_dir=exp_dir,
+            video_name="best",
+            val_params=eval_params,
+            env_settings_all=env_settings_all,
+            device=device,
+            trials=evaluation_samples,
+            render_width=4,
+            render_num=8,
+            base_seed=seed+1,
+            max_policy_steps=max_policy_steps,
+            recorded_control_freq=recorded_control_freq,
+            trajectory_control_freq=trajectory_control_freq,
+            T_diff=dp_T_diff,
+            schedule_type=dp_schedule_type,
+            ddim_steps=dp_ddim_steps,
+            eta=dp_eta,
+            pred_type=dp_pred_type,
+        )
+    else:
+        success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
+                                                    model_class=VectorField,
+                                                    task_name=task_name,
+                                                    seq_len=seq_len,
+                                                    dof=dof,
+                                                    param_len=param_len,
+                                                    gripper_idx=gripper_idx,
+                                                    render_dir=exp_dir,
+                                                    video_name="best",
+                                                    val_params=eval_params,
+                                                    env_settings_all=env_settings_all,
+                                                    device=device,
+                                                    trials=evaluation_samples,
+                                                    render_width=4,
+                                                    render_num=8,
+                                                    base_seed=seed+1,
+                                                    q_low=q_low,
+                                                    base_mixture=False,
+                                                    max_policy_steps=max_policy_steps,
+                                                    recorded_control_freq=recorded_control_freq,
+                                                    trajectory_control_freq=trajectory_control_freq)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
 
@@ -608,6 +662,11 @@ def train_and_eval_model(
             "dgfm_truncated":  dgfm_truncated if model_type in ("DGFM", "MPPCA") else None,
             "dgfm_trunc_low":  dgfm_trunc_low if model_type in ("DGFM", "MPPCA") else None,
             "dgfm_trunc_high": dgfm_trunc_high if model_type in ("DGFM", "MPPCA") else None,
+            "dp_T_diff":       dp_T_diff if model_type == "DP" else None,
+            "dp_schedule_type": dp_schedule_type if model_type == "DP" else None,
+            "dp_ddim_steps":   dp_ddim_steps if model_type == "DP" else None,
+            "dp_eta":          dp_eta if model_type == "DP" else None,
+            "dp_pred_type":    dp_pred_type if model_type == "DP" else None,
             "n_t_global":      None,
             "n_t_local":       None,
             "maximum epoch":   max_epochs,
@@ -694,9 +753,9 @@ if __name__ == "__main__":
     parser.add_argument("--config",         type=str,   default=None,
                         help="JSON config with all run options except dataset_path.")
     parser.add_argument("--model_type",     type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","MPPCA"])
+                        choices=["UniformFM","ShiftedFM","DGFM","DP","MPPCA"])
     parser.add_argument("--FM_type",        type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","MPPCA"],
+                        choices=["UniformFM","ShiftedFM","DGFM","DP","MPPCA"],
                         help=argparse.SUPPRESS)
     parser.add_argument("--N",              type=int,   default=None)
     parser.add_argument("--dataset_path",   type=str,   default=None)
@@ -743,6 +802,11 @@ if __name__ == "__main__":
     parser.add_argument("--dgfm_truncated", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dgfm_trunc_low", type=float, default=-1.5)
     parser.add_argument("--dgfm_trunc_high", type=float, default=1.5)
+    parser.add_argument("--dp_T_diff", type=int, default=100)
+    parser.add_argument("--dp_schedule_type", type=str, default="cosine", choices=["cosine", "linear"])
+    parser.add_argument("--dp_ddim_steps", type=int, default=None)
+    parser.add_argument("--dp_eta", type=float, default=0.0)
+    parser.add_argument("--dp_pred_type", type=str, default="x0", choices=["x0", "epsilon"])
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
 
@@ -819,4 +883,9 @@ if __name__ == "__main__":
         dgfm_truncated     = args.dgfm_truncated,
         dgfm_trunc_low     = args.dgfm_trunc_low,
         dgfm_trunc_high    = args.dgfm_trunc_high,
+        dp_T_diff          = args.dp_T_diff,
+        dp_schedule_type   = args.dp_schedule_type,
+        dp_ddim_steps      = args.dp_ddim_steps,
+        dp_eta             = args.dp_eta,
+        dp_pred_type       = args.dp_pred_type,
     )
