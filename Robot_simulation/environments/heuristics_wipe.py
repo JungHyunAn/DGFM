@@ -40,7 +40,7 @@ def generate_wipe_trajectory(
 
     Returns:
         q_traj : np.ndarray
-            (T, dof_arm + dof_gripper) joint positions sampled every env.step().
+            (T, dof_arm) joint positions sampled every env.step().
         success : bool
             Result of `env._check_success()` at the end of the rollout.
         frontview_frames : list[np.ndarray]
@@ -55,6 +55,10 @@ def generate_wipe_trajectory(
               "body_pos":  env.sim.model.body_pos.copy(),
               "body_quat": env.sim.model.body_quat.copy(),
             }
+        environment_parameters : tuple
+            Empty for wipe; current dirt center/radius is recorded dynamically.
+        dynamic_traj : np.ndarray
+            (T, 3) values of (center_x, center_y, max_radius) sampled every env.step().
     """
 
     # ---------- storage ----------
@@ -65,11 +69,9 @@ def generate_wipe_trajectory(
     # ---------- reset & joint indices ----------
     env.reset()
     robot = env.robots[0]
-    # arm+gripper
+    # arm only; wipe does not need a gripper state channel
     arm_names  = robot.robot_model.joints
-    grip_names = robot.gripper["right"].joints   # fine to include; we won't use them
-    all_names  = arm_names + grip_names
-    joint_idx  = [env.sim.model.get_joint_qpos_addr(n) for n in all_names]
+    joint_idx  = [env.sim.model.get_joint_qpos_addr(n) for n in arm_names]
     # end effector
     eef_id  = list(robot.eef_site_id.values())[0]
     adim = env.action_dim
@@ -86,16 +88,24 @@ def generate_wipe_trajectory(
     # ---------- helper for recording ----------
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
-        # TODO(wipe): Replace empty placeholder with remaining marker / dirt state.
         dynamic_traj.append(get_dynamic_state(env, "wipe"))
 
     # ---------- helper for step then check & record ----------
+    def episode_done():
+        return bool(getattr(env, "done", False) or getattr(env, "_done", False))
+
     def step_and_check(pos, quat, steps=1):
-        step_towards(env, eef_id, adim, record_q,
-                        target_pos=pos, target_quat=quat, steps=steps,
-                        render=render, frames=frames)
-        return False
-        # return env._check_success() # DO NOT CHECK FOR NOW
+        if episode_done():
+            return True
+        try:
+            step_towards(env, eef_id, adim, record_q,
+                            target_pos=pos, target_quat=quat, steps=steps,
+                            render=render, frames=frames)
+        except ValueError as exc:
+            if "terminated episode" in str(exc):
+                return True
+            raise
+        return env._check_success() or episode_done()
 
     # ---------- begin recording ----------
     record_q()
@@ -104,9 +114,9 @@ def generate_wipe_trajectory(
     R_eef0  = env.sim.data.site_xmat[eef_id].reshape(3, 3)
     q_eef0  = mat2quat(R_eef0)
 
-    # ---------- choose single dirt center ----------
+    # ---------- choose initial dirt center ----------
     max_radius, center, _ = env._get_wipe_information()
-    environment_paramters = (center[0], center[1], max_radius)
+    environment_parameters = ()
     
     # ---------- contact&approach height ----------
     table_z = getattr(env, "table_offset", np.array([0, 0, 0]))[2]
@@ -116,73 +126,53 @@ def generate_wipe_trajectory(
     hover_z = wipe_z + 0.10
 
     # ---------- parameters to tune for policy -----------
-    tool_width   = 0.03          # estimated contact width of the wiper
-    margin       = 0.2           # 20% safety to ensure overlap
-    spacing      = tool_width * (1.0 - margin)
-    wx, wy       = max_radius, max_radius    # half sizes of rectangle (x,y)
-    n_line_pts   = 35            # interpolation points per strip
-    jitter_xy    = 0.005          # ≤ 5mm random jitter
-    rng          = np.random.default_rng()
+    tool_width      = 0.03
+    radius_margin   = 0.30
+    min_wipe_radius = tool_width
+    max_wipe_steps  = 360
+    jitter_xy       = 0.003
+    rng             = np.random.default_rng()
 
     cx, cy, _ = center
     wipe_z = center[2]           # already set to contact height
 
-    # ---------- wiping setup -----------
-    x_offsets = np.arange(-wx, wx + 1e-9, spacing)
-    if x_offsets[-1] > wx:            # safety trim
-        x_offsets = x_offsets[:-1]
-
-    rng.shuffle(x_offsets) # randomize strip order
-    
-    forward = rng.random() < 0.5 # choose first direction randomly
-
     # ---------- PHASE1‑1: 40‑step approach to hover above center ----------
     hover = np.array([cx, cy, hover_z])
-    step_towards(env, eef_id, adim, record_q, hover, q_eef0, steps=40,
-                render=render, frames=frames)
+    step_and_check(hover, q_eef0, steps=40)
     # ---------- PHASE1‑2: 20‑step decending to wiping height ----------
-    first_x = x_offsets[0]
-    y0, y1  = cy - wy, cy + wy
-    start_down = np.array([cx + first_x, y0 if forward else y1, wipe_z])
-    step_towards(env, eef_id, adim, record_q, start_down, q_eef0, steps=20,
-                render=render, frames=frames)
+    start_down = np.array([cx, cy, wipe_z])
+    step_and_check(start_down, q_eef0, steps=20)
 
-    # ---------- PHASE2: start wiping until the dirt is gone ----------
-    for xo in x_offsets:
-        # endpoints along y with direction
-        p_start = np.array([cx + xo, cy - np.sqrt(wy**2 - xo**2), wipe_z])
-        p_end   = np.array([cx + xo, cy + np.sqrt(wy**2 - xo**2), wipe_z])
-        if not forward:
-            p_start, p_end = p_end, p_start
-
-        # go to line start (tiny jitter ok)
-        start_jit = p_start.copy()
-        start_jit[:2] += rng.uniform(-jitter_xy, jitter_xy, size=2)
-        if step_and_check(start_jit, q_eef0):
+    # ---------- PHASE2: wipe near the current dirt center, then recenter ----------
+    sweep_angle = rng.uniform(0.0, 2.0 * np.pi)
+    for wipe_step in range(max_wipe_steps):
+        if env._check_success() or episode_done():
             break
 
-        # sweep line with jittered intermediate waypoints
-        base_pts = np.linspace(p_start, p_end, n_line_pts)
-        for pt in base_pts[1:]:
-            pt_jit = pt.copy()
-            pt_jit[0] += rng.uniform(-jitter_xy, jitter_xy)
-            pt_jit[1] += rng.uniform(-jitter_xy, jitter_xy)
-            # keep z constant
-            pt_jit[2] = wipe_z
-            if step_and_check(pt_jit, q_eef0): 
-                break
+        max_radius, center, _ = env._get_wipe_information()
+        center = np.asarray(center, dtype=np.float32).copy()
+        cx, cy = float(center[0]), float(center[1])
+        local_radius = max(min_wipe_radius, float(max_radius) * (1.0 + radius_margin))
 
-        # flip direction next strip with 50% chance (adds randomness but still covers)
-        forward = not forward if rng.random() < 0.7 else forward
+        if wipe_step % 6 == 0:
+            sweep_angle = rng.uniform(0.0, 2.0 * np.pi)
+        direction = np.array([np.cos(sweep_angle), np.sin(sweep_angle)], dtype=np.float32)
+        tangent = np.array([-direction[1], direction[0]], dtype=np.float32)
 
-    # ---------- PHASE3: 20‑step additional wiping ----------
-    final_pt = env.sim.data.site_xpos[eef_id].copy()
-    for _ in range(20):
-        # jitter around the current position
-        scrub_pt = final_pt.copy()
-        scrub_pt[:2] += rng.uniform(-jitter_xy, jitter_xy, size=2)
-        scrub_pt[2]  = wipe_z             # keep contact height
-        step_and_check(scrub_pt, q_eef0)
+        phase = wipe_step % 4
+        if phase == 0:
+            offset = np.zeros(2, dtype=np.float32)
+        elif phase == 1:
+            offset = direction * local_radius
+        elif phase == 2:
+            offset = -direction * local_radius
+        else:
+            offset = tangent * local_radius * rng.choice([-0.7, 0.7])
+
+        pt = np.array([cx + offset[0], cy + offset[1], wipe_z], dtype=np.float32)
+        pt[:2] += rng.uniform(-jitter_xy, jitter_xy, size=2)
+        if step_and_check(pt, q_eef0):
+            break
         
     success = env._check_success()
 
@@ -200,7 +190,7 @@ def generate_wipe_trajectory(
         frames,
         init_qpos,
         env_setting,
-        environment_paramters,
+        environment_parameters,
         np.stack(dynamic_traj, axis=0),
     )
 

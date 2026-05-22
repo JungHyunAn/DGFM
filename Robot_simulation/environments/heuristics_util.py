@@ -182,9 +182,9 @@ def _safe_qpos_by_joint_substring(env, substrings):
 def get_dynamic_state(env, task_name: str) -> np.ndarray:
     """Extract task dynamic state recorded alongside robot joint angles.
 
-    Door records handle/latch angle and door hinge angle. Wipe records a
-    per-marker remaining-dirt mask. Other tasks intentionally return an empty
-    vector until task-specific dynamics are chosen.
+    Door records handle/latch angle and door hinge angle. Wipe records the
+    current remaining-dirt center and maximum radius. Other tasks intentionally
+    return an empty vector until task-specific dynamics are chosen.
     """
     if task_name == "door":
         handle_angle = None
@@ -217,20 +217,21 @@ def get_dynamic_state(env, task_name: str) -> np.ndarray:
     # TODO(two_arm): Record pot/handle dynamic pose or lifted height during rollout.
     # TODO(nut): Record nut pose relative to peg during rollout.
     if task_name == "wipe":
-        markers = getattr(getattr(env.model, "mujoco_arena", None), "markers", ())
-        if not markers:
-            return np.zeros((0,), dtype=np.float32)
+        try:
+            max_radius, center, _ = env._get_wipe_information()
+            state = np.array([center[0], center[1], max_radius], dtype=np.float32)
+            if np.all(np.isfinite(state)):
+                env._dgfm_last_wipe_dynamic_state = state
+                return state
+        except Exception:
+            pass
 
-        marker_geom_ids = getattr(env, "_dgfm_wipe_marker_geom_ids", None)
-        if marker_geom_ids is None or len(marker_geom_ids) != len(markers):
-            marker_geom_ids = np.fromiter(
-                (env.sim.model.geom_name2id(marker.visual_geoms[0]) for marker in markers),
-                dtype=np.int32,
-                count=len(markers),
-            )
-            env._dgfm_wipe_marker_geom_ids = marker_geom_ids
-
-        return (env.sim.model.geom_rgba[marker_geom_ids, 3] > 0.0).astype(np.float32)
+        state = np.asarray(
+            getattr(env, "_dgfm_last_wipe_dynamic_state", np.zeros(3, dtype=np.float32)),
+            dtype=np.float32,
+        ).copy()
+        state[2] = 0.0
+        return state
 
     return np.zeros((0,), dtype=np.float32)
 
@@ -485,6 +486,8 @@ def make_env(
         )
         env.task_config["num_markers"] = 50
         env.num_markers = 50
+        # env.task_config["two_clusters"] = True
+        # env.two_clusters = True
         env.task_config["table_full_size"] = [0.4, 0.6, 0.05]
         env.table_full_size = [0.4, 0.6, 0.05]
         env.task_config['contact_threshold'] = 0.01
@@ -802,8 +805,7 @@ def _get_environment_params(
         yaw = np.arctan2(R_handle[1,0], R_handle[0,0])
         environment_parameters = (handle_pos[0], handle_pos[1], yaw)
     elif task_name == "wipe":
-        max_radius, center, _ = env._get_wipe_information()
-        environment_parameters = (center[0], center[1], max_radius)
+        environment_parameters = ()
     elif task_name == "two_arm":
         handle_names = [n for n in env.sim.model.site_names if "handle" in n]
         handle_ids   = [env.sim.model.site_name2id(n) for n in handle_names]

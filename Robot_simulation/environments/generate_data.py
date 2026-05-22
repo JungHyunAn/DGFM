@@ -41,7 +41,8 @@ What this script does
          │    ├─ qvel
          │    ├─ body_pos
          │    └─ body_quat
-         └─ environment_parameters/values       # task-specific (P,)
+         ├─ environment_parameters/values       # task-specific static params (P,)
+         └─ dynamic_states                      # per-step task dynamics
 
 4) **Parallel collection** (`generate_data_parallel`):
    - Launches `num_workers` processes; each worker repeatedly calls the heuristic
@@ -273,7 +274,7 @@ def save_episode(
             - environment_setting/ (group of arrays: qpos, qvel, body_pos, body_quat, ...)
             - environment_parameters/ (tuple of parameters for the environment
                                         - Door   : door handle x coordinate, y coordinate, yaw
-                                        - Wipe   : dirt x coordinate, y coordinate, maximum radius
+                                        - Wipe   : none; current dirt center/radius is stored in dynamic_states
                                         - TwoArm : pot x coordinate, y coordinate, yaw
                                         - Nut    : nut handle x coordinate, y coordinate, yaw)
 
@@ -587,20 +588,20 @@ def generate_data_parallel(
                 init_q  = q_traj[0]
                 g = hf_read[f"data/entire_episode_{i}/environment_setting"]
                 environment_setting = {k: g[k][()] for k in g.keys()}   # dict of arrays
-            # restore the initial pose            
-            env_r = make_env(task_name, 
-                             has_offscreen_renderer=True, 
-                             use_camera_obs=False, 
-                             use_joint_control=True, 
+            # restore the initial pose
+            env_r = make_env(task_name,
+                             has_offscreen_renderer=True,
+                             use_camera_obs=False,
+                             use_joint_control=True,
                              environment_setting=environment_setting)
-            
+
             frames = render_trajectory(
                 env_r, task_name, q_traj, init_q,
                 fps=control_freq * 3,
                 camera_name="frontview"
             )
             episodes_frames.append(frames)
-        env_r.close()
+            env_r.close()
 
         grid_path = os.path.join(output_dir, f"{task_name}_grid_{n}.mp4")
         write_grid_video(episodes_frames, grid_path, grid_shape=(5,5), fps=control_freq)
