@@ -1,6 +1,6 @@
 {
   "FM_type": "UniformFM",
-  "N": 40,
+  "N": 10,
   "task_name": "door",
   "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
   "device": "cuda",
