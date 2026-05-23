@@ -106,6 +106,28 @@ def get_trajectory_sample_step(
     return sample_step
 
 
+def normalize_policy_data(q: np.ndarray, normalization_stats: dict[str, np.ndarray]) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32)
+    mean = np.asarray(normalization_stats["mean"], dtype=np.float32)
+    std = np.asarray(normalization_stats["std"], dtype=np.float32)
+    return (q - mean) / std
+
+
+def denormalize_policy_data(q: np.ndarray, normalization_stats: dict[str, np.ndarray]) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float32)
+    mean = np.asarray(normalization_stats["mean"], dtype=np.float32)
+    std = np.asarray(normalization_stats["std"], dtype=np.float32)
+    return q * std + mean
+
+
+def _maybe_denormalize_policy_data(
+    q: np.ndarray,
+    normalization_stats: dict[str, np.ndarray] | None,
+) -> np.ndarray:
+    if normalization_stats is None:
+        return np.asarray(q, dtype=np.float32)
+    return denormalize_policy_data(q, normalization_stats)
+
 def _upsample_policy_trajectory(
     q_low: np.ndarray,
     task_name: str,
@@ -194,8 +216,15 @@ def make_policy_condition(
     )
 
 
-def _condition_from_env(env, task_name: str, static_c: np.ndarray, param_len: int) -> tuple[np.ndarray, np.ndarray]:
+def _condition_from_env(
+    env,
+    task_name: str,
+    static_c: np.ndarray,
+    param_len: int,
+    normalization_stats: dict[str, np.ndarray] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     q0 = _current_robot_q(env, task_name)
+    model_q0 = normalize_policy_data(q0, normalization_stats) if normalization_stats is not None else q0
     dyn = get_dynamic_state(env, task_name)
     static_flat = np.asarray(static_c, dtype=np.float32).reshape(-1)
     dyn_dim = param_len - q0.shape[0] - static_flat.shape[0]
@@ -209,7 +238,7 @@ def _condition_from_env(env, task_name: str, static_c: np.ndarray, param_len: in
             dyn = np.pad(dyn, (0, dyn_dim - dyn.shape[0]))
         elif dyn.shape[0] > dyn_dim:
             dyn = dyn[:dyn_dim]
-    cond = make_policy_condition(q0, dyn, static_flat)
+    cond = make_policy_condition(model_q0, dyn, static_flat)
     if cond.shape[0] != param_len:
         raise ValueError(f"Condition length {cond.shape[0]} != model param_len {param_len}")
     return cond.astype(np.float32), q0
@@ -228,6 +257,7 @@ def _state_policy_env_worker(
     max_policy_steps: int,
     recorded_control_freq: int | float | None,
     trajectory_control_freq: int | float | None,
+    normalization_stats: dict[str, np.ndarray] | None = None,
 ):
     env = None
     executed = []
@@ -239,7 +269,7 @@ def _state_policy_env_worker(
             training=True,
         )
         steps = 0
-        cond, _ = _condition_from_env(env, task_name, static_c, param_len)
+        cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats)
         conn.send({"type": "cond", "idx": idx, "cond": cond})
 
         while True:
@@ -276,7 +306,7 @@ def _state_policy_env_worker(
                 })
                 break
 
-            cond, _ = _condition_from_env(env, task_name, static_c, param_len)
+            cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats)
             conn.send({"type": "cond", "idx": idx, "cond": cond})
     except Exception as exc:
         conn.send({"type": "error", "idx": idx, "error": repr(exc)})
@@ -520,6 +550,7 @@ def _run_flow_batched(
     rng: np.random.RandomState,
     flow_steps: int,
     gpu_chunk_size: int | None = None,
+    normalization_stats: dict[str, np.ndarray] | None = None,
 ) -> np.ndarray:
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if not use_cuda:
@@ -536,6 +567,7 @@ def _run_flow_batched(
                 q_low = model.sample(cond_batch[s:e].astype(np.float32))
             if isinstance(q_low, torch.Tensor):
                 q_low = q_low.detach().cpu().numpy()
+            q_low = _maybe_denormalize_policy_data(q_low, normalization_stats)
             out[s:e] = _clip_policy_gripper_dims(np.asarray(q_low, dtype=np.float32), task_name)
         return out
 
@@ -549,13 +581,15 @@ def _run_flow_batched(
         if use_cuda:
             with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                 q_low = flow.run_flow(x0, c, n_steps=flow_steps)
-            out[s:e] = _clip_policy_gripper_dims(q_low.float().cpu().numpy(), task_name)
+            q_np = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
+            out[s:e] = _clip_policy_gripper_dims(q_np, task_name)
             del q_low
             torch.cuda.empty_cache()
         else:
             with torch.inference_mode():
                 q_low = flow.run_flow(x0, c, n_steps=flow_steps)
-            out[s:e] = _clip_policy_gripper_dims(q_low.cpu().numpy(), task_name)
+            q_np = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
+            out[s:e] = _clip_policy_gripper_dims(q_np, task_name)
     return out
 
 
@@ -576,6 +610,7 @@ def _rollout_state_policy_synchronized(
     gpu_chunk_size: int | None = None,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
+    normalization_stats: dict[str, np.ndarray] | None = None,
 ) -> Tuple[float, float, list, list]:
     """Synchronize state-conditioned environments and batch flow inference in the parent."""
     rng = np.random.RandomState(base_seed)
@@ -606,6 +641,7 @@ def _rollout_state_policy_synchronized(
                     max_policy_steps,
                     recorded_control_freq,
                     trajectory_control_freq,
+                    normalization_stats,
                 ),
             )
             proc.start()
@@ -651,6 +687,7 @@ def _rollout_state_policy_synchronized(
                 rng,
                 flow_steps,
                 gpu_chunk_size,
+                normalization_stats=normalization_stats,
             )
             for local_i, idx in enumerate(ready):
                 conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})
@@ -689,7 +726,8 @@ def eval_model(
     max_policy_steps: int = 20,
     flow_steps: int = 100,
     recorded_control_freq: int | float | None = None,
-    trajectory_control_freq: int | float | None = None) -> Tuple[float, float]:
+    trajectory_control_freq: int | float | None = None,
+    normalization_stats: dict[str, np.ndarray] | None = None) -> Tuple[float, float]:
     """ Evaluates a flow model on given environments.
 
     Multiprocessing is used by calling _rollout_batch to evaluate multiple environments in parallel.
@@ -743,6 +781,7 @@ def eval_model(
             gpu_chunk_size=gpu_chunk_size,
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
+            normalization_stats=normalization_stats,
         )
         success_info = success_all[:render_num]
         fail_slots = max(0, render_width * render_width - render_num)
@@ -798,12 +837,12 @@ def eval_model(
             if use_cuda:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                     q_low = flow.run_flow(x0, c)          # (N, T, D) on CUDA
-                q_low_all[:] = q_low.float().cpu().numpy()
+                q_low_all[:] = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
                 del q_low; torch.cuda.empty_cache()
             else:
                 with torch.inference_mode():
                     q_low = flow.run_flow(x0, c)          # CPU path
-                q_low_all[:] = q_low.cpu().numpy()
+                q_low_all[:] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
         else:
             # chunked single pass to cap VRAM
             N = trials
@@ -815,12 +854,12 @@ def eval_model(
                 if use_cuda:
                     with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                         q_low = flow.run_flow(x0, c)
-                    q_low_all[s:e] = q_low.float().cpu().numpy()
+                    q_low_all[s:e] = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
                     del q_low; torch.cuda.empty_cache()
                 else:
                     with torch.inference_mode():
                         q_low = flow.run_flow(x0, c)
-                    q_low_all[s:e] = q_low.cpu().numpy()
+                    q_low_all[s:e] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
     elif q_low is not None:
         q_low_all = q_low.cpu().numpy()
 
@@ -832,12 +871,14 @@ def eval_model(
             if use_cuda:
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
                     q_low = flow.run_flow(x0, c)          # (N, T, D) on CUDA
-                q_low_all[:] = q_low.float().cpu().numpy()
+                q_low_all[:] = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
                 del q_low; torch.cuda.empty_cache()
             else:
                 with torch.inference_mode():
                     q_low = flow.run_flow(x0, c)          # CPU path
-                q_low_all[:] = q_low.cpu().numpy()
+                q_low_all[:] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
+        else:
+            q_low_all = _maybe_denormalize_policy_data(q_low_all, normalization_stats)
 
 
     # ---- (2) Roll out on CPU with multiple workers ----

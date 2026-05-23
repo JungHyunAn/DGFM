@@ -12,6 +12,7 @@ from Robot_simulation.environments.heuristics_util import render_trajectory, wri
 from Robot_simulation.models.FM_util import (
     _clip_policy_gripper_dims,
     _generate_val_env,
+    _maybe_denormalize_policy_data,
     _rollout_batch,
     _state_policy_env_worker,
 )
@@ -141,6 +142,7 @@ def _run_diffusion_batched(
     device: str,
     rng: np.random.RandomState,
     gpu_chunk_size: int | None = None,
+    normalization_stats: dict[str, np.ndarray] | None = None,
     *,
     T_diff: int = 100,
     schedule_type: str = "cosine",
@@ -172,7 +174,8 @@ def _run_diffusion_batched(
             eta=eta,
             pred_type=pred_type,
         )
-        out[s:e] = _clip_policy_gripper_dims(q_low.float().cpu().numpy(), task_name)
+        q_np = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
+        out[s:e] = _clip_policy_gripper_dims(q_np, task_name)
         del q_low
         if use_cuda:
             torch.cuda.empty_cache()
@@ -195,6 +198,7 @@ def _rollout_state_policy_synchronized_dp(
     gpu_chunk_size: int | None = None,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
+    normalization_stats: dict[str, np.ndarray] | None = None,
     *,
     T_diff: int = 100,
     schedule_type: str = "cosine",
@@ -230,6 +234,7 @@ def _rollout_state_policy_synchronized_dp(
                     max_policy_steps,
                     recorded_control_freq,
                     trajectory_control_freq,
+                    normalization_stats,
                 ),
             )
             proc.start()
@@ -279,6 +284,7 @@ def _rollout_state_policy_synchronized_dp(
                 ddim_steps=ddim_steps,
                 eta=eta,
                 pred_type=pred_type,
+                normalization_stats=normalization_stats,
             )
             for local_i, idx in enumerate(ready):
                 conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})
@@ -319,6 +325,7 @@ def eval_model_DP(
     eta: float = 0.0,
     pred_type: str = "x0",
     max_policy_steps: int = 20,
+    normalization_stats: dict[str, np.ndarray] | None = None,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
 ) -> Tuple[float, float]:
@@ -347,6 +354,7 @@ def eval_model_DP(
             gpu_chunk_size=gpu_chunk_size,
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
+            normalization_stats=normalization_stats,
             T_diff=T_diff,
             schedule_type=schedule_type,
             ddim_steps=ddim_steps,
@@ -423,7 +431,7 @@ def eval_model_DP(
             q_low = run_diffusion(model, xT, c, device,
                                   T_diff=T_diff, schedule_type=schedule_type,
                                   ddim_steps=ddim_steps, eta=eta, pred_type=pred_type)
-        q_low_all[:] = q_low.cpu().numpy()
+        q_low_all[:] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
         del q_low
         if use_cuda:
             torch.cuda.empty_cache()
@@ -441,7 +449,7 @@ def eval_model_DP(
                 q_low = run_diffusion(model, xT, c, device,
                                       T_diff=T_diff, schedule_type=schedule_type,
                                       ddim_steps=ddim_steps, eta=eta, pred_type=pred_type)
-            q_low_all[s:e] = q_low.cpu().numpy()
+            q_low_all[s:e] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
             del q_low
             if use_cuda:
                 torch.cuda.empty_cache()
@@ -561,6 +569,7 @@ class DiffusionPolicy:
         ddim_steps: int | None = None,
         eta: float = 0.0,
         pred_type: str = "x0",
+        normalization_stats: dict[str, np.ndarray] | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -576,6 +585,7 @@ class DiffusionPolicy:
         self.ddim_steps = ddim_steps
         self.eta = eta
         self.pred_type = pred_type
+        self.normalization_stats = normalization_stats
 
     @torch.no_grad()
     def run_diffusion(self, x, c):
@@ -685,6 +695,7 @@ class DiffusionPolicy:
                         ddim_steps=self.ddim_steps,
                         eta=self.eta,
                         pred_type=self.pred_type,
+                        normalization_stats=self.normalization_stats,
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,
                     )

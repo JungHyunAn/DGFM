@@ -21,5 +21,6 @@
   "max_policy_steps": 20,
   "early_stopping": false,
   "seed": 1000,
-  "time_sampling": "shifted"
+  "time_sampling": "shifted",
+  "normalize_data": false
 }

@@ -171,6 +171,30 @@ def _apply_config_defaults(parser: argparse.ArgumentParser, config: dict) -> Non
     parser.set_defaults(**config)
 
 
+def _fit_joint_normalization_stats(trajectories: list[np.ndarray], std_eps: float = 1e-8) -> dict[str, np.ndarray]:
+    if not trajectories:
+        raise ValueError("Cannot fit normalization stats without trajectories")
+    flat_q = np.concatenate([np.asarray(q, dtype=np.float32).reshape(-1, q.shape[-1]) for q in trajectories], axis=0)
+    mean = flat_q.mean(axis=0).astype(np.float32)
+    std = flat_q.std(axis=0).astype(np.float32)
+    std = np.where(std < std_eps, 1.0, std).astype(np.float32)
+    return {"mean": mean, "std": std}
+
+
+def _apply_joint_normalization(trajectories: list[np.ndarray], stats: dict[str, np.ndarray]) -> list[np.ndarray]:
+    mean = np.asarray(stats["mean"], dtype=np.float32)
+    std = np.asarray(stats["std"], dtype=np.float32)
+    return [((np.asarray(q, dtype=np.float32) - mean) / std).astype(np.float32) for q in trajectories]
+
+
+def _normalization_stats_to_json(stats: dict[str, np.ndarray] | None) -> dict | None:
+    if stats is None:
+        return None
+    return {
+        "joint_mean": np.asarray(stats["mean"], dtype=np.float32).tolist(),
+        "joint_std": np.asarray(stats["std"], dtype=np.float32).tolist(),
+    }
+
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
@@ -300,6 +324,7 @@ def train_and_eval_model(
     dp_ddim_steps: int | None = None,
     dp_eta: float = 0.0,
     dp_pred_type: str = "x0",
+    normalize_data: bool = False,
 ):
     fm_class_map = {
         "UniformFM": UniformFM,
@@ -355,6 +380,9 @@ def train_and_eval_model(
                 data_dynamic.append(np.zeros((q_ep.shape[0], dyn_dim), dtype=np.float32))
             data_static_env.append(grp["environment_parameters"]["values"][:])
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
+        normalization_stats = _fit_joint_normalization_stats(data_trajectories) if normalize_data else None
+        if normalize_data:
+            data_trajectories = _apply_joint_normalization(data_trajectories, normalization_stats)
 
         window_traj, window_cond = build_state_conditioned_windows(
             data_trajectories,
@@ -403,7 +431,7 @@ def train_and_eval_model(
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
-        f"seed={seed} | device={device}"
+        f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | seed={seed} | device={device}"
     )
     model = None
     flow = None
@@ -431,6 +459,7 @@ def train_and_eval_model(
                 ddim_steps=dp_ddim_steps,
                 eta=dp_eta,
                 pred_type=dp_pred_type,
+                normalization_stats=normalization_stats,
             )
         else:
             flow = fm_class_map[model_type](
@@ -446,6 +475,7 @@ def train_and_eval_model(
                 beta_a=beta_a,
                 beta_b=beta_b,
                 device=device,
+                normalization_stats=normalization_stats,
             )
     elif model_type == "MPPCA":
         flow = MPPCA(
@@ -593,6 +623,7 @@ def train_and_eval_model(
             ddim_steps=dp_ddim_steps,
             eta=dp_eta,
             pred_type=dp_pred_type,
+            normalization_stats=normalization_stats,
         )
     else:
         success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
@@ -615,7 +646,8 @@ def train_and_eval_model(
                                                     base_mixture=False,
                                                     max_policy_steps=max_policy_steps,
                                                     recorded_control_freq=recorded_control_freq,
-                                                    trajectory_control_freq=trajectory_control_freq)
+                                                    trajectory_control_freq=trajectory_control_freq,
+                                                    normalization_stats=normalization_stats)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
 
@@ -634,6 +666,8 @@ def train_and_eval_model(
             "recorded_control_freq": recorded_control_freq,
             "trajectory_control_freq": trajectory_control_freq,
             "trajectory_sample_step": sample_step,
+            "normalize_data": normalize_data,
+            "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
             "task_name":       task_name,
             "n_t":             n_t,
@@ -735,7 +769,9 @@ def train_and_eval_model(
         output = {
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
             "success_rate_best": success_rate_best,
-            "average_reward_best": avg_reward_best
+            "average_reward_best": avg_reward_best,
+            "normalize_data": normalize_data,
+            "normalization_stats": _normalization_stats_to_json(normalization_stats)
         }
         with open(json_path, "w") as f:
             json.dump(output, f, indent=2)
@@ -807,6 +843,8 @@ if __name__ == "__main__":
     parser.add_argument("--dp_ddim_steps", type=int, default=None)
     parser.add_argument("--dp_eta", type=float, default=0.0)
     parser.add_argument("--dp_pred_type", type=str, default="x0", choices=["x0", "epsilon"])
+    parser.add_argument("--normalize_data", action=argparse.BooleanOptionalAction, default=False,
+                        help="Normalize the selected demos per joint with fitted mean/std before training, and denormalize model outputs at inference.")
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
 
@@ -888,4 +926,5 @@ if __name__ == "__main__":
         dp_ddim_steps      = args.dp_ddim_steps,
         dp_eta             = args.dp_eta,
         dp_pred_type       = args.dp_pred_type,
+        normalize_data     = args.normalize_data,
     )

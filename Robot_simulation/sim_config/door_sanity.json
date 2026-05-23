@@ -17,5 +17,6 @@
   "trajectory_control_freq": 20,
   "max_policy_steps": 20,
   "early_stopping": false,
-  "seed": 2002
+  "seed": 2002,
+  "normalize_data": false
 }

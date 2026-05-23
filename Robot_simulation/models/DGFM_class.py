@@ -873,7 +873,8 @@ class DGFM(VanillaFM):
                         self.condition_dim, self.gripper_idx, val_params,
                         env_settings_all, self.device, trials=val_trials,
                         recorded_control_freq=recorded_control_freq,
-                        trajectory_control_freq=trajectory_control_freq
+                        trajectory_control_freq=trajectory_control_freq,
+                        normalization_stats=self.normalization_stats
                     )
 
                     if not torch.is_grad_enabled():

@@ -252,6 +252,7 @@ class VanillaFM:
         beta_a: float = 1.5,
         beta_b: float = 1.0,
         device: str = "cuda",
+        normalization_stats: dict[str, np.ndarray] | None = None,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -265,6 +266,7 @@ class VanillaFM:
         self.beta_a = beta_a
         self.beta_b = beta_b
         self.device = device
+        self.normalization_stats = normalization_stats
 
     def sample_t(self, n: int) -> torch.Tensor:
         if self.time_sampling == "shifted":
@@ -366,6 +368,7 @@ class VanillaFM:
                         trials=val_trials,
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,
+                        normalization_stats=self.normalization_stats,
                     )
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                     if success_rate < best_success_rate:

@@ -25,5 +25,6 @@
   "recorded_control_freq": 20,
   "trajectory_control_freq": 20,
   "max_policy_steps": 20,
-  "seed": 1000
+  "seed": 1000,
+  "normalize_data": false
 }

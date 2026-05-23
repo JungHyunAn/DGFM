@@ -37,5 +37,6 @@
   "early_stopping": false,
   "seed": 1000,
   "time_sampling": "shifted",
-  "interpolation_path": "piecewise-linear-midpoint"
+  "interpolation_path": "piecewise-linear-midpoint",
+  "normalize_data": false
 }

@@ -37,5 +37,6 @@
   "early_stopping": false,
   "seed": 1000,
   "time_sampling": "uniform",
-  "interpolation_path": "residual-cosine-midpoint"
+  "interpolation_path": "residual-cosine-midpoint",
+  "normalize_data": false
 }
