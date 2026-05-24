@@ -1,8 +1,8 @@
 {
   "FM_type": "DGFM",
   "N": 20,
-  "task_name": "door",
-  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
+  "task_name": "nut",
+  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/nut",
   "device": "cuda",
   "n_t": 1,
   "cluster_partition": 10,

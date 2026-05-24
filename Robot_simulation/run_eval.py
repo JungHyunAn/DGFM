@@ -212,9 +212,9 @@ def _default_cluster_rank(task_name: str, seq_len: int, param_len: int) -> int |
     if task_name == "wipe":
         return seq_len * 3
     if task_name == "two_arm":
-        return seq_len * 3 + 3
+        return seq_len * 3 + param_len
     if task_name == "nut":
-        return int(seq_len * 3.2)
+        return seq_len * 2 + param_len
     return None
 
 
