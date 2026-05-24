@@ -5,11 +5,10 @@ import numpy as np
 from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
-from Robot_simulation.environments.heuristics_util import get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import configure_nut_pegs, get_dynamic_state, step_towards
 
 def generate_nut_trajectory(
     env,
-    delta_z: float = 0.1,
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
@@ -22,13 +21,11 @@ def generate_nut_trajectory(
       • PHASE1‑2: 20‑step careful approach to nut handle
       • PHASE2: 10‑step grasping handle
       • PHASE3: 50‑step approach to peg end
-      • PHASE4: 50‑step decend into peg
+      • PHASE4: 50-step descend onto peg
       • PHASE5: 10-step opening gripper
 
     Args:
         env: robosuite NutAssembly environment (already constructed).
-        delta_x: how much the pegs are pulled toward the robot
-        delta_z: how much the pegs should move up with the table
         render: If True, collect frames and save an MP4 to `video_folder`.
         video_folder: Output directory for the rendered video.
         verbose: Print extra info (e.g., video save path).
@@ -52,7 +49,9 @@ def generate_nut_trajectory(
             }
     
     Notes:
-        - environment_setting is recorded after some time to prevent the pegs from starting midair
+        - The static environment parameter vector is intentionally empty for nut.
+          The live square-nut pose [x, y, z, roll, pitch, yaw] is recorded in
+          dynamic_states at each step.
     """
 
     # ---------- storage ----------
@@ -61,30 +60,9 @@ def generate_nut_trajectory(
     dynamic_traj = []
     frames = []
 
-    # ---------- reset & joint indices ----------
+    # ---------- reset & deterministic peg layout ----------
     env.reset()
-
-    # randomize peg x and y coordinates & shift upward with the table (delta_z)
-    """
-    delta_x_range = [-0.015, 0.015]
-    delta_y_range = [-0.015, 0.015]
-    delta_x = np.random.uniform(delta_x_range[0], delta_x_range[1])
-    delta_y = np.random.uniform(delta_y_range[0], delta_y_range[1])
-    """
-
-    # fixed peg position for now
-    delta_x = -0.05
-    delta_y = 0
-
-    env.sim.model.body_pos[env.peg1_body_id][0] += delta_x
-    env.sim.data.body_xpos[env.peg1_body_id][0] += delta_x
-    env.sim.model.body_pos[env.peg1_body_id][1] += delta_y
-    env.sim.data.body_xpos[env.peg1_body_id][1] += delta_y
-    env.sim.model.body_pos[env.peg1_body_id][2] += delta_z
-    env.sim.data.body_xpos[env.peg1_body_id][2] += delta_z
-
-    env.sim.model.body_pos[env.peg2_body_id][2] = 0
-    env.sim.data.body_xpos[env.peg2_body_id][2] = 0
+    configure_nut_pegs(env, delta_x=-0.05, delta_z=0.1)
 
     robot = env.robots[0]
     # arm+gripper
@@ -98,8 +76,18 @@ def generate_nut_trajectory(
     nut_handle_id = env.object_site_ids[0]
     adim        = env.action_dim
 
-    # ---------- record robot initial state ----------
+    # ---------- record initial simulator and robot state ----------
     init_qpos = env.sim.data.qpos[joint_idx].copy()
+    environment_setting = {
+        "qpos":     env.sim.data.qpos.copy(),
+        "qvel":     env.sim.data.qvel.copy(),
+        "body_pos": env.sim.model.body_pos.copy(),
+        "body_quat": env.sim.model.body_quat.copy(),
+        "act": env.sim.data.act.copy(),
+        "ctrl": env.sim.data.ctrl.copy(),
+        "mocap_pos": env.sim.data.mocap_pos.copy(),
+        "mocap_quat": env.sim.data.mocap_quat.copy(),
+    }
 
     # ---------- helper for recording ----------
     gripper_pose = 1.0
@@ -107,7 +95,6 @@ def generate_nut_trajectory(
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
         gripper_traj.append(gripper_pose)
-        # TODO(nut): Replace empty placeholder with nut pose / peg-relative state.
         dynamic_traj.append(get_dynamic_state(env, "nut"))
 
     # ---------- begin recording ----------
@@ -148,18 +135,9 @@ def generate_nut_trajectory(
                  render=render,
                  frames=frames,
                  camera_name="frontview")    
-    # ---------- record environment setting (to record after nuts drop) ----------
-    environment_setting = {
-        "qpos":     env.sim.data.qpos.copy(),
-        "qvel":     env.sim.data.qvel.copy(),
-        "body_pos": env.sim.model.body_pos.copy(),
-        "body_quat":env.sim.model.body_quat.copy(),
-    }
-    yaw = np.arctan2(R0[1,0], R0[0,0])
-    # environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1]) # for peg variation
-    environment_parameters = (nut_pos[0], nut_pos[1], yaw)
+    environment_parameters = ()
 
-    # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
+    # ---------- PHASE1-2: 20-step careful approach to nut handle ----------
     gripper_pose = 1.0
     grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
     step_towards(env, eef_id, adim, record_q,
@@ -181,7 +159,7 @@ def generate_nut_trajectory(
             img = env.sim.render(640, 480, camera_name="frontview")
             frames.append(np.flipud(img))
 
-    # ---------- PHASE3: 50‑step approach to peg end ----------
+    # ---------- PHASE3: 50-step approach to peg end ----------
     gripper_pose = 0.0
     # Find closest alignment
     if angle > np.pi/2 and np.pi > angle:
@@ -202,7 +180,7 @@ def generate_nut_trajectory(
                  frames=frames,
                  camera_name="frontview")
 
-    # ---------- PHASE4: 50‑step decend into peg ----------
+    # ---------- PHASE4: 50-step descend onto peg ----------
     gripper_pose = 0.0
     insert_height = pre_insert.copy()
     insert_height[2] -= 0.15
@@ -267,13 +245,11 @@ if __name__ == "__main__":
         control_freq=20,
     )
     delta_z = 0.1
-    
     env.table_offset[2] += delta_z
     env.reset()    
     
     result = generate_nut_trajectory(
         env,
-        delta_z,
         render=True,
         video_folder="Robot_simulation/videos",
         verbose=True

@@ -8,9 +8,9 @@ Outputs:
 
 Usage example:
 python -m Robot_simulation.train_vision_encoder \
-  --task_name nut --param_len 3 --epochs 50 --n_samples 200 \
-  --out_path ./vision_encoder/vision_encoder_nut_simple.pt \
-  --stats_path ./vision_encoder/vision_encoder_nut_simple_stats.json
+  --task_name door --param_len 3 --epochs 50 --n_samples 200 \
+  --out_path ./vision_encoder/vision_encoder_door_simple.pt \
+  --stats_path ./vision_encoder/vision_encoder_door_simple_stats.json
 """
 
 import os

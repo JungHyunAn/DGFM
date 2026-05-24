@@ -43,7 +43,6 @@ Note
 This module focuses on learning and evaluation. Environment construction,
 state restoration, trajectory smoothing, and rendering are provided by
 'Robot_simulation.environments.heuristics_util'.
-For nut assembly task, grasping the nut is ensured by lifting the nut in '_align_handle_to_nut'
 """
 
 import numpy as np
@@ -61,8 +60,6 @@ robosuite_logger.setLevel(logging.ERROR)
 robosuite_logger.propagate = False        
 for h in list(robosuite_logger.handlers): 
     robosuite_logger.removeHandler(h)
-from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
-
 from Robot_simulation.env_util import make_env
 from Robot_simulation.models.VanillaFM_class import VanillaFM
 from Robot_simulation.environments.heuristics_util import (
@@ -71,9 +68,9 @@ from Robot_simulation.environments.heuristics_util import (
     _get_environment_params,
     _state_policy_success,
     _to_action_from_q,
+    configure_nut_pegs,
     get_dynamic_state,
     render_trajectory,
-    step_towards,
     write_grid_video,
 )
 
@@ -315,137 +312,28 @@ def _state_policy_env_worker(
         conn.close()
 
 
-def _align_handle_to_nut(env, 
-                         delta_x: float = 0.05, delta_z: float = 0.1, 
-                         use_vision: bool = False, camera_name: str = "frontview"):
-    def record_q(): # helper for recording, empty
-        return
-
-    # randomize peg x and y coordinates & shift upward with the table (delta_z)
-    """
-    delta_x_range = [-0.015, 0.015]
-    delta_y_range = [-0.015, 0.015]
-    delta_x = np.random.uniform(delta_x_range[0], delta_x_range[1])
-    delta_y = np.random.uniform(delta_y_range[0], delta_y_range[1])
-    """
-
-    # fixed peg position for now
-    delta_x = -delta_x
-    delta_y = 0
-    
-    env.sim.model.body_pos[env.peg1_body_id][0] += delta_x
-    env.sim.data.body_xpos[env.peg1_body_id][0] += delta_x
-    env.sim.model.body_pos[env.peg1_body_id][1] += delta_y
-    env.sim.data.body_xpos[env.peg1_body_id][1] += delta_y
-    env.sim.model.body_pos[env.peg1_body_id][2] += delta_z
-    env.sim.data.body_xpos[env.peg1_body_id][2] += delta_z
-
-    env.sim.model.body_pos[env.peg2_body_id][2] = 0
-    env.sim.data.body_xpos[env.peg2_body_id][2] = 0
-    
-    robot = env.robots[0]
-    # arm+gripper
-    arm_joints  = robot.robot_model.joints
-    grip_joints = robot.gripper["right"].joints
-    all_joints  = arm_joints + grip_joints
-    joint_idx   = [env.sim.model.get_joint_qpos_addr(n) for n in all_joints]
-    # eef & square peg & nut handle
-    eef_id      = list(robot.eef_site_id.values())[0]
-    peg_id      = env.peg1_body_id
-    nut_handle_id = env.object_site_ids[0]
-    adim        = env.action_dim
-
-    init_qpos = env.sim.data.qpos[joint_idx].copy()
-
-    nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
-    nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
-
-    peg_pos = env.sim.data.body_xpos[peg_id].copy()
-
-    R0       = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
-    quat0    = mat2quat(R0)
-    for axis, ang in [(R0[:,0], np.pi), (R0[:, 2], -np.pi/2)]:
-        axis = axis / np.linalg.norm(axis)
-        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
-        quat0 = quat_multiply(q_rot, quat0)
-    # calculate minimum shift in orientation
-    q_cur = mat2quat(env.sim.data.site_xmat[eef_id].reshape(3,3))
-    q_rel = quat_multiply(quat_inverse(q_cur), quat0)
-    angle = 2 * np.arccos(np.clip(q_rel[3], -1.0, 1.0))
-    if angle > np.pi/2 and angle < np.pi*3/2:
-        axis, ang = (R0[:, 2], np.pi)
-        axis = axis / np.linalg.norm(axis)
-        q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
-        quat0 = quat_multiply(q_rot, quat0)
-
-    # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
-    pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
-    step_towards(env, eef_id, adim, record_q,
-                 target_pos=pre_grasp,
-                 target_quat=quat0,
-                 steps=100,
-                 gripper_val=-1)
-    # ---------- PHASE1‑2: 20‑step careful approach to nut handle ----------
-    grasp_height = nut_pos + np.array([0.0, 0.0, 0.015], dtype=np.float32) # 15mm above handle
-    step_towards(env, eef_id, adim, record_q,
-                 target_pos=grasp_height,
-                 target_quat=quat0,
-                 steps=20,
-                 gripper_val=-1)
-    # ---------- PHASE2: 10‑step grasping handle ----------
-    for _ in range(10):
-        a = np.zeros(adim); a[6] = 1.0
-        obs, _, _, _ = env.step(a)
-
-    # ---------- record environment setting (to record after nuts drop) ----------
-    # environment_setting = save_mj_state(env) # save full mujoco settings
-    environment_setting = {
-        "qpos":     env.sim.data.qpos.copy(),
-        "qvel":     env.sim.data.qvel.copy(),
-        "body_pos": env.sim.model.body_pos.copy(),
-        "body_quat":env.sim.model.body_quat.copy(),
-        "act": env.sim.data.act.copy(),
-        "ctrl": env.sim.data.ctrl.copy(),
-        "mocap_pos": env.sim.data.mocap_pos.copy(),
-        "mocap_quat": env.sim.data.mocap_quat.copy()
-    }
-    yaw = np.arctan2(R0[1,0], R0[0,0])
-    # environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1]) # for peg variation
-    environment_parameters = (nut_pos[0], nut_pos[1], yaw)
-    if (use_vision):
-        vision = env.sim.render(640, 480, camera_name=camera_name)
-    else:
-        vision = None
-
-    # ---------- PHASE3: 20‑step lift to check grasp ----------
-    check_grasp = False
-    step_towards(env, eef_id, adim, record_q,
-                 target_pos=pre_grasp,
-                 target_quat=quat0,
-                 steps=20,
-                 gripper_val=1)
-    if (env.sim.data.site_xpos[nut_handle_id][2] > nut_pos[2] + 0.02):
-        check_grasp = True
-
-    return environment_setting, environment_parameters, check_grasp, vision
 def _generate_val_env(task_name, val_trials):
     env_params_list: List[np.ndarray] = []
     env_settings_all: List[dict] = []
 
-    if (task_name == "nut"):
+    if task_name == "nut":
         for _ in range(val_trials):
-            for i in range(100):
-                env = make_env(task_name, training=True)
-                env.reset()
-                env_setting, env_param, check_grasp = _align_handle_to_nut(env)
-                env.close()  
+            env = make_env(task_name, training=True)
+            env.reset()
+            configure_nut_pegs(env, delta_x=-0.05, delta_z=0.1)
 
-                if check_grasp:
-                    env_settings_all.append(env_setting)
-                    env_params_list.append(env_param)
-                    break
-                if i == 99:
-                    print("Nut environment failed grasping!")
+            env_settings_all.append({
+                "qpos":      env.sim.data.qpos.copy(),
+                "qvel":      env.sim.data.qvel.copy(),
+                "body_pos":  env.sim.model.body_pos.copy(),
+                "body_quat": env.sim.model.body_quat.copy(),
+                "act": env.sim.data.act.copy(),
+                "ctrl": env.sim.data.ctrl.copy(),
+                "mocap_pos": env.sim.data.mocap_pos.copy(),
+                "mocap_quat": env.sim.data.mocap_quat.copy(),
+            })
+            env_params_list.append(_get_environment_params(env, task_name))
+            env.close()
     else:
         for _ in range(val_trials):
             env = make_env(task_name, use_joint_control=True, training=True)

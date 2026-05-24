@@ -153,16 +153,11 @@ KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
                                    (130, 133, 2), # hovering on handles
                                    (140, -1, 13)],# lifting
 
-                      "nut"     : [(130, 140, 2), # carrying to peg end
-                                   (140, 150, 2), # carrying to peg end
-                                   (150, 160, 2), # carrying to peg end
-                                   (160, 170, 2), # carrying to peg end
-                                   (170, 180, 2), # carrying to peg end
-                                   (180, 190, 3), # entering peg
-                                   (190, 202, 3), # entering peg
-                                   (202, 207, 3), # entering peg
-                                   (207, 215, 3), # entering peg
-                                   (215, 230, 3)] # entering peg
+                      "nut"     : [(0, 80, 8),    # approaching nut
+                                   (80, 120, 4),   # final approach
+                                   (120, 132, 2),  # grasping nut
+                                   (132, 180, 4),  # carrying to square peg
+                                   (180, 230, 3)]  # inserting and releasing
                     }
 
 
@@ -276,7 +271,7 @@ def save_episode(
                                         - Door   : door handle x coordinate, y coordinate, yaw
                                         - Wipe   : none; current dirt center/radius is stored in dynamic_states
                                         - TwoArm : pot x coordinate, y coordinate, yaw
-                                        - Nut    : nut handle x coordinate, y coordinate, yaw)
+                                        - Nut    : none; live square-nut xyz/rpy is stored in dynamic_states)
 
     Args:
         hf: Open HDF5 file handle.

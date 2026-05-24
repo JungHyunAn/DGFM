@@ -72,6 +72,65 @@ from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multipl
 PANDA_GRIPPER_OPEN_QPOS = 0.04
 
 
+def _mat_to_roll_pitch_yaw(mat: np.ndarray) -> np.ndarray:
+    """Convert a 3x3 rotation matrix to xyz fixed-axis Euler angles."""
+    mat = np.asarray(mat, dtype=np.float64).reshape(3, 3)
+    sy = np.sqrt(mat[0, 0] * mat[0, 0] + mat[1, 0] * mat[1, 0])
+    singular = sy < 1e-6
+    if singular:
+        roll = np.arctan2(-mat[1, 2], mat[1, 1])
+        pitch = np.arctan2(-mat[2, 0], sy)
+        yaw = 0.0
+    else:
+        roll = np.arctan2(mat[2, 1], mat[2, 2])
+        pitch = np.arctan2(-mat[2, 0], sy)
+        yaw = np.arctan2(mat[1, 0], mat[0, 0])
+    return np.array([roll, pitch, yaw], dtype=np.float32)
+
+
+def _first_id(value):
+    if isinstance(value, dict):
+        return next(iter(value.values()))
+    if isinstance(value, (list, tuple)):
+        return value[0]
+    return value
+
+
+def get_square_nut_pose(env) -> np.ndarray:
+    """Return square nut position and orientation as [x, y, z, roll, pitch, yaw]."""
+    body_id = None
+    for attr in ("obj_body_id", "object_body_ids"):
+        if hasattr(env, attr):
+            body_id = _first_id(getattr(env, attr))
+            break
+
+    if body_id is not None:
+        nut_pos = env.sim.data.body_xpos[body_id].copy()
+        nut_rot = env.sim.data.body_xmat[body_id].reshape(3, 3)
+    else:
+        nut_site_id = env.object_site_ids[0]
+        nut_pos = env.sim.data.site_xpos[nut_site_id].copy()
+        nut_rot = env.sim.data.site_xmat[nut_site_id].reshape(3, 3)
+    return np.concatenate([nut_pos.astype(np.float32), _mat_to_roll_pitch_yaw(nut_rot)], axis=0)
+
+
+def configure_nut_pegs(env, delta_x: float = -0.05, delta_z: float = 0.1) -> None:
+    """Apply the deterministic nut peg layout used by the heuristic task."""
+    if not hasattr(env, "_dgfm_nut_peg1_base_pos"):
+        env._dgfm_nut_peg1_base_pos = env.sim.model.body_pos[env.peg1_body_id].copy()
+        env._dgfm_nut_peg2_base_pos = env.sim.model.body_pos[env.peg2_body_id].copy()
+
+    peg1_pos = env._dgfm_nut_peg1_base_pos.copy()
+    peg1_pos[0] += delta_x
+    peg1_pos[2] += delta_z
+    peg2_pos = env._dgfm_nut_peg2_base_pos.copy()
+    peg2_pos[2] = 0.0
+
+    env.sim.model.body_pos[env.peg1_body_id] = peg1_pos
+    env.sim.model.body_pos[env.peg2_body_id] = peg2_pos
+    env.sim.forward()
+
+
 def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
     """Map Panda finger qpos to normalized gripper pose: 0 closed, 1 open."""
     gripper_qpos = np.asarray(gripper_qpos, dtype=np.float32)
@@ -183,8 +242,8 @@ def get_dynamic_state(env, task_name: str) -> np.ndarray:
     """Extract task dynamic state recorded alongside robot joint angles.
 
     Door records handle/latch angle and door hinge angle. Wipe records the
-    current remaining-dirt center and maximum radius. Other tasks intentionally
-    return an empty vector until task-specific dynamics are chosen.
+    current remaining-dirt center and maximum radius. Nut records the live
+    square nut pose as position plus roll/pitch/yaw.
     """
     if task_name == "door":
         handle_angle = None
@@ -214,8 +273,10 @@ def get_dynamic_state(env, task_name: str) -> np.ndarray:
 
         return np.array([handle_angle, door_angle], dtype=np.float32)
 
+    if task_name == "nut":
+        return get_square_nut_pose(env)
+
     # TODO(two_arm): Record pot/handle dynamic pose or lifted height during rollout.
-    # TODO(nut): Record nut pose relative to peg during rollout.
     if task_name == "wipe":
         try:
             max_radius, center, _ = env._get_wipe_information()
@@ -543,7 +604,7 @@ def make_env(
             restore_environment(env, environment_setting)
             env.placement_initializer = None
             env.sim.forward()
-    else:
+    elif task_name == "nut":
         cfg = load_composite_controller_config(robot="Panda")
         if use_joint_control: # for rendering
             arm_key = next(iter(cfg["body_parts"]))
@@ -581,20 +642,14 @@ def make_env(
         env.table_offset = [0, 0, 0.82 + delta_z]
         env.placement_initializer = None
         env.reset()
-        if environment_setting is not None:
-            if training and delta_z:
-                m = env.sim.model
-                for name in m.body_names:
-                    n = name.lower()
-                    if ("peg" in n) or ("stand" in n) or ("board" in n):
-                        m.body_pos[m.body_name2id(name)][2] += delta_z
-            mujoco.mj_setConst(env.sim.model._model, env.sim.data._data)
-
+        if environment_setting is None:
+            configure_nut_pegs(env, delta_x=-0.05, delta_z=delta_z)
+        else:
             restore_environment(env, environment_setting)
-
-            # restore_mj_state(env, environment_setting) # restore via full mujoco setting
             env.sim.forward()
-        
+    else:
+        raise ValueError(f"Unsupported task type={task_name}.")
+
     return env
 
 
@@ -795,7 +850,8 @@ def _get_environment_params(
     """Extract compact task parameters used as static policy conditions.
 
     Each task exposes the object/target pose information needed by training and
-    evaluation, e.g. handle pose for door or nut/peg pose for nut assembly.
+    evaluation. Nut assembly has no static parameters; its live square-nut
+    pose is recorded in dynamic_states.
     """
     assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
     if task_name == "door":
@@ -816,15 +872,7 @@ def _get_environment_params(
         yaw  = np.arctan2(R0[1,0], R0[0,0])
         environment_parameters = ((posL[0]+posR[0])/2, (posL[1]+posR[1])/2, yaw)
     else:
-        nut_handle_id = env.object_site_ids[0]
-        nut_pos = env.sim.data.site_xpos[nut_handle_id].copy()
-        nut_pos[2] = getattr(env, "table_offset", np.zeros(3))[2] # since the pegs drop from midair
-        R0 = env.sim.data.site_xmat[nut_handle_id].reshape(3,3)
-        yaw = np.arctan2(R0[1,0], R0[0,0])
-
-        peg_id  = env.peg1_body_id
-        peg_pos = env.sim.data.body_xpos[peg_id].copy()
-        environment_parameters = (nut_pos[0], nut_pos[1], yaw, peg_pos[0], peg_pos[1])
+        environment_parameters = ()
 
     return environment_parameters
 

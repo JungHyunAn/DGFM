@@ -140,7 +140,6 @@ from Robot_simulation.models.VanillaFM_class import VectorField
 from Robot_simulation.models.UniformFM_class import UniformFM
 from Robot_simulation.models.ShiftedFM_class import ShiftedFM
 from Robot_simulation.models.FM_util import (
-    _align_handle_to_nut,
     build_state_conditioned_windows,
     eval_model,
     get_trajectory_sample_step,
@@ -149,7 +148,7 @@ from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.DP_class import DiffusionPolicy, eval_model_DP
 from Robot_simulation.models.MPPCA_class import MPPCA
 from Robot_simulation.env_util import make_env
-from Robot_simulation.environments.heuristics_util import _get_environment_params
+from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 
 
@@ -239,18 +238,26 @@ def _spawn_env_once(task_name: str, seed: int, idx: int,
     setting, params, vision = None, None, None
     
     if task_name == "nut":
-        for i in range(100):
-            env = make_env(task_name, has_offscreen_renderer=use_vision, training=True)
-            env.reset()
+        env = make_env(task_name, has_offscreen_renderer=use_vision, training=True)
+        env.reset()
+        configure_nut_pegs(env, delta_x=-0.05, delta_z=0.1)
 
-            setting, params, check_grasp, vision = _align_handle_to_nut(env, use_vision=use_vision, camera_name=camera_name)
-            
-            env.close()
-            
-            if check_grasp:
-                break
-            if i == 99:
-                print("Nut environment failed grasping!")
+        setting = {
+            "qpos":      env.sim.data.qpos.copy(),
+            "qvel":      env.sim.data.qvel.copy(),
+            "body_pos":  env.sim.model.body_pos.copy(),
+            "body_quat": env.sim.model.body_quat.copy(),
+            "act": env.sim.data.act.copy(),
+            "ctrl": env.sim.data.ctrl.copy(),
+            "mocap_pos": env.sim.data.mocap_pos.copy(),
+            "mocap_quat": env.sim.data.mocap_quat.copy(),
+        }
+        params = np.asarray(_get_environment_params(env, task_name), dtype=np.float32)
+        if use_vision:
+            vision = env.sim.render(640, 480, camera_name=camera_name)
+        else:
+            vision = None
+        env.close()
 
     else:
         env = make_env(task_name, training=True)
