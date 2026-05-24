@@ -171,20 +171,21 @@ def _apply_config_defaults(parser: argparse.ArgumentParser, config: dict) -> Non
     parser.set_defaults(**config)
 
 
-def _fit_joint_normalization_stats(trajectories: list[np.ndarray], std_eps: float = 1e-8) -> dict[str, np.ndarray]:
-    if not trajectories:
-        raise ValueError("Cannot fit normalization stats without trajectories")
-    flat_q = np.concatenate([np.asarray(q, dtype=np.float32).reshape(-1, q.shape[-1]) for q in trajectories], axis=0)
+def _fit_joint_normalization_stats(joint_data: np.ndarray, std_eps: float = 1e-8) -> dict[str, np.ndarray]:
+    joint_data = np.asarray(joint_data, dtype=np.float32)
+    if joint_data.size == 0:
+        raise ValueError("Cannot fit normalization stats without joint data")
+    flat_q = joint_data.reshape(-1, joint_data.shape[-1])
     mean = flat_q.mean(axis=0).astype(np.float32)
     std = flat_q.std(axis=0).astype(np.float32)
     std = np.where(std < std_eps, 1.0, std).astype(np.float32)
     return {"mean": mean, "std": std}
 
 
-def _apply_joint_normalization(trajectories: list[np.ndarray], stats: dict[str, np.ndarray]) -> list[np.ndarray]:
+def _apply_joint_normalization(joint_data: np.ndarray, stats: dict[str, np.ndarray]) -> np.ndarray:
     mean = np.asarray(stats["mean"], dtype=np.float32)
     std = np.asarray(stats["std"], dtype=np.float32)
-    return [((np.asarray(q, dtype=np.float32) - mean) / std).astype(np.float32) for q in trajectories]
+    return ((np.asarray(joint_data, dtype=np.float32) - mean) / std).astype(np.float32)
 
 
 def _normalization_stats_to_json(stats: dict[str, np.ndarray] | None) -> dict | None:
@@ -382,10 +383,6 @@ def train_and_eval_model(
                 data_dynamic.append(np.zeros((q_ep.shape[0], dyn_dim), dtype=np.float32))
             data_static_env.append(grp["environment_parameters"]["values"][:])
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
-        normalization_stats = _fit_joint_normalization_stats(data_trajectories) if normalize_data else None
-        print(f"Data stats - mean : {normalization_stats["mean"]}, stddev : {normalization_stats["std"]}")
-        if normalize_data:
-            data_trajectories = _apply_joint_normalization(data_trajectories, normalization_stats)
 
         window_traj, window_cond = build_state_conditioned_windows(
             data_trajectories,
@@ -396,6 +393,13 @@ def train_and_eval_model(
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
         )
+        normalization_stats = _fit_joint_normalization_stats(window_traj) if normalize_data else None
+        if normalize_data:
+            print(
+                f"Data stats - mean : {normalization_stats['mean']}, "
+                f"stddev : {normalization_stats['std']}"
+            )
+            window_traj = _apply_joint_normalization(window_traj, normalization_stats)
         data_trajectories = torch.from_numpy(window_traj).float().to(device)
         data_env_params = torch.from_numpy(window_cond).float().to(device)
         param_len = window_cond.shape[1]

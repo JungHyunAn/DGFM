@@ -431,7 +431,16 @@ def eval_model_DP(
             q_low = run_diffusion(model, xT, c, device,
                                   T_diff=T_diff, schedule_type=schedule_type,
                                   ddim_steps=ddim_steps, eta=eta, pred_type=pred_type)
-        q_low_all[:] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
+        q_low_np = q_low.cpu().numpy()
+        q_low_all[:] = _maybe_denormalize_policy_data(q_low_np, normalization_stats)
+        if normalization_stats is not None:
+            print(
+                "[DP normalize debug] "
+                f"sample_norm_min={np.min(q_low_np, axis=(0, 1))} | "
+                f"sample_norm_max={np.max(q_low_np, axis=(0, 1))} | "
+                f"sample_raw_min={np.min(q_low_all, axis=(0, 1))} | "
+                f"sample_raw_max={np.max(q_low_all, axis=(0, 1))}"
+            )
         del q_low
         if use_cuda:
             torch.cuda.empty_cache()
@@ -449,7 +458,16 @@ def eval_model_DP(
                 q_low = run_diffusion(model, xT, c, device,
                                       T_diff=T_diff, schedule_type=schedule_type,
                                       ddim_steps=ddim_steps, eta=eta, pred_type=pred_type)
-            q_low_all[s:e] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
+            q_low_np = q_low.cpu().numpy()
+            q_low_all[s:e] = _maybe_denormalize_policy_data(q_low_np, normalization_stats)
+            if normalization_stats is not None and s == 0:
+                print(
+                    "[DP normalize debug] "
+                    f"sample_norm_min={np.min(q_low_np, axis=(0, 1))} | "
+                    f"sample_norm_max={np.max(q_low_np, axis=(0, 1))} | "
+                    f"sample_raw_min={np.min(q_low_all[s:e], axis=(0, 1))} | "
+                    f"sample_raw_max={np.max(q_low_all[s:e], axis=(0, 1))}"
+                )
             del q_low
             if use_cuda:
                 torch.cuda.empty_cache()

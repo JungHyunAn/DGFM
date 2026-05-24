@@ -224,7 +224,6 @@ def _condition_from_env(
     normalization_stats: dict[str, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     q0 = _current_robot_q(env, task_name)
-    model_q0 = normalize_policy_data(q0, normalization_stats) if normalization_stats is not None else q0
     dyn = get_dynamic_state(env, task_name)
     static_flat = np.asarray(static_c, dtype=np.float32).reshape(-1)
     dyn_dim = param_len - q0.shape[0] - static_flat.shape[0]
@@ -238,7 +237,7 @@ def _condition_from_env(
             dyn = np.pad(dyn, (0, dyn_dim - dyn.shape[0]))
         elif dyn.shape[0] > dyn_dim:
             dyn = dyn[:dyn_dim]
-    cond = make_policy_condition(model_q0, dyn, static_flat)
+    cond = make_policy_condition(q0, dyn, static_flat)
     if cond.shape[0] != param_len:
         raise ValueError(f"Condition length {cond.shape[0]} != model param_len {param_len}")
     return cond.astype(np.float32), q0
