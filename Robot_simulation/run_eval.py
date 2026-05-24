@@ -348,10 +348,12 @@ def train_and_eval_model(
     # load dataset
     with h5py.File(dataset_path, "r") as hf:
         data_grp = hf["data"]
-        # collect episode subgroup names in order:
+        # collect episode subgroup names and select a seeded random subset
         ep_keys = sorted(data_grp.keys(), key=lambda s: int(s.split("_")[-1]))
         total_N = len(ep_keys)
-        selected_ep_keys = ep_keys[:min(N, total_N)]
+        rng = np.random.default_rng(seed)
+        selected_idx = rng.choice(total_N, size=min(N, total_N), replace=False)
+        selected_ep_keys = [ep_keys[i] for i in selected_idx]
         if not selected_ep_keys:
             raise ValueError(f"No episodes found in dataset: {dataset_path}")
 
@@ -381,6 +383,7 @@ def train_and_eval_model(
             data_static_env.append(grp["environment_parameters"]["values"][:])
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
         normalization_stats = _fit_joint_normalization_stats(data_trajectories) if normalize_data else None
+        print(f"Data stats - mean : {normalization_stats["mean"]}, stddev : {normalization_stats["std"]}")
         if normalize_data:
             data_trajectories = _apply_joint_normalization(data_trajectories, normalization_stats)
 
