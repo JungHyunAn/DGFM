@@ -25,6 +25,6 @@
   "dp_schedule_type": "cosine",
   "dp_ddim_steps": null,
   "dp_eta": 0.0,
-  "dp_pred_type": "epsilon",
+  "dp_pred_type": "x0",
   "normalize_data": true
 }
