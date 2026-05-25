@@ -12,6 +12,7 @@
   "stop_criteria": 1,
   "evaluation_samples": 1,
   "horizon": 16,
+  "executed_horizon": 16,
   "window_stride": 1,
   "recorded_control_freq": 20,
   "trajectory_control_freq": 20,

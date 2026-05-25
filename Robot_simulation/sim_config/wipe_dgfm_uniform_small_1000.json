@@ -30,6 +30,7 @@
   "stop_criteria": 3,
   "evaluation_samples": 100,
   "horizon": 32,
+  "executed_horizon": 32,
   "window_stride": 1,
   "recorded_control_freq": 20,
   "trajectory_control_freq": 20,

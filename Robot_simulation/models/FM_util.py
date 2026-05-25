@@ -251,6 +251,7 @@ def _state_policy_env_worker(
     seq_len: int,
     param_len: int,
     max_policy_steps: int,
+    executed_horizon: int,
     recorded_control_freq: int | float | None,
     trajectory_control_freq: int | float | None,
     normalization_stats: dict[str, np.ndarray] | None = None,
@@ -275,8 +276,9 @@ def _state_policy_env_worker(
             if msg.get("type") != "act":
                 raise ValueError(f"Unknown worker message: {msg}")
 
+            planned_q = msg["q_low"][:executed_horizon]
             q_low = _upsample_policy_trajectory(
-                msg["q_low"],
+                planned_q,
                 task_name,
                 recorded_control_freq,
                 trajectory_control_freq,
@@ -493,6 +495,7 @@ def _rollout_state_policy_synchronized(
     num_workers: int,
     base_seed: int,
     max_policy_steps: int,
+    executed_horizon: int,
     flow_steps: int,
     gpu_chunk_size: int | None = None,
     recorded_control_freq: int | float | None = None,
@@ -500,6 +503,11 @@ def _rollout_state_policy_synchronized(
     normalization_stats: dict[str, np.ndarray] | None = None,
 ) -> Tuple[float, float, list, list]:
     """Synchronize state-conditioned environments and batch flow inference in the parent."""
+    if executed_horizon <= 0:
+        raise ValueError(f"executed_horizon must be positive, got {executed_horizon}")
+    if executed_horizon > seq_len:
+        raise ValueError(f"executed_horizon={executed_horizon} exceeds planned seq_len={seq_len}")
+
     rng = np.random.RandomState(base_seed)
     total_success = 0
     total_reward = 0.0
@@ -526,6 +534,7 @@ def _rollout_state_policy_synchronized(
                     seq_len,
                     param_len,
                     max_policy_steps,
+                    executed_horizon,
                     recorded_control_freq,
                     trajectory_control_freq,
                     normalization_stats,
@@ -611,6 +620,7 @@ def eval_model(
     q_low = None,
     base_mixture = False,
     max_policy_steps: int = 20,
+    executed_horizon: int | None = None,
     flow_steps: int = 100,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
@@ -644,6 +654,8 @@ def eval_model(
       3) Workers restore envs, upsample, and roll out on CPU (no GPU in workers).
     """
     np_rng = np.random.RandomState(base_seed)
+    if executed_horizon is None:
+        executed_horizon = seq_len
 
 
     state_conditioned = val_params.shape[1] != param_len
@@ -664,6 +676,7 @@ def eval_model(
             num_workers=num_workers,
             base_seed=base_seed,
             max_policy_steps=max_policy_steps,
+            executed_horizon=executed_horizon,
             flow_steps=flow_steps,
             gpu_chunk_size=gpu_chunk_size,
             recorded_control_freq=recorded_control_freq,
@@ -704,6 +717,7 @@ def eval_model(
             write_grid_video(episode_frames, grid_path, grid_shape=(render_width, render_width))
         return success_rate, mean_reward
 
+    # Legacy code for single pass generation!!
     # ---- (1) One GPU forward (optionally chunked) to produce all q_low ----
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if not use_cuda:

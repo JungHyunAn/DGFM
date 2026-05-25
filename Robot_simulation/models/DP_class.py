@@ -195,6 +195,7 @@ def _rollout_state_policy_synchronized_dp(
     num_workers: int,
     base_seed: int,
     max_policy_steps: int,
+    executed_horizon: int,
     gpu_chunk_size: int | None = None,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
@@ -206,6 +207,11 @@ def _rollout_state_policy_synchronized_dp(
     eta: float = 0.0,
     pred_type: str = "x0",
 ) -> Tuple[float, float, list, list]:
+    if executed_horizon <= 0:
+        raise ValueError(f"executed_horizon must be positive, got {executed_horizon}")
+    if executed_horizon > seq_len:
+        raise ValueError(f"executed_horizon={executed_horizon} exceeds planned seq_len={seq_len}")
+
     rng = np.random.RandomState(base_seed)
     total_success = 0
     total_reward = 0.0
@@ -232,6 +238,7 @@ def _rollout_state_policy_synchronized_dp(
                     seq_len,
                     param_len,
                     max_policy_steps,
+                    executed_horizon,
                     recorded_control_freq,
                     trajectory_control_freq,
                     normalization_stats,
@@ -325,6 +332,7 @@ def eval_model_DP(
     eta: float = 0.0,
     pred_type: str = "x0",
     max_policy_steps: int = 20,
+    executed_horizon: int | None = None,
     normalization_stats: dict[str, np.ndarray] | None = None,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
@@ -332,6 +340,8 @@ def eval_model_DP(
     """
     Same evaluation pipeline as eval_model, but trajectory generation uses diffusion.
     """
+    if executed_horizon is None:
+        executed_horizon = seq_len
 
     state_conditioned = val_params.shape[1] != param_len
     if state_conditioned:
@@ -351,6 +361,7 @@ def eval_model_DP(
             num_workers=num_workers,
             base_seed=base_seed,
             max_policy_steps=max_policy_steps,
+            executed_horizon=executed_horizon,
             gpu_chunk_size=gpu_chunk_size,
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
@@ -415,7 +426,8 @@ def eval_model_DP(
 
     np_rng = np.random.RandomState(base_seed)
 
-    # ---- (2) One GPU forward (optionally chunked) to produce all q_low ----
+    # Legacy code for single pass generation!!
+    # ---- (1) One GPU forward (optionally chunked) to produce all q_low ----
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if not use_cuda:
         device = "cpu"
@@ -472,7 +484,7 @@ def eval_model_DP(
             if use_cuda:
                 torch.cuda.empty_cache()
 
-    # ---- (3) Roll out on CPU with multiple workers (unchanged) ----
+    # ---- (2) Roll out on CPU with multiple workers (unchanged) ----
     base, rem = divmod(trials, max(1, num_workers))
     splits: List[tuple[int, int]] = []
     off = 0

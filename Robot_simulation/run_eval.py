@@ -306,6 +306,7 @@ def train_and_eval_model(
     val_trials: int = 5,
     seed: int = 2002,
     horizon: int = 32,
+    executed_horizon: int | None = None,
     window_stride: int = 1,
     recorded_control_freq: int | float = 20,
     trajectory_control_freq: int | float = 20,
@@ -376,6 +377,15 @@ def train_and_eval_model(
         sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
         downsampled_full_len = len(traj0[::sample_step])
         seq_len = min(horizon, downsampled_full_len)
+        if executed_horizon is None:
+            executed_horizon = seq_len
+        if executed_horizon <= 0:
+            raise ValueError(f"executed_horizon must be positive, got {executed_horizon}")
+        if executed_horizon > seq_len:
+            raise ValueError(
+                f"executed_horizon={executed_horizon} exceeds planned seq_len={seq_len}. "
+                f"Increase available trajectory length or lower executed_horizon."
+            )
         data_trajectories = []
         data_dynamic = []
         data_static_env = []
@@ -435,7 +445,7 @@ def train_and_eval_model(
         "[config] "
         f"model_type={model_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
-        f"horizon_arg={horizon} | window_stride={window_stride} | "
+        f"horizon_arg={horizon} | executed_horizon={executed_horizon} | window_stride={window_stride} | "
         f"recorded_control_freq={recorded_control_freq} | "
         f"trajectory_control_freq={trajectory_control_freq} | sample_step={sample_step} | "
         f"max_policy_steps={max_policy_steps} | cluster_partition={cluster_partition} | "
@@ -509,7 +519,7 @@ def train_and_eval_model(
     
     training_thread_time_seconds = None
 
-    if model_path is None:
+    if model_path is None: # to train a model
         best_model = None
         mixture_sampler = None
         cluster_d = None
@@ -561,7 +571,7 @@ def train_and_eval_model(
                 )
             else:
                 best_model, last_model, recs, mixture_sampler = flow.train(**train_kwargs)
-        else:
+        else: # if model is given 
             best_model, last_model, recs = flow.train(
                 target_trajectories=target_trajectories,
                 conditions=env_params,
@@ -630,6 +640,7 @@ def train_and_eval_model(
             render_num=8,
             base_seed=seed+1,
             max_policy_steps=max_policy_steps,
+            executed_horizon=executed_horizon,
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
             T_diff=dp_T_diff,
@@ -659,6 +670,7 @@ def train_and_eval_model(
                                                     q_low=q_low,
                                                     base_mixture=False,
                                                     max_policy_steps=max_policy_steps,
+                                                    executed_horizon=executed_horizon,
                                                     recorded_control_freq=recorded_control_freq,
                                                     trajectory_control_freq=trajectory_control_freq,
                                                     normalization_stats=normalization_stats)
@@ -676,6 +688,7 @@ def train_and_eval_model(
             "num_demos":       num_demos,
             "num_windows":     num_windows,
             "horizon":         seq_len,
+            "executed_horizon": executed_horizon,
             "window_stride":   window_stride,
             "recorded_control_freq": recorded_control_freq,
             "trajectory_control_freq": trajectory_control_freq,
@@ -831,6 +844,7 @@ if __name__ == "__main__":
     parser.add_argument("--stop_criteria",  type=int,   default=3)
     parser.add_argument("--evaluation_samples", type=int, default=100)
     parser.add_argument("--horizon", type=int, default=32)
+    parser.add_argument("--executed_horizon", type=int, default=None)
     parser.add_argument("--window_stride", type=int, default=1)
     parser.add_argument("--recorded_control_freq", type=float, default=20)
     parser.add_argument("--trajectory_control_freq", type=float, default=20)
@@ -914,6 +928,7 @@ if __name__ == "__main__":
         evaluation_samples = args.evaluation_samples,
         seed               = args.seed,
         horizon            = args.horizon,
+        executed_horizon   = args.executed_horizon,
         window_stride      = args.window_stride,
         recorded_control_freq = args.recorded_control_freq,
         trajectory_control_freq = args.trajectory_control_freq,
