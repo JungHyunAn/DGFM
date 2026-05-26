@@ -139,15 +139,16 @@ for h in list(robosuite_logger.handlers):
 from Robot_simulation.models.VanillaFM_class import VectorField
 from Robot_simulation.models.UniformFM_class import UniformFM
 from Robot_simulation.models.ShiftedFM_class import ShiftedFM
-from Robot_simulation.models.FM_util import (
+from Robot_simulation.env_util import (
     build_state_conditioned_windows,
     eval_model,
     get_trajectory_sample_step,
+    make_env,
 )
 from Robot_simulation.models.DGFM_class import DGFM
-from Robot_simulation.models.DP_class import DiffusionPolicy, eval_model_DP
+from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
+from Robot_simulation.models.DP_class import DiffusionPolicy
 from Robot_simulation.models.MPPCA_class import MPPCA
-from Robot_simulation.env_util import make_env
 from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 
@@ -222,6 +223,10 @@ def _default_cluster_size(train_N: int, full_dimension: int, cluster_partition: 
     if cluster_d is None:
         return None
     return max(int(train_N / cluster_partition), full_dimension + 5)
+
+
+def _default_cluster_size_v2(train_N: int, cluster_partition: int) -> int:
+    return max(2, int(train_N / cluster_partition))
 
 
 def _spawn_env_once(task_name: str, seed: int, idx: int,
@@ -339,12 +344,13 @@ def train_and_eval_model(
         "UniformFM": UniformFM,
         "ShiftedFM": ShiftedFM,
         "DGFM": DGFM,
+        "DGFMv2": DGFMv2,
     }
-    supported_model_types = sorted([*fm_class_map, "DP", "MPPCA"])
+    supported_model_types = sorted([*fm_class_map, "DP", "MPPCA", "MPPCAv2"])
     if model_type not in supported_model_types:
         raise ValueError(f"Unsupported model type={model_type}. Expected one of {supported_model_types}")
-    if model_type == "MPPCA" and model_path is not None:
-        raise ValueError("Loading a saved MPPCA sampler from --model_path is not supported yet.")
+    if model_type in ("MPPCA", "MPPCAv2") and model_path is not None:
+        raise ValueError(f"Loading a saved {model_type} sampler from --model_path is not supported yet.")
 
     timestamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime("%Y%m%dT%H%M%S")
 
@@ -501,8 +507,9 @@ def train_and_eval_model(
                 device=device,
                 normalization_stats=normalization_stats,
             )
-    elif model_type == "MPPCA":
-        flow = MPPCA(
+    elif model_type in ("MPPCA", "MPPCAv2"):
+        mppca_cls = MPPCAv2 if model_type == "MPPCAv2" else MPPCA
+        flow = mppca_cls(
             task_name=task_name,
             horizon=seq_len,
             dof=dof,
@@ -526,19 +533,23 @@ def train_and_eval_model(
         cluster_size = None
         train_time_start = time.thread_time()
 
-        if model_type in ("DGFM", "MPPCA"):
+        cluster_model_types = ("DGFM", "DGFMv2", "MPPCA", "MPPCAv2")
+        if model_type in cluster_model_types:
             if cluster_partition <= 0:
                 raise ValueError(f"cluster_partition must be positive, got {cluster_partition}")
 
             full_dimension = seq_len * dof
-            cluster_d = _default_cluster_rank(task_name, seq_len, param_len)
-            cluster_size = _default_cluster_size(train_N, full_dimension, cluster_partition, cluster_d)
+            if model_type in ("DGFMv2", "MPPCAv2"):
+                cluster_d = None
+                cluster_size = _default_cluster_size_v2(train_N, cluster_partition)
+            else:
+                cluster_d = _default_cluster_rank(task_name, seq_len, param_len)
+                cluster_size = _default_cluster_size(train_N, full_dimension, cluster_partition, cluster_d)
 
             train_kwargs = dict(
                 target_trajectories=target_trajectories,
                 conditions=env_params,
                 cluster_size=cluster_size,
-                cluster_d=cluster_d,
                 scale_x=cluster_scale_x,
                 scale_c=cluster_scale_c,
                 cluster_jaccard_thresh=cluster_jaccard_thresh,
@@ -554,8 +565,10 @@ def train_and_eval_model(
                 dgfm_trunc_low=dgfm_trunc_low,
                 dgfm_trunc_high=dgfm_trunc_high,
             )
+            if cluster_d is not None:
+                train_kwargs["cluster_d"] = cluster_d
 
-            if model_type == "DGFM":
+            if model_type in ("DGFM", "DGFMv2"):
                 best_model, last_model, recs, mixture_sampler = flow.train(
                     **train_kwargs,
                     n_t=n_t,
@@ -619,10 +632,10 @@ def train_and_eval_model(
     eval_params = np.asarray(env_params_list, dtype=np.float32)
 
     q_low = None
-    eval_model_obj = flow if model_type == "MPPCA" else best_model
+    eval_model_obj = flow if model_type in ("MPPCA", "MPPCAv2") else best_model
 
     if model_type == "DP":
-        success_rate_best, avg_reward_best = eval_model_DP(
+        success_rate_best, avg_reward_best = eval_model(
             model=best_model,
             model_class=VectorField,
             task_name=task_name,
@@ -649,6 +662,7 @@ def train_and_eval_model(
             eta=dp_eta,
             pred_type=dp_pred_type,
             normalization_stats=normalization_stats,
+            sampler_type="diffusion",
         )
     else:
         success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
@@ -701,28 +715,28 @@ def train_and_eval_model(
             "time_sampling":   time_sampling,
             "beta_a":          beta_a,
             "beta_b":          beta_b,
-            "interpolation_path": interpolation_path if model_type == "DGFM" else None,
+            "interpolation_path": interpolation_path if model_type in ("DGFM", "DGFMv2") else None,
             "mf":              None,
             "learning_rate":   learning_rate,
             "weight_decay":    weight_decay,
-            "cluster_d":       cluster_d if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_partition": cluster_partition if model_type in ("DGFM", "MPPCA") else None,
-            "full_dimension":  seq_len * dof if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_size":    cluster_size if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_jaccard_thresh": cluster_jaccard_thresh if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_merge_k": cluster_merge_k if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_standardize": cluster_standardize if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_scale_x": cluster_scale_x if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_scale_c": cluster_scale_c if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_eps":     cluster_eps if model_type in ("DGFM", "MPPCA") else None,
-            "cluster_outlier_q": cluster_outlier_q if model_type in ("DGFM", "MPPCA") else None,
-            "max_pca_samples": max_pca_samples if model_type in ("DGFM", "MPPCA") else None,
-            "pca_n_jobs":      pca_n_jobs if model_type in ("DGFM", "MPPCA") else None,
-            "mixture_reg":     mixture_reg if model_type in ("DGFM", "MPPCA") else None,
-            "mixture_orth_sigma": mixture_orth_sigma if model_type in ("DGFM", "MPPCA") else None,
-            "dgfm_truncated":  dgfm_truncated if model_type in ("DGFM", "MPPCA") else None,
-            "dgfm_trunc_low":  dgfm_trunc_low if model_type in ("DGFM", "MPPCA") else None,
-            "dgfm_trunc_high": dgfm_trunc_high if model_type in ("DGFM", "MPPCA") else None,
+            "cluster_d":       cluster_d if model_type in cluster_model_types else None,
+            "cluster_partition": cluster_partition if model_type in cluster_model_types else None,
+            "full_dimension":  seq_len * dof if model_type in cluster_model_types else None,
+            "cluster_size":    cluster_size if model_type in cluster_model_types else None,
+            "cluster_jaccard_thresh": cluster_jaccard_thresh if model_type in cluster_model_types else None,
+            "cluster_merge_k": cluster_merge_k if model_type in cluster_model_types else None,
+            "cluster_standardize": cluster_standardize if model_type in cluster_model_types else None,
+            "cluster_scale_x": cluster_scale_x if model_type in cluster_model_types else None,
+            "cluster_scale_c": cluster_scale_c if model_type in cluster_model_types else None,
+            "cluster_eps":     cluster_eps if model_type in cluster_model_types else None,
+            "cluster_outlier_q": cluster_outlier_q if model_type in cluster_model_types else None,
+            "max_pca_samples": max_pca_samples if model_type in cluster_model_types else None,
+            "pca_n_jobs":      pca_n_jobs if model_type in cluster_model_types else None,
+            "mixture_reg":     mixture_reg if model_type in cluster_model_types else None,
+            "mixture_orth_sigma": mixture_orth_sigma if model_type in cluster_model_types else None,
+            "dgfm_truncated":  dgfm_truncated if model_type in cluster_model_types else None,
+            "dgfm_trunc_low":  dgfm_trunc_low if model_type in cluster_model_types else None,
+            "dgfm_trunc_high": dgfm_trunc_high if model_type in cluster_model_types else None,
             "dp_T_diff":       dp_T_diff if model_type == "DP" else None,
             "dp_schedule_type": dp_schedule_type if model_type == "DP" else None,
             "dp_ddim_steps":   dp_ddim_steps if model_type == "DP" else None,
@@ -782,10 +796,11 @@ def train_and_eval_model(
             print(f"[Saved plot to {plot_path}]")
 
         # save model parameters
-        if model_type == "MPPCA":
-            sampler_path = os.path.join(exp_dir, "mppca_sampler.pt")
+        if model_type in ("MPPCA", "MPPCAv2"):
+            sampler_name = "mppcav2_sampler.pt" if model_type == "MPPCAv2" else "mppca_sampler.pt"
+            sampler_path = os.path.join(exp_dir, sampler_name)
             flow.save(sampler_path)
-            print(f"[Saved MPPCA sampler to {sampler_path}]")
+            print(f"[Saved {model_type} sampler to {sampler_path}]")
         else:
             model_path = os.path.join(exp_dir, 'model.pt')
             torch.save(best_model.state_dict(), model_path)
@@ -816,9 +831,9 @@ if __name__ == "__main__":
     parser.add_argument("--config",         type=str,   default=None,
                         help="JSON config with all run options except dataset_path.")
     parser.add_argument("--model_type",     type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","DP","MPPCA"])
+                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","DP","MPPCA","MPPCAv2"])
     parser.add_argument("--FM_type",        type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","DP","MPPCA"],
+                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","DP","MPPCA","MPPCAv2"],
                         help=argparse.SUPPRESS)
     parser.add_argument("--N",              type=int,   default=None)
     parser.add_argument("--dataset_path",   type=str,   default=None)

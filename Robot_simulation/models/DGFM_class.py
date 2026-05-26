@@ -10,7 +10,7 @@ from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
 from Robot_simulation.models.VanillaFM_class import VanillaFM, VectorField
-from Robot_simulation.models.FM_util import _generate_val_env, eval_model
+from Robot_simulation.env_util import _generate_val_env, eval_model
 
 
 class MixtureSampler:

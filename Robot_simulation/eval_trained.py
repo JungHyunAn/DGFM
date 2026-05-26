@@ -2,11 +2,11 @@ import os
 import torch
 import numpy as np
 from Robot_simulation.models.VanillaFM_class import VectorField
-from Robot_simulation.environments.heuristics_util import make_env, write_grid_video, render_trajectory
+from Robot_simulation.environments.heuristics_util import write_grid_video, render_trajectory
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 
-from Robot_simulation.models.FM_util import eval_model
+from Robot_simulation.env_util import eval_model, make_env
 from Robot_simulation.run_eval import _spawn_env_once
 
 

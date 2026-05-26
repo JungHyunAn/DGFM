@@ -311,7 +311,7 @@ class VanillaFM:
 
         do_validation = val_period > 0 and val_trials > 0
         if do_validation:
-            from Robot_simulation.models.FM_util import _generate_val_env, eval_model
+            from Robot_simulation.env_util import _generate_val_env, eval_model
 
         env_settings_all, val_params = (None, None)
         if do_validation:
