@@ -15,7 +15,7 @@
   "stop_criteria": 3,
   "evaluation_samples": 100,
   "horizon": 32,
-  "executed_horizon": 32,
+  "executed_horizon": 16,
   "window_stride": 1,
   "recorded_control_freq": 20,
   "trajectory_control_freq": 20,
@@ -23,5 +23,5 @@
   "early_stopping": false,
   "seed": 1000,
   "time_sampling": "uniform",
-  "normalize_data": false
+  "normalize_data": true
 }

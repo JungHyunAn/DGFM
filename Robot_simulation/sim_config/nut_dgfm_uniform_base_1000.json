@@ -29,7 +29,7 @@
   "val_trials": 20,
   "stop_criteria": 3,
   "evaluation_samples": 100,
-  "horizon": 16,
+  "horizon": 32,
   "executed_horizon": 16,
   "window_stride": 1,
   "recorded_control_freq": 20,
