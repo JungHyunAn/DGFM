@@ -764,6 +764,9 @@ class DGFM(VanillaFM):
         dgfm_truncated: bool = True,
         dgfm_trunc_low: float = -1.5,
         dgfm_trunc_high: float = 1.5,
+        max_policy_steps: int = 20,
+        executed_horizon: int | None = None,
+        eval_base_seed: int = 123,
         recorded_control_freq: int | float | None = None,
         trajectory_control_freq: int | float | None = None,
     ):
@@ -872,6 +875,9 @@ class DGFM(VanillaFM):
                         self.model, VectorField, self.task_name, self.horizon, self.dof,
                         self.condition_dim, self.gripper_idx, val_params,
                         env_settings_all, self.device, trials=val_trials,
+                        base_seed=eval_base_seed,
+                        max_policy_steps=max_policy_steps,
+                        executed_horizon=executed_horizon,
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,
                         normalization_stats=self.normalization_stats

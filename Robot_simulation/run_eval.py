@@ -568,6 +568,12 @@ def train_and_eval_model(
             if cluster_d is not None:
                 train_kwargs["cluster_d"] = cluster_d
 
+            train_kwargs.update(
+                max_policy_steps=max_policy_steps,
+                executed_horizon=executed_horizon,
+                eval_base_seed=seed + 1,
+            )
+
             if model_type in ("DGFM", "DGFMv2"):
                 best_model, last_model, recs, mixture_sampler = flow.train(
                     **train_kwargs,
@@ -595,6 +601,9 @@ def train_and_eval_model(
                 early_stopping=early_stopping,
                 stop_criteria=stop_criteria,
                 val_trials=val_trials,
+                max_policy_steps=max_policy_steps,
+                executed_horizon=executed_horizon,
+                eval_base_seed=seed + 1,
                 recorded_control_freq=recorded_control_freq,
                 trajectory_control_freq=trajectory_control_freq,
             )
