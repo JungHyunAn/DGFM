@@ -1,6 +1,6 @@
 {
   "FM_type": "UniformFM",
-  "N": 40,
+  "N": 20,
   "task_name": "door",
   "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
   "device": "cuda",
@@ -19,7 +19,7 @@
   "window_stride": 1,
   "recorded_control_freq": 20,
   "trajectory_control_freq": 20,
-  "max_policy_steps": 20,
+  "max_policy_steps": 40,
   "early_stopping": false,
   "seed": 1000,
   "time_sampling": "uniform",

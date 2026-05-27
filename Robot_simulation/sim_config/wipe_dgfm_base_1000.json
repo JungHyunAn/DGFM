@@ -1,8 +1,8 @@
 {
   "FM_type": "DGFMv2",
-  "N": 20,
-  "task_name": "nut",
-  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/nut",
+  "N": 40,
+  "task_name": "wipe",
+  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/wipe",
   "device": "cuda",
   "n_t": 1,
   "cluster_partition": 10,
@@ -30,14 +30,14 @@
   "stop_criteria": 3,
   "evaluation_samples": 100,
   "horizon": 32,
-  "executed_horizon": 32,
+  "executed_horizon": 16,
   "window_stride": 1,
   "recorded_control_freq": 20,
   "trajectory_control_freq": 20,
-  "max_policy_steps": 20,
+  "max_policy_steps": 40,
   "early_stopping": false,
   "seed": 1000,
   "time_sampling": "uniform",
   "interpolation_path": "residual-cosine-midpoint",
-  "normalize_data": false
+  "normalize_data": true
 }
