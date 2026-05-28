@@ -13,7 +13,7 @@ from Robot_simulation.models.DGFM_class import (
     DGFM,
     _pad_basis_to_rank,
     _pad_square,
-    cluster_points_joint,
+    cluster_points_x,
 )
 from Robot_simulation.env_util import _generate_val_env, eval_model
 from Robot_simulation.models.VanillaFM_class import VectorField
@@ -306,15 +306,15 @@ class DGFMv2(DGFM):
         X_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)
         C_np = conditions.detach().cpu().numpy()
 
-        clusters, inv_cluster = cluster_points_joint(
+        clusters, inv_cluster = cluster_points_x(
             X_np,
-            C_np,
+            # C_np, # don't use conditional vector for clustering
             m=cluster_size,
             jaccard_thresh=cluster_jaccard_thresh,
             merge_k=cluster_merge_k,
             standardize=cluster_standardize,
             scale_x=scale_x,
-            scale_c=scale_c,
+            # scale_c=scale_c,
         )
         cluster_sizes = np.asarray([len(c) for c in clusters], dtype=np.float64)
 
@@ -531,15 +531,15 @@ class MPPCAv2:
         x_np = target_trajectories.detach().cpu().numpy().reshape(target_trajectories.shape[0], -1)
         c_np = conditions.detach().cpu().numpy()
 
-        clusters, _ = cluster_points_joint(
-            x_np,
-            c_np,
+        clusters, _ = cluster_points_x(
+            X_np,
+            # C_np, # don't use conditional vector for clustering
             m=cluster_size,
             jaccard_thresh=cluster_jaccard_thresh,
             merge_k=cluster_merge_k,
             standardize=cluster_standardize,
             scale_x=scale_x,
-            scale_c=scale_c,
+            # scale_c=scale_c,
         )
 
         print(f"{len(clusters)} clusters made! Applying X-only PCA . . .")

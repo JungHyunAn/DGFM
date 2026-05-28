@@ -277,6 +277,142 @@ def cluster_points_joint(X, C, m, jaccard_thresh=0.5, merge_k=10,
     return merged_clusters, inv_cluster
 
 
+def cluster_points_x(X, m, jaccard_thresh=0.5, merge_k=10,
+                     standardize=True, scale_x=1.0):
+    """Greedy set-cover style clustering based only on X.
+
+    Steps:
+      1) Build local m-NN neighborhoods in standardized / scaled X feature space.
+      2) Choose uncovered seeds and take their neighborhoods as candidate clusters.
+      3) Merge seed clusters with Jaccard overlap ≥ `jaccard_thresh` using seed-to-seed KNN.
+      4) Ensure full coverage and build an inverse map from point index to cluster ids.
+
+    Args:
+        X: (N, Dx) flattened trajectories.
+        m: Neighborhood size for initial local clusters (m ≥ 2).
+        jaccard_thresh: Merge threshold on set overlap.
+        merge_k: Number of nearest seed clusters to consider when merging.
+        standardize: If True, z-score features before clustering.
+        scale_x: Scale factor applied to standardized X.
+
+    Returns:
+        clusters: List[Set[int]] of merged index sets.
+        inv_cluster: Dict[int, List[int]] mapping point → list of cluster ids.
+    """
+    N, Dx = X.shape
+    assert m >= 2
+
+    # 0) Feature build: use X only
+    if standardize:
+        Xs, _ = _standardize_cols(X)
+    else:
+        Xs = X
+
+    F = scale_x * Xs
+
+    # 1) local m-NN neighborhoods
+    nn = NearestNeighbors(n_neighbors=min(m, N), algorithm='kd_tree')
+    nn.fit(F)
+    _, indices = nn.kneighbors(F)
+
+    raw = []
+    for i, neigh in enumerate(indices):
+        s = set(neigh.tolist())
+        s.add(i)  # ensure self-inclusion
+        raw.append(s)
+
+    # 2) greedy cover -> candidates
+    covered = np.zeros(N, dtype=bool)
+    seed_indices, candidates = [], []
+
+    for i in range(N):
+        if not covered[i]:
+            seed_indices.append(i)
+            cand = raw[i].copy()
+            candidates.append(cand)
+            covered[list(cand)] = True
+
+    M = len(candidates)
+
+    if M <= 1:
+        clusters = [set(range(N))]
+        inv = {j: [0] for j in range(N)}
+        return clusters, inv
+
+    # 3) merge via seed-to-seed KNN + Jaccard
+    seed_pts = F[seed_indices]
+
+    seed_nbrs = NearestNeighbors(
+        n_neighbors=min(merge_k + 1, M),
+        algorithm='kd_tree'
+    ).fit(seed_pts)
+
+    _, seed_neighbors = seed_nbrs.kneighbors(seed_pts)
+
+    parent = list(range(M))
+    cluster_sets = {i: candidates[i] for i in range(M)}
+
+    def find(u):
+        while parent[u] != u:
+            parent[u] = parent[parent[u]]
+            u = parent[u]
+        return u
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+
+        if ra == rb:
+            return ra
+
+        # merge smaller into larger
+        if len(cluster_sets[ra]) < len(cluster_sets[rb]):
+            ra, rb = rb, ra
+
+        parent[rb] = ra
+        cluster_sets[ra] |= cluster_sets.pop(rb)
+
+        return ra
+
+    for i in range(M):
+        for j in seed_neighbors[i][1:]:
+            ri, rj = find(i), find(j)
+
+            if ri == rj:
+                continue
+
+            Ci, Cj = cluster_sets[ri], cluster_sets[rj]
+
+            inter = len(Ci & Cj)
+            union_sz = len(Ci | Cj)
+
+            if union_sz > 0 and (inter / union_sz) >= jaccard_thresh:
+                union(ri, rj)
+
+    merged_clusters = list(cluster_sets.values())
+
+    # 4) assert & repair coverage
+    covered_all = set().union(*merged_clusters) if merged_clusters else set()
+
+    if len(covered_all) < N:
+        missing = [j for j in range(N) if j not in covered_all]
+        print(
+            f"Warning! {len(missing)} points are not covered by clusters, "
+            "adding them to the first cluster"
+        )
+
+        for j in missing:
+            merged_clusters[0].add(j)
+
+    # 5) build inverse map
+    inv_cluster = {j: [] for j in range(N)}
+
+    for ci, cluster in enumerate(merged_clusters):
+        for j in cluster:
+            inv_cluster[j].append(ci)
+
+    return merged_clusters, inv_cluster
+
+
 def _pad_basis_to_rank(Bx, target_rank, Dx):
     """Pad a basis with deterministic orthonormal-ish fallback axes."""
     if Bx.shape[1] >= target_rank:
