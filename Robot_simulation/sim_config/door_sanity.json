@@ -19,5 +19,6 @@
   "max_policy_steps": 20,
   "early_stopping": false,
   "seed": 2002,
-  "normalize_data": false
+  "normalize_data": false,
+  "eval_fresh": false
 }

@@ -198,6 +198,8 @@ class DiffusionPolicy:
         best_model = copy.deepcopy(self.model)
         records = {}
         stop_count = 0
+        best_validation_rollouts = None
+        self.best_validation_rollouts = None
 
         do_validation = val_period > 0 and val_trials > 0
         env_settings_all, val_params = (None, None)
@@ -253,7 +255,7 @@ class DiffusionPolicy:
                 avg_loss = loss_sum / max(1, batch_count)
                 if do_validation and epoch % val_period == 0:
                     self.model.eval()
-                    success_rate, avg_reward = eval_model(
+                    success_rate, avg_reward, validation_rollouts = eval_model(
                         model=self.model,
                         model_class=None,
                         task_name=self.task_name,
@@ -277,6 +279,7 @@ class DiffusionPolicy:
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,
                         sampler_type="diffusion",
+                        return_rollouts=True,
                     )
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": avg_loss}
 
@@ -287,10 +290,12 @@ class DiffusionPolicy:
                                 tqdm.write("Early stopping triggered.")
                                 break
                             stop_count += 1
-                    elif (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                    elif best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
                         best_avg_reward = avg_reward
                         best_success_rate = success_rate
                         best_model = copy.deepcopy(self.model)
+                        best_validation_rollouts = validation_rollouts
+                        self.best_validation_rollouts = best_validation_rollouts
                         stop_count = 0
                         tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={avg_loss:.3f} | Best model saved")
                     else:

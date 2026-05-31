@@ -348,6 +348,8 @@ class DGFMv2(DGFM):
         best_model = copy.deepcopy(self.model)
         success_rate_recs = {}
         stop_count = 0
+        best_validation_rollouts = None
+        self.best_validation_rollouts = None
 
         do_validation = val_period > 0 and val_trials > 0
         env_settings_all, val_params = (None, None)
@@ -405,7 +407,7 @@ class DGFMv2(DGFM):
                 avg_loss = loss_sum / max(1, batch_count)
                 if do_validation and epoch % val_period == 0:
                     self.model.eval()
-                    success_rate, avg_reward = eval_model(
+                    success_rate, avg_reward, validation_rollouts = eval_model(
                         self.model,
                         VectorField,
                         self.task_name,
@@ -423,6 +425,7 @@ class DGFMv2(DGFM):
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,
                         normalization_stats=self.normalization_stats,
+                        return_rollouts=True,
                     )
 
                     if not torch.is_grad_enabled():
@@ -445,10 +448,12 @@ class DGFMv2(DGFM):
                                 break
                             stop_count += 1
                     else:
-                        if (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                        if best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
                             best_avg_reward = avg_reward
                             best_success_rate = success_rate
                             best_model = copy.deepcopy(self.model)
+                            best_validation_rollouts = validation_rollouts
+                            self.best_validation_rollouts = best_validation_rollouts
                             stop_count = 0
                             tqdm.write(
                                 f"Epoch {epoch}: success_rate={success_rate:.3f}, "

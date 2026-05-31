@@ -27,5 +27,6 @@
   "dp_ddim_steps": null,
   "dp_eta": 0.0,
   "dp_pred_type": "x0",
-  "normalize_data": true
+  "normalize_data": true,
+  "eval_fresh": false
 }

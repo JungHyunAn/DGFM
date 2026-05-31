@@ -121,6 +121,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from datetime import datetime
 from typing import Tuple, List
 import json
+import pickle
 import h5py
 import argparse
 import time
@@ -144,6 +145,7 @@ from Robot_simulation.env_util import (
     eval_model,
     get_trajectory_sample_step,
     make_env,
+    _render_rollout_grid,
 )
 from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
@@ -339,6 +341,7 @@ def train_and_eval_model(
     dp_eta: float = 0.0,
     dp_pred_type: str = "x0",
     normalize_data: bool = False,
+    eval_fresh: bool = True,
 ):
     fm_class_map = {
         "UniformFM": UniformFM,
@@ -461,7 +464,8 @@ def train_and_eval_model(
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
-        f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | seed={seed} | device={device}"
+        f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | "
+        f"eval_fresh={eval_fresh} | seed={seed} | device={device}"
     )
     model = None
     flow = None
@@ -615,88 +619,136 @@ def train_and_eval_model(
         best_model.load_state_dict(state)
         best_model.eval()
 
+    def _summarize_validation_records(records: dict) -> tuple[float, float, int, float]:
+        if not records:
+            raise ValueError("eval_fresh=False requires in-training validation records; set val_period/val_trials > 0.")
+        epochs = sorted(records.keys())
+        rates = [float(records[e].get("success_rate", float("nan"))) for e in epochs]
+        valid_pairs = [(e, r) for e, r in zip(epochs, rates) if not np.isnan(r)]
+        if not valid_pairs:
+            raise ValueError("eval_fresh=False found no finite validation success rates.")
+        best_epoch, best_rate = max(valid_pairs, key=lambda item: item[1])
+        tail_rates = [r for r in rates[-10:] if not np.isnan(r)]
+        avg_last_10 = float(np.mean(tail_rates)) if tail_rates else float("nan")
+        avg_reward = float(records[best_epoch].get("avg_reward", float("nan")))
+        return best_rate, avg_last_10, best_epoch, avg_reward
+
+    validation_rollouts = getattr(flow, "best_validation_rollouts", None)
+    if validation_rollouts is not None:
+        rollout_path = os.path.join(exp_dir, "best_validation_rollouts.pkl")
+        with open(rollout_path, "wb") as f:
+            pickle.dump(validation_rollouts, f)
+        print(f"[Saved best validation rollouts to {rollout_path}]")
+
+    max_validation_success_rate = None
+    avg_last_10_validation_success_rate = None
+    best_validation_epoch = None
+
     # evaluate model
-    print(f"Training finished, evaluating for {evaluation_samples} trials . . .")
+    if eval_fresh:
+        print(f"Training finished, evaluating for {evaluation_samples} fresh trials . . .")
 
-    # ====== PARALLEL ENV GENERATION ======
-    env_params_list: list[np.ndarray] = [None] * evaluation_samples
-    env_settings_all: list[dict]      = [None] * evaluation_samples
+        # ====== PARALLEL ENV GENERATION ======
+        env_params_list: list[np.ndarray] = [None] * evaluation_samples
+        env_settings_all: list[dict]      = [None] * evaluation_samples
 
-    # choose worker count (env creation is CPU-bound)
-    ENV_WORKERS = min(
-        evaluation_samples,
-        max(1, (os.cpu_count() or 4) - 2),
-        int(os.getenv("EVAL_ENV_WORKERS", "10"))
-    )
-
-    ctx = get_context("spawn")  # safe with MuJoCo/OpenGL
-    with ProcessPoolExecutor(max_workers=ENV_WORKERS, mp_context=ctx) as ex:
-        futs = [ex.submit(_spawn_env_once, task_name, seed + i, i) for i in range(evaluation_samples)]
-        for fut in as_completed(futs):
-            idx, setting, params, _ = fut.result() # vision not used for training+evaluation
-            env_settings_all[idx] = setting
-            env_params_list[idx]  = params
-
-    # stack to (N, Dc) float32 (order matches idx)
-    eval_params = np.asarray(env_params_list, dtype=np.float32)
-
-    q_low = None
-    eval_model_obj = flow if model_type in ("MPPCA", "MPPCAv2") else best_model
-
-    if model_type == "DP":
-        success_rate_best, avg_reward_best = eval_model(
-            model=best_model,
-            model_class=VectorField,
-            task_name=task_name,
-            seq_len=seq_len,
-            dof=dof,
-            param_len=param_len,
-            gripper_idx=gripper_idx,
-            render_dir=exp_dir,
-            video_name="best",
-            val_params=eval_params,
-            env_settings_all=env_settings_all,
-            device=device,
-            trials=evaluation_samples,
-            render_width=4,
-            render_num=8,
-            base_seed=seed+2,
-            max_policy_steps=max_policy_steps,
-            executed_horizon=executed_horizon,
-            recorded_control_freq=recorded_control_freq,
-            trajectory_control_freq=trajectory_control_freq,
-            T_diff=dp_T_diff,
-            schedule_type=dp_schedule_type,
-            ddim_steps=dp_ddim_steps,
-            eta=dp_eta,
-            pred_type=dp_pred_type,
-            normalization_stats=normalization_stats,
-            sampler_type="diffusion",
+        # choose worker count (env creation is CPU-bound)
+        ENV_WORKERS = min(
+            evaluation_samples,
+            max(1, (os.cpu_count() or 4) - 2),
+            int(os.getenv("EVAL_ENV_WORKERS", "10"))
         )
+
+        ctx = get_context("spawn")  # safe with MuJoCo/OpenGL
+        with ProcessPoolExecutor(max_workers=ENV_WORKERS, mp_context=ctx) as ex:
+            futs = [ex.submit(_spawn_env_once, task_name, seed + i, i) for i in range(evaluation_samples)]
+            for fut in as_completed(futs):
+                idx, setting, params, _ = fut.result() # vision not used for training+evaluation
+                env_settings_all[idx] = setting
+                env_params_list[idx]  = params
+
+        # stack to (N, Dc) float32 (order matches idx)
+        eval_params = np.asarray(env_params_list, dtype=np.float32)
+
+        q_low = None
+        eval_model_obj = flow if model_type in ("MPPCA", "MPPCAv2") else best_model
+
+        if model_type == "DP":
+            success_rate_best, avg_reward_best = eval_model(
+                model=best_model,
+                model_class=VectorField,
+                task_name=task_name,
+                seq_len=seq_len,
+                dof=dof,
+                param_len=param_len,
+                gripper_idx=gripper_idx,
+                render_dir=exp_dir,
+                video_name="best",
+                val_params=eval_params,
+                env_settings_all=env_settings_all,
+                device=device,
+                trials=evaluation_samples,
+                render_width=4,
+                render_num=8,
+                base_seed=seed+2,
+                max_policy_steps=max_policy_steps,
+                executed_horizon=executed_horizon,
+                recorded_control_freq=recorded_control_freq,
+                trajectory_control_freq=trajectory_control_freq,
+                T_diff=dp_T_diff,
+                schedule_type=dp_schedule_type,
+                ddim_steps=dp_ddim_steps,
+                eta=dp_eta,
+                pred_type=dp_pred_type,
+                normalization_stats=normalization_stats,
+                sampler_type="diffusion",
+            )
+        else:
+            success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
+                                                        model_class=VectorField,
+                                                        task_name=task_name,
+                                                        seq_len=seq_len,
+                                                        dof=dof,
+                                                        param_len=param_len,
+                                                        gripper_idx=gripper_idx,
+                                                        render_dir=exp_dir,
+                                                        video_name="best",
+                                                        val_params=eval_params,
+                                                        env_settings_all=env_settings_all,
+                                                        device=device,
+                                                        trials=evaluation_samples,
+                                                        render_width=4,
+                                                        render_num=8,
+                                                        base_seed=seed+2,
+                                                        q_low=q_low,
+                                                        base_mixture=False,
+                                                        max_policy_steps=max_policy_steps,
+                                                        executed_horizon=executed_horizon,
+                                                        recorded_control_freq=recorded_control_freq,
+                                                        trajectory_control_freq=trajectory_control_freq,
+                                                        normalization_stats=normalization_stats)
     else:
-        success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
-                                                    model_class=VectorField,
-                                                    task_name=task_name,
-                                                    seq_len=seq_len,
-                                                    dof=dof,
-                                                    param_len=param_len,
-                                                    gripper_idx=gripper_idx,
-                                                    render_dir=exp_dir,
-                                                    video_name="best",
-                                                    val_params=eval_params,
-                                                    env_settings_all=env_settings_all,
-                                                    device=device,
-                                                    trials=evaluation_samples,
-                                                    render_width=4,
-                                                    render_num=8,
-                                                    base_seed=seed+2,
-                                                    q_low=q_low,
-                                                    base_mixture=False,
-                                                    max_policy_steps=max_policy_steps,
-                                                    executed_horizon=executed_horizon,
-                                                    recorded_control_freq=recorded_control_freq,
-                                                    trajectory_control_freq=trajectory_control_freq,
-                                                    normalization_stats=normalization_stats)
+        if model_path is not None:
+            raise ValueError("eval_fresh=False is only available immediately after training, because it uses validation records and saved validation rollouts.")
+        success_rate_best, avg_last_10_validation_success_rate, best_validation_epoch, avg_reward_best = _summarize_validation_records(recs)
+        max_validation_success_rate = success_rate_best
+        print(
+            "Training finished, reporting validation metrics without fresh environments: "
+            f"max_success={max_validation_success_rate:.3f} at epoch {best_validation_epoch}, "
+            f"avg_last_10_success={avg_last_10_validation_success_rate:.3f}"
+        )
+        if validation_rollouts is None:
+            print("[Skipped validation rollout render: no best validation rollouts were captured]")
+        else:
+            _render_rollout_grid(
+                task_name,
+                exp_dir,
+                "best_validation",
+                render_width=4,
+                render_num=8,
+                success_info=validation_rollouts.get("success", []),
+                failure_info=validation_rollouts.get("failure", []),
+            )
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
 
@@ -717,6 +769,7 @@ def train_and_eval_model(
             "trajectory_control_freq": trajectory_control_freq,
             "trajectory_sample_step": sample_step,
             "normalize_data": normalize_data,
+            "eval_fresh": eval_fresh,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
             "task_name":       task_name,
@@ -763,6 +816,9 @@ def train_and_eval_model(
             "eval_samples":    evaluation_samples,
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
+            "max_validation_success_rate": max_validation_success_rate,
+            "avg_last_10_validation_success_rate": avg_last_10_validation_success_rate,
+            "best_validation_epoch": best_validation_epoch,
             "training_thread_time_seconds": training_thread_time_seconds,
             "records":         recs,
         }
@@ -821,6 +877,7 @@ def train_and_eval_model(
             "timestamp":       datetime.now(ZoneInfo("Asia/Seoul")).isoformat(),
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
+            "eval_fresh": eval_fresh,
             "normalize_data": normalize_data,
             "normalization_stats": _normalization_stats_to_json(normalization_stats)
         }
@@ -897,6 +954,8 @@ if __name__ == "__main__":
     parser.add_argument("--dp_pred_type", type=str, default="x0", choices=["x0", "epsilon"])
     parser.add_argument("--normalize_data", action=argparse.BooleanOptionalAction, default=False,
                         help="Normalize the selected demos per joint with fitted mean/std before training, and denormalize model outputs at inference.")
+    parser.add_argument("--eval_fresh", action=argparse.BooleanOptionalAction, default=True,
+                        help="When true, evaluate on newly generated environments after training. When false, report validation metrics and render best validation rollouts.")
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
 
@@ -980,4 +1039,5 @@ if __name__ == "__main__":
         dp_eta             = args.dp_eta,
         dp_pred_type       = args.dp_pred_type,
         normalize_data     = args.normalize_data,
+        eval_fresh         = args.eval_fresh,
     )

@@ -311,6 +311,8 @@ class VanillaFM:
         best_model = copy.deepcopy(self.model)
         records = {}
         stop_count = 0
+        best_validation_rollouts = None
+        self.best_validation_rollouts = None
 
         do_validation = val_period > 0 and val_trials > 0
         if do_validation:
@@ -357,7 +359,7 @@ class VanillaFM:
                     self.scheduler.step()
 
                 if do_validation and epoch % val_period == 0:
-                    success_rate, avg_reward = eval_model(
+                    success_rate, avg_reward, validation_rollouts = eval_model(
                         self.model,
                         VectorField,
                         self.task_name,
@@ -375,6 +377,7 @@ class VanillaFM:
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,
                         normalization_stats=self.normalization_stats,
+                        return_rollouts=True,
                     )
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                     if success_rate < best_success_rate:
@@ -384,10 +387,12 @@ class VanillaFM:
                                 tqdm.write("Early stopping triggered.")
                                 break
                             stop_count += 1
-                    elif (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                    elif best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
                         best_avg_reward = avg_reward
                         best_success_rate = success_rate
                         best_model = copy.deepcopy(self.model)
+                        best_validation_rollouts = validation_rollouts
+                        self.best_validation_rollouts = best_validation_rollouts
                         stop_count = 0
                         tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f} | Best model saved")
                     else:

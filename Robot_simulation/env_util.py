@@ -669,12 +669,27 @@ def _render_rollout_grid(
     failure_info: list,
 ):
     episode_frames = []
-    fail_slots = max(0, render_width * render_width - render_num)
-    s_left = min(len(success_info), render_num)
-    f_left = min(len(failure_info), fail_slots)
+    total_slots = render_width * render_width
+    if total_slots <= 0:
+        return
 
-    while s_left > 0:
-        info = success_info[s_left - 1]
+    success_slots = min(render_num, total_slots)
+    failure_slots = max(0, total_slots - success_slots)
+
+    def take_with_repeat(infos: list, count: int) -> list:
+        if count <= 0 or not infos:
+            return []
+        return [infos[i % len(infos)] for i in range(count)]
+
+    success_grid = take_with_repeat(success_info, success_slots)
+    if len(success_grid) < success_slots:
+        success_grid += take_with_repeat(failure_info, success_slots - len(success_grid))
+
+    failure_grid = take_with_repeat(failure_info, failure_slots)
+    if len(failure_grid) < failure_slots:
+        failure_grid += take_with_repeat(success_info, failure_slots - len(failure_grid))
+
+    for info in success_grid + failure_grid:
         env_r = make_env(
             task_name,
             has_offscreen_renderer=True,
@@ -694,30 +709,6 @@ def _render_rollout_grid(
         )
         episode_frames.append(frames)
         env_r.close()
-        s_left -= 1
-
-    while f_left > 0:
-        info = failure_info[f_left - 1]
-        env_r = make_env(
-            task_name,
-            has_offscreen_renderer=True,
-            use_camera_obs=False,
-            use_joint_control=True,
-            environment_setting=info["setting"],
-            training=True,
-        )
-        frames = render_trajectory(
-            env_r,
-            task_name,
-            info["traj"],
-            info["traj"][0, :],
-            camera_name="frontview",
-            hold_init=False,
-            set_init=False,
-        )
-        episode_frames.append(frames)
-        env_r.close()
-        f_left -= 1
 
     if render_num and episode_frames:
         grid_path = os.path.join(render_dir, f"{task_name}_grid_{video_name}.mp4")
@@ -758,6 +749,7 @@ def eval_model(
     ddim_steps: int | None = None,
     eta: float = 0.0,
     pred_type: str = "x0",
+    return_rollouts: bool = False,
 ) -> Tuple[float, float]:
     """Evaluate a flow or diffusion policy on restored RoboSuite environments."""
     del model_class, gripper_idx
@@ -798,16 +790,17 @@ def eval_model(
             eta=eta,
             pred_type=pred_type,
         )
-        fail_slots = max(0, render_width * render_width - render_num)
         _render_rollout_grid(
             task_name,
             render_dir,
             video_name,
             render_width,
             render_num,
-            success_all[:render_num],
-            failure_all[:fail_slots],
+            success_all,
+            failure_all,
         )
+        if return_rollouts:
+            return success_rate, mean_reward, {"success": success_all, "failure": failure_all}
         return success_rate, mean_reward
 
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
@@ -911,7 +904,7 @@ def eval_model(
     failure_info: List[dict] = []
     s_count = 0
     f_count = 0
-    fail_slots = max(0, render_width * render_width - render_num)
+    rollout_collect_limit = trials if return_rollouts else (render_width * render_width if render_width > 0 else 0)
 
     ctx = get_context("spawn")
     with ProcessPoolExecutor(max_workers=num_workers, mp_context=ctx) as ex:
@@ -931,12 +924,12 @@ def eval_model(
             total_success += succ
             total_reward += rew
 
-            if s_count < render_num:
-                take = min(render_num - s_count, len(info_s))
+            if s_count < rollout_collect_limit:
+                take = min(rollout_collect_limit - s_count, len(info_s))
                 success_info += info_s[:take]
                 s_count += take
-            if f_count < fail_slots:
-                take = min(fail_slots - f_count, len(info_f))
+            if f_count < rollout_collect_limit:
+                take = min(rollout_collect_limit - f_count, len(info_f))
                 failure_info += info_f[:take]
                 f_count += take
 
@@ -953,6 +946,8 @@ def eval_model(
         failure_info,
     )
 
+    if return_rollouts:
+        return success_rate, mean_reward, {"success": success_info, "failure": failure_info}
     return success_rate, mean_reward
 
 
