@@ -220,12 +220,12 @@ class VectorField(nn.Module):
         assert seq_len == self.seq_len and dof == self.dof, "Shape mismatch"
 
         # Normalize environment parameters (optional preprocessing)
-        env_params_norm = env_params * 100
+        # env_params_norm = env_params * 100
 
         # Encode timestep
         t_embed = self.time_embed(t)
         # p_embed = self.param_embed(env_params_norm) # in cased of additional encoding
-        p_embed = env_params_norm # without environment parameter encoding
+        p_embed = env_params # without environment parameter encoding
 
         # Create conditioning vector
         condition = torch.cat([p_embed, t_embed], dim=-1)  # (B, cond_dim)
