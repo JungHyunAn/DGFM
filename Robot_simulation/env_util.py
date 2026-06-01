@@ -125,12 +125,10 @@ def build_state_conditioned_windows(
             dyn = np.asarray(dyn, dtype=np.float32)
             if dyn.shape[0] != len(q):
                 raise ValueError(f"dynamic_states[{ep}] length {dyn.shape[0]} != trajectory length {len(q)}")
-        if sample_step > 1:
-            q = q[::sample_step]
-            dyn = dyn[::sample_step]
         env_c = np.asarray(static_env_params[ep], dtype=np.float32)
-        for start in range(0, len(q) - horizon + 1, stride):
-            xs.append(q[start:start + horizon])
+        max_start = len(q) - (horizon - 1) * sample_step
+        for start in range(0, max_start, stride):
+            xs.append(q[start:start + horizon * sample_step:sample_step])
             cs.append(np.concatenate([q[start], dyn[start], env_c], axis=0))
 
     if not xs:
