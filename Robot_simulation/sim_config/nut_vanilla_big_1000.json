@@ -1,8 +1,8 @@
 {
-  "FM_type": "DP",
-  "N": 40,
-  "task_name": "door",
-  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
+  "FM_type": "UniformFM",
+  "N": 60,
+  "task_name": "nut",
+  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/nut",
   "device": "cuda",
   "n_t": 1,
   "learning_rate": 0.0001,
@@ -22,11 +22,7 @@
   "max_policy_steps": 40,
   "early_stopping": false,
   "seed": 1000,
-  "dp_T_diff": 100,
-  "dp_schedule_type": "cosine",
-  "dp_ddim_steps": null,
-  "dp_eta": 0.0,
-  "dp_pred_type": "x0",
+  "time_sampling": "uniform",
   "normalize_data": true,
   "eval_fresh": false
 }
