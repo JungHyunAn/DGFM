@@ -426,6 +426,7 @@ class DGFMv2(DGFM):
                         trajectory_control_freq=trajectory_control_freq,
                         normalization_stats=self.normalization_stats,
                         return_rollouts=True,
+                        action_representation=getattr(self, "action_representation", "joint_space"),
                     )
 
                     if not torch.is_grad_enabled():

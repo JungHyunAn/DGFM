@@ -70,6 +70,18 @@ from robosuite.utils.placement_samplers import UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
 
 PANDA_GRIPPER_OPEN_QPOS = 0.04
+ACTION_REPRESENTATIONS = ("joint_space", "task_space")
+
+
+def validate_action_representation(action_representation: str) -> str:
+    if action_representation not in ACTION_REPRESENTATIONS:
+        raise ValueError(
+            f"Unsupported action_representation={action_representation!r}. "
+            f"Expected one of {ACTION_REPRESENTATIONS}."
+        )
+    return action_representation
+
+
 
 
 def _mat_to_roll_pitch_yaw(mat: np.ndarray) -> np.ndarray:
@@ -171,6 +183,76 @@ def _clip_policy_gripper_dims(q: np.ndarray, task_name: str) -> np.ndarray:
 def _normalized_gripper_to_qpos(value) -> np.ndarray:
     value = float(np.clip(value, 0.0, 1.0))
     return np.full((2,), value * PANDA_GRIPPER_OPEN_QPOS, dtype=np.float32)
+
+
+def _site_pose(env, site_id: int) -> np.ndarray:
+    pos = env.sim.data.site_xpos[site_id].copy().astype(np.float32)
+    quat = mat2quat(env.sim.data.site_xmat[site_id].reshape(3, 3)).astype(np.float32)
+    return np.concatenate([pos, quat], axis=0)
+
+
+def _robot_eef_pose(env, robot) -> np.ndarray:
+    return _site_pose(env, list(robot.eef_site_id.values())[0])
+
+
+def _eef_action_delta(env, site_id: int, target_pose: np.ndarray, pos_gain: float = 100.0, ori_gain: float = 1.0) -> np.ndarray:
+    target_pose = np.asarray(target_pose, dtype=np.float32)
+    target_pos = target_pose[:3]
+    target_quat = target_pose[3:7]
+    quat_norm = np.linalg.norm(target_quat)
+    if quat_norm < 1e-6:
+        target_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+    else:
+        target_quat = target_quat / quat_norm
+    cur_pos = env.sim.data.site_xpos[site_id].copy()
+    cur_quat = mat2quat(env.sim.data.site_xmat[site_id].reshape(3, 3))
+
+    action = np.zeros(6, dtype=np.float32)
+    action[0:3] = (target_pos - cur_pos) * pos_gain
+    q_rel = quat_multiply(target_quat, quat_inverse(cur_quat))
+    w = q_rel[3]
+    th = 2 * np.arccos(np.clip(w, -1, 1))
+    if abs(th) < 1e-6:
+        axis = np.zeros(3, dtype=np.float32)
+    else:
+        axis = q_rel[:3] / np.sin(th / 2)
+    action[3:6] = axis * th * ori_gain
+    return action
+
+
+def compose_task_space_trajectory(
+    task_name: str,
+    eef_trace: np.ndarray,
+    gripper_pose: np.ndarray | None = None,
+) -> np.ndarray:
+    """Pack EEF pose traces into the policy trajectory representation."""
+    eef_trace = np.asarray(eef_trace, dtype=np.float32)
+    if task_name in ["door", "nut"]:
+        if eef_trace.shape[-1] != 7:
+            raise ValueError(f"{task_name} task-space trajectory must have 7 EEF pose dims")
+        if gripper_pose is None:
+            raise ValueError(f"{task_name} task-space trajectory requires gripper_pose")
+        grip = np.clip(np.asarray(gripper_pose, dtype=np.float32).reshape(-1, 1), 0.0, 1.0)
+        if grip.shape[0] != eef_trace.shape[0]:
+            raise ValueError("gripper_pose length must match eef_trace length")
+        return np.concatenate([eef_trace, grip], axis=-1).astype(np.float32)
+    if task_name == "wipe":
+        if eef_trace.shape[-1] != 7:
+            raise ValueError("wipe task-space trajectory must have 7 EEF pose dims")
+        return eef_trace.astype(np.float32)
+    if task_name == "two_arm":
+        if eef_trace.shape[-1] != 14:
+            raise ValueError("two_arm task-space trajectory must have 14 EEF pose dims")
+        if gripper_pose is None:
+            raise ValueError("two_arm task-space trajectory requires gripper_pose")
+        grip = np.clip(np.asarray(gripper_pose, dtype=np.float32).reshape(eef_trace.shape[0], -1), 0.0, 1.0)
+        if grip.shape[1] != 2:
+            raise ValueError("two_arm gripper_pose must have shape (T, 2)")
+        return np.concatenate(
+            [eef_trace[:, 0:7], grip[:, 0:1], eef_trace[:, 7:14], grip[:, 1:2]],
+            axis=-1,
+        ).astype(np.float32)
+    raise ValueError(f"Unsupported task for task-space trajectory: {task_name}")
 
 
 def normalize_policy_trajectory(
@@ -419,6 +501,7 @@ def make_env(
     use_joint_control: bool = False,
     environment_setting: Optional[List[float]] = None,
     training: bool = False,
+    action_representation: str = "joint_space",
 ):
     """
     Build and reset a robosuite environment (currently only 'door'), optionally
@@ -433,6 +516,8 @@ def make_env(
         use_camera_obs: If True, image observations are returned by env.step().
         use_joint_control: If True, change the Panda controller to absolute
             joint-position control (useful for replaying trajectories).
+        action_representation: "joint_space" uses the current joint-space controller
+            behavior. "task_space" keeps the default OSC controller for EEF targets.
         environment_setting: Dict with keys {"qpos","qvel","body_pos","body_quat"}
             (all np.ndarray) that fully specify a saved simulator state. When
             given, it is copied into the env after reset to recreate the scene.
@@ -454,6 +539,9 @@ def make_env(
 
     # 1) for task "door"
     assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
+    action_representation = validate_action_representation(action_representation)
+    if action_representation == "task_space":
+        use_joint_control = False
     if task_name == "door":
         cfg = load_composite_controller_config(robot="Panda")
         door_sampler = UniformRandomSampler(
@@ -877,12 +965,28 @@ def _get_environment_params(
     return environment_parameters
 
 
-def _current_robot_q(env, task_name: str) -> np.ndarray:
+def _current_robot_q(env, task_name: str, action_representation: str = "joint_space") -> np.ndarray:
     """Return the current robot pose in the compact policy representation.
 
     Gripper finger qpos values are collapsed into normalized open/close channels
     so state-conditioned policies see the same format they generate.
     """
+    action_representation = validate_action_representation(action_representation)
+    if action_representation == "task_space":
+        if task_name in ["door", "nut"]:
+            return np.concatenate([
+                _robot_eef_pose(env, env.robots[0]),
+                [float(_gripper_qpos_to_normalized(env.sim.data.qpos[7:9]))],
+            ]).astype(np.float32)
+        if task_name == "wipe":
+            return _robot_eef_pose(env, env.robots[0]).astype(np.float32)
+        return np.concatenate([
+            _robot_eef_pose(env, env.robots[0]),
+            [float(_gripper_qpos_to_normalized(env.sim.data.qpos[7:9]))],
+            _robot_eef_pose(env, env.robots[1]),
+            [float(_gripper_qpos_to_normalized(env.sim.data.qpos[16:18]))],
+        ]).astype(np.float32)
+
     full_qpos = env.sim.data.qpos.copy()
     if task_name in ["door", "nut"]:
         return np.concatenate([full_qpos[:7], [float(_gripper_qpos_to_normalized(full_qpos[7:9]))]])
@@ -913,13 +1017,38 @@ def _state_policy_success(env, task_name: str) -> bool:
     return True
 
 
-def _to_action_from_q(q, task_name):
+def _to_action_from_q(q, task_name, action_representation: str = "joint_space", env=None):
     """Pack a compact policy pose into the action vector expected by env.step.
 
     This centralizes task-specific arm / gripper action layouts for replay and
     rollout code.
     """
     q = np.asarray(q, dtype=np.float32)
+    action_representation = validate_action_representation(action_representation)
+    if action_representation == "task_space":
+        if env is None:
+            raise ValueError("Task-space action conversion requires env")
+        if task_name in ["door", "nut"]:
+            robot = env.robots[0]
+            eef_id = list(robot.eef_site_id.values())[0]
+            grip_sc = _normalized_gripper_to_action(q[7]) if q.shape[0] >= 8 else 0.0
+            return np.concatenate([_eef_action_delta(env, eef_id, q[:7]), [grip_sc]])
+        if task_name == "wipe":
+            robot = env.robots[0]
+            eef_id = list(robot.eef_site_id.values())[0]
+            return _eef_action_delta(env, eef_id, q[:7])
+        left, right = env.robots[0], env.robots[1]
+        eef_l = list(left.eef_site_id.values())[0]
+        eef_r = list(right.eef_site_id.values())[0]
+        grip_l = _normalized_gripper_to_action(q[7])
+        grip_r = _normalized_gripper_to_action(q[15])
+        return np.concatenate([
+            _eef_action_delta(env, eef_l, q[0:7]),
+            [grip_l],
+            _eef_action_delta(env, eef_r, q[8:15]),
+            [grip_r],
+        ])
+
     if task_name in ["door", "nut"]:
         arm_q = q[:7]
         if q.shape[0] == 8:
@@ -983,6 +1112,7 @@ def render_trajectory(
     camera_name: str = "frontview",
     hold_init: bool = False,
     set_init: bool = True,
+    action_representation: str = "joint_space",
 ) -> List[np.ndarray]:
     """
     Replay a high-rate joint trajectory in the environment and capture rendered frames.
@@ -1007,8 +1137,10 @@ def render_trajectory(
           matches (absolute joint targets) instead of OSC deltas.
     """
     
+    action_representation = validate_action_representation(action_representation)
+
     # restore robot + door
-    if set_init:
+    if set_init and action_representation == "joint_space":
         if not _set_robot_qpos_from_policy_pose(env, task_name, initial_pose):
             offset = 0
             for robot in env.robots:
@@ -1034,7 +1166,7 @@ def render_trajectory(
     terminated = False
     if hold_init:
         for _ in range(100):
-            _, _, done, _ = env.step(_to_action_from_q(q_high[0], task_name))
+            _, _, done, _ = env.step(_to_action_from_q(q_high[0], task_name, action_representation, env))
             if done:
                 terminated = True
                 break
@@ -1046,7 +1178,7 @@ def render_trajectory(
         return frames
 
     for q in q_high:
-        action = _to_action_from_q(q, task_name)
+        action = _to_action_from_q(q, task_name, action_representation, env)
         
         _, _, done, _ = env.step(action)
 

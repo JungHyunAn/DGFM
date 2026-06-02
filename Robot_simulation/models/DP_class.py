@@ -280,6 +280,7 @@ class DiffusionPolicy:
                         trajectory_control_freq=trajectory_control_freq,
                         sampler_type="diffusion",
                         return_rollouts=True,
+                        action_representation=getattr(self, "action_representation", "joint_space"),
                     )
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": avg_loss}
 

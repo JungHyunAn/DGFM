@@ -63,6 +63,7 @@ def generate_door_trajectory(
     # ---------- storage ----------
     q_traj = []
     gripper_traj = []
+    eef_traj = []
     dynamic_traj = []
     frontview_frames = []
 
@@ -105,6 +106,10 @@ def generate_door_trajectory(
         full = env.sim.data.qpos.copy()
         q_traj.append(full[joint_idx].copy())
         gripper_traj.append(gripper_pose)
+        eef_traj.append(np.concatenate([
+            env.sim.data.site_xpos[eef_id].copy(),
+            mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3)),
+        ]).astype(np.float32))
         dynamic_traj.append(get_dynamic_state(env, "door"))
 
     # ---------- begin recording ----------
@@ -217,6 +222,7 @@ def generate_door_trajectory(
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
         np.asarray(gripper_traj, dtype=np.float32),
+        np.stack(eef_traj, axis=0),
     )
 
 

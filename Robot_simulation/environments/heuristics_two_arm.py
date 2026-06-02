@@ -43,6 +43,7 @@ def generate_two_arm_trajectory(
     # ---------- storage ----------
     q_traj, frames = [], []
     gripper_traj = []
+    eef_traj = []
     dynamic_traj = []
 
     # ---------- reset & indices ----------
@@ -85,6 +86,12 @@ def generate_two_arm_trajectory(
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
         gripper_traj.append(gripper_pose.copy())
+        eef_traj.append(np.concatenate([
+            env.sim.data.site_xpos[eefL].copy(),
+            mat2quat(env.sim.data.site_xmat[eefL].reshape(3, 3)),
+            env.sim.data.site_xpos[eefR].copy(),
+            mat2quat(env.sim.data.site_xmat[eefR].reshape(3, 3)),
+        ]).astype(np.float32))
         # TODO(two_arm): Replace empty placeholder with pot / handle dynamic state.
         dynamic_traj.append(get_dynamic_state(env, "two_arm"))
 
@@ -257,6 +264,7 @@ def generate_two_arm_trajectory(
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
         np.stack(gripper_traj, axis=0),
+        np.stack(eef_traj, axis=0),
     )
 
 

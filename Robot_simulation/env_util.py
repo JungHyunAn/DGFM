@@ -16,6 +16,7 @@ from Robot_simulation.environments.heuristics_util import (
     _state_policy_success,
     _to_action_from_q,
     configure_nut_pegs,
+    validate_action_representation,
     get_dynamic_state,
     make_env,
     render_trajectory,
@@ -82,9 +83,13 @@ def _upsample_policy_trajectory(
     task_name: str,
     recorded_control_freq: int | float | None,
     trajectory_control_freq: int | float | None,
+    action_representation: str = "joint_space",
 ) -> np.ndarray:
     sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
-    q_low = _clip_policy_gripper_dims(np.asarray(q_low, dtype=np.float32), task_name)
+    action_representation = validate_action_representation(action_representation)
+    q_low = np.asarray(q_low, dtype=np.float32)
+    if action_representation == "joint_space":
+        q_low = _clip_policy_gripper_dims(q_low, task_name)
     if sample_step == 1:
         return q_low
     if q_low.shape[0] < 2:
@@ -95,7 +100,9 @@ def _upsample_policy_trajectory(
     t_high = np.linspace(t_low[0], t_low[-1], target_len, dtype=np.float32)
     spline = CubicSpline(t_low, q_low, axis=0, extrapolate=False)
     q_high = spline(t_high).astype(np.float32)
-    return _clip_policy_gripper_dims(q_high, task_name)
+    if action_representation == "joint_space":
+        return _clip_policy_gripper_dims(q_high, task_name)
+    return q_high
 
 
 def build_state_conditioned_windows(
@@ -160,8 +167,9 @@ def _condition_from_env(
     static_c: np.ndarray,
     param_len: int,
     normalization_stats: dict[str, np.ndarray] | None = None,
+    action_representation: str = "joint_space",
 ) -> tuple[np.ndarray, np.ndarray]:
-    q0 = _current_robot_q(env, task_name)
+    q0 = _current_robot_q(env, task_name, action_representation)
     dyn = get_dynamic_state(env, task_name)
     static_flat = np.asarray(static_c, dtype=np.float32).reshape(-1)
     dyn_dim = param_len - q0.shape[0] - static_flat.shape[0]
@@ -194,18 +202,20 @@ def _state_policy_env_worker(
     recorded_control_freq: int | float | None,
     trajectory_control_freq: int | float | None,
     normalization_stats: dict[str, np.ndarray] | None = None,
+    action_representation: str = "joint_space",
 ):
     env = None
     executed = []
     try:
         env = make_env(
             task_name,
-            use_joint_control=True,
+            use_joint_control=(action_representation == "joint_space"),
             environment_setting=setting,
             training=True,
+            action_representation=action_representation,
         )
         steps = 0
-        cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats)
+        cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats, action_representation)
         conn.send({"type": "cond", "idx": idx, "cond": cond})
 
         while True:
@@ -221,11 +231,12 @@ def _state_policy_env_worker(
                 task_name,
                 recorded_control_freq,
                 trajectory_control_freq,
+                action_representation,
             )
 
             done = False
             for q in q_low:
-                _, _, done, _ = env.step(_to_action_from_q(q, task_name))
+                _, _, done, _ = env.step(_to_action_from_q(q, task_name, action_representation, env))
                 executed.append(q.copy())
                 if done or env._check_success():
                     break
@@ -243,7 +254,7 @@ def _state_policy_env_worker(
                 })
                 break
 
-            cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats)
+            cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats, action_representation)
             conn.send({"type": "cond", "idx": idx, "cond": cond})
     except Exception as exc:
         conn.send({"type": "error", "idx": idx, "error": repr(exc)})
@@ -300,6 +311,7 @@ def _rollout_batch(
     print_true: bool,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
+    action_representation: str = "joint_space",
 ) -> Tuple[int, float, list, list]:
     """Worker: restore envs from settings, upsample to controller rate, roll out CPU-only."""
     successes, reward_sum = 0, 0.0
@@ -312,9 +324,10 @@ def _rollout_batch(
         setting = env_settings[i]
         env = make_env(
             task_name,
-            use_joint_control=True,
+            use_joint_control=(action_representation == "joint_space"),
             environment_setting=setting,
             training=True,
+            action_representation=action_representation,
         )
 
         q_low = _upsample_policy_trajectory(
@@ -322,10 +335,11 @@ def _rollout_batch(
             task_name,
             recorded_control_freq,
             trajectory_control_freq,
+            action_representation,
         )
 
         for q in q_low:
-            env.step(_to_action_from_q(q, task_name))
+            env.step(_to_action_from_q(q, task_name, action_representation, env))
 
         if env._check_success():
             if task_name == "two_arm":
@@ -435,6 +449,7 @@ def _run_diffusion_batched(
     rng: np.random.RandomState,
     gpu_chunk_size: int | None = None,
     normalization_stats: dict[str, np.ndarray] | None = None,
+    action_representation: str = "joint_space",
     *,
     T_diff: int = 100,
     schedule_type: str = "cosine",
@@ -488,6 +503,7 @@ def _run_policy_batched(
     flow_steps: int,
     gpu_chunk_size: int | None,
     normalization_stats: dict[str, np.ndarray] | None,
+    action_representation: str = "joint_space",
     *,
     T_diff: int,
     schedule_type: str,
@@ -519,6 +535,7 @@ def _run_policy_batched(
             rng,
             gpu_chunk_size,
             normalization_stats=normalization_stats,
+            action_representation=action_representation,
             T_diff=T_diff,
             schedule_type=schedule_type,
             ddim_steps=ddim_steps,
@@ -548,6 +565,7 @@ def _rollout_state_policy_synchronized(
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
     normalization_stats: dict[str, np.ndarray] | None = None,
+    action_representation: str = "joint_space",
     *,
     T_diff: int = 100,
     schedule_type: str = "cosine",
@@ -591,6 +609,7 @@ def _rollout_state_policy_synchronized(
                     recorded_control_freq,
                     trajectory_control_freq,
                     normalization_stats,
+                    action_representation,
                 ),
             )
             proc.start()
@@ -638,6 +657,7 @@ def _rollout_state_policy_synchronized(
                 flow_steps,
                 gpu_chunk_size,
                 normalization_stats,
+                action_representation,
                 T_diff=T_diff,
                 schedule_type=schedule_type,
                 ddim_steps=ddim_steps,
@@ -665,6 +685,7 @@ def _render_rollout_grid(
     render_num: int,
     success_info: list,
     failure_info: list,
+    action_representation: str = "joint_space",
 ):
     episode_frames = []
     total_slots = render_width * render_width
@@ -692,9 +713,10 @@ def _render_rollout_grid(
             task_name,
             has_offscreen_renderer=True,
             use_camera_obs=False,
-            use_joint_control=True,
+            use_joint_control=(action_representation == "joint_space"),
             environment_setting=info["setting"],
             training=True,
+            action_representation=action_representation,
         )
         frames = render_trajectory(
             env_r,
@@ -704,6 +726,7 @@ def _render_rollout_grid(
             camera_name="frontview",
             hold_init=False,
             set_init=False,
+            action_representation=action_representation,
         )
         episode_frames.append(frames)
         env_r.close()
@@ -748,10 +771,12 @@ def eval_model(
     eta: float = 0.0,
     pred_type: str = "x0",
     return_rollouts: bool = False,
+    action_representation: str = "joint_space",
 ) -> Tuple[float, float]:
     """Evaluate a flow or diffusion policy on restored RoboSuite environments."""
     del model_class, gripper_idx
 
+    action_representation = validate_action_representation(action_representation)
     np_rng = np.random.RandomState(base_seed)
     if executed_horizon is None:
         executed_horizon = seq_len
@@ -782,6 +807,7 @@ def eval_model(
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
             normalization_stats=normalization_stats,
+            action_representation=action_representation,
             T_diff=T_diff,
             schedule_type=schedule_type,
             ddim_steps=ddim_steps,
@@ -796,6 +822,7 @@ def eval_model(
             render_num,
             success_all,
             failure_all,
+            action_representation=action_representation,
         )
         if return_rollouts:
             return success_rate, mean_reward, {"success": success_all, "failure": failure_all}
@@ -916,6 +943,7 @@ def eval_model(
                 s == 0,
                 recorded_control_freq,
                 trajectory_control_freq,
+                action_representation,
             ))
         for fut in futs:
             succ, rew, info_s, info_f = fut.result()
@@ -942,6 +970,7 @@ def eval_model(
         render_num,
         success_info,
         failure_info,
+        action_representation=action_representation,
     )
 
     if return_rollouts:

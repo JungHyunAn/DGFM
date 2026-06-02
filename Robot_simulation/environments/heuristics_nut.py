@@ -57,6 +57,7 @@ def generate_nut_trajectory(
     # ---------- storage ----------
     q_traj = []
     gripper_traj = []
+    eef_traj = []
     dynamic_traj = []
     frames = []
 
@@ -95,6 +96,10 @@ def generate_nut_trajectory(
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
         gripper_traj.append(gripper_pose)
+        eef_traj.append(np.concatenate([
+            env.sim.data.site_xpos[eef_id].copy(),
+            mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3)),
+        ]).astype(np.float32))
         dynamic_traj.append(get_dynamic_state(env, "nut"))
 
     # ---------- begin recording ----------
@@ -222,6 +227,7 @@ def generate_nut_trajectory(
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
         np.asarray(gripper_traj, dtype=np.float32),
+        np.stack(eef_traj, axis=0),
     )
 
 

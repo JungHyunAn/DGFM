@@ -63,6 +63,7 @@ def generate_wipe_trajectory(
 
     # ---------- storage ----------
     q_traj: List[np.ndarray] = []
+    eef_traj: List[np.ndarray] = []
     dynamic_traj: List[np.ndarray] = []
     frames: List[np.ndarray] = []
 
@@ -88,6 +89,10 @@ def generate_wipe_trajectory(
     # ---------- helper for recording ----------
     def record_q():
         q_traj.append(env.sim.data.qpos[joint_idx].copy())
+        eef_traj.append(np.concatenate([
+            env.sim.data.site_xpos[eef_id].copy(),
+            mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3)),
+        ]).astype(np.float32))
         dynamic_traj.append(get_dynamic_state(env, "wipe"))
 
     # ---------- helper for step then check & record ----------
@@ -192,6 +197,7 @@ def generate_wipe_trajectory(
         env_setting,
         environment_parameters,
         np.stack(dynamic_traj, axis=0),
+        np.stack(eef_traj, axis=0),
     )
 
 

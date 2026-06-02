@@ -151,7 +151,7 @@ from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
 from Robot_simulation.models.DP_class import DiffusionPolicy
 from Robot_simulation.models.MPPCA_class import MPPCA
-from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs
+from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs, validate_action_representation
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 
 
@@ -342,6 +342,7 @@ def train_and_eval_model(
     dp_pred_type: str = "x0",
     normalize_data: bool = False,
     eval_fresh: bool = True,
+    action_representation: str | None = None,
 ):
     fm_class_map = {
         "UniformFM": UniformFM,
@@ -365,6 +366,17 @@ def train_and_eval_model(
 
     # load dataset
     with h5py.File(dataset_path, "r") as hf:
+        dataset_action_representation = hf.get("meta", {}).attrs.get("action_representation", "joint_space") if "meta" in hf else "joint_space"
+        if isinstance(dataset_action_representation, bytes):
+            dataset_action_representation = dataset_action_representation.decode("utf-8")
+        if action_representation is None:
+            action_representation = dataset_action_representation
+        action_representation = validate_action_representation(action_representation)
+        if dataset_action_representation != action_representation:
+            raise ValueError(
+                f"Dataset action_representation={dataset_action_representation!r} does not match "
+                f"requested action_representation={action_representation!r}"
+            )
         data_grp = hf["data"]
         # collect episode subgroup names and select a seeded random subset
         ep_keys = sorted(data_grp.keys(), key=lambda s: int(s.split("_")[-1]))
@@ -465,6 +477,7 @@ def train_and_eval_model(
         f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
         f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | "
+        f"action_representation={action_representation} | "
         f"eval_fresh={eval_fresh} | seed={seed} | device={device}"
     )
     model = None
@@ -521,6 +534,9 @@ def train_and_eval_model(
             gripper_idx=gripper_idx,
             device=device,
         )
+
+    if flow is not None:
+        flow.action_representation = action_representation
 
     # train model
     print(
@@ -702,6 +718,7 @@ def train_and_eval_model(
                 pred_type=dp_pred_type,
                 normalization_stats=normalization_stats,
                 sampler_type="diffusion",
+                action_representation=action_representation,
             )
         else:
             success_rate_best, avg_reward_best = eval_model(model=eval_model_obj,
@@ -726,7 +743,8 @@ def train_and_eval_model(
                                                         executed_horizon=executed_horizon,
                                                         recorded_control_freq=recorded_control_freq,
                                                         trajectory_control_freq=trajectory_control_freq,
-                                                        normalization_stats=normalization_stats)
+                                                        normalization_stats=normalization_stats,
+                                                        action_representation=action_representation)
     else:
         if model_path is not None:
             raise ValueError("eval_fresh=False is only available immediately after training, because it uses validation records and saved validation rollouts.")
@@ -748,6 +766,7 @@ def train_and_eval_model(
                 render_num=8,
                 success_info=validation_rollouts.get("success", []),
                 failure_info=validation_rollouts.get("failure", []),
+                action_representation=action_representation,
             )
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
@@ -769,6 +788,7 @@ def train_and_eval_model(
             "trajectory_control_freq": trajectory_control_freq,
             "trajectory_sample_step": sample_step,
             "normalize_data": normalize_data,
+            "action_representation": action_representation,
             "eval_fresh": eval_fresh,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
@@ -879,6 +899,7 @@ def train_and_eval_model(
             "average_reward_best": avg_reward_best,
             "eval_fresh": eval_fresh,
             "normalize_data": normalize_data,
+            "action_representation": action_representation,
             "normalization_stats": _normalization_stats_to_json(normalization_stats)
         }
         with open(json_path, "w") as f:
@@ -956,6 +977,9 @@ if __name__ == "__main__":
                         help="Normalize the selected demos per joint with fitted mean/std before training, and denormalize model outputs at inference.")
     parser.add_argument("--eval_fresh", action=argparse.BooleanOptionalAction, default=True,
                         help="When true, evaluate on newly generated environments after training. When false, report validation metrics and render best validation rollouts.")
+    parser.add_argument("--action_representation", type=str, default=None,
+                        choices=["joint_space", "task_space"],
+                        help="Policy trajectory representation. Defaults to the dataset metadata, or joint_space for old datasets.")
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
 
@@ -1040,4 +1064,5 @@ if __name__ == "__main__":
         dp_pred_type       = args.dp_pred_type,
         normalize_data     = args.normalize_data,
         eval_fresh         = args.eval_fresh,
+        action_representation = args.action_representation,
     )

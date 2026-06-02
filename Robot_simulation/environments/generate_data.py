@@ -32,7 +32,7 @@ What this script does
        task, timestamp, robot, dof
    - For each successful episode, creates:
        /data/entire_episode_{i}/
-         ├─ joint_angles          (K, dof)        # sampled keyframes (not full trace)
+         ├─ joint_angles          (K, dof)        # sampled policy keyframes (joint or task space)
          ├─ key_inds              (K,)            # original indices in the full trace
          ├─ initial_pose          (dof,)          # robot pose at episode start
          ├─ attrs: success=1, num_keyframes=K
@@ -81,8 +81,8 @@ Important notes & assumptions
   with `success=True` are saved.
 - Keyframes are sampled from a potentially downsampled trace but `key_inds`
   are always in the **original** trace index space.
-- `make_env(..., use_joint_control=True, environment_setting=...)` restores the
-  exact scene for deterministic replay and disables random placement thereafter.
+- `make_env(..., action_representation=...)` restores the exact scene for
+  deterministic replay and uses joint-position replay only for joint-space data.
 - The upsampler (`compute_smooth_trajectory`) handles task-specific gripper
   timing and rates. If you change the env `control_freq`, revisit its arguments.
 
@@ -125,7 +125,13 @@ from Robot_simulation.environments.heuristics_wipe import generate_wipe_trajecto
 from Robot_simulation.environments.heuristics_two_arm import generate_two_arm_trajectory
 from Robot_simulation.environments.heuristics_nut import generate_nut_trajectory
 from Robot_simulation.env_util import make_env
-from Robot_simulation.environments.heuristics_util import normalize_policy_trajectory, write_grid_video, render_trajectory
+from Robot_simulation.environments.heuristics_util import (
+    compose_task_space_trajectory,
+    normalize_policy_trajectory,
+    render_trajectory,
+    validate_action_representation,
+    write_grid_video,
+)
 from Robot_simulation import DEFAULT_DATASET_DIR
 
 DOWNSAMPLE_RATIOS  = {"door"    : 2,
@@ -161,7 +167,7 @@ KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
                     }
 
 
-def init_hdf5(path: str, task_name: str, env):
+def init_hdf5(path: str, task_name: str, env, action_representation: str = "joint_space"):
     """
     Create and initialize the root HDF5 file for this dataset.
 
@@ -180,6 +186,7 @@ def init_hdf5(path: str, task_name: str, env):
     meta.attrs["timestamp"] = time.time()
     meta.attrs["robot"] = env.robots[0].robot_model.naming_prefix
     meta.attrs["robot_dof"] = env.robots[0].dof
+    meta.attrs["action_representation"] = action_representation
     return f
 
 
@@ -256,6 +263,7 @@ def save_episode(
     env_param,
     dynamic_states: Optional[np.ndarray] = None,
     rendered_images: Optional[np.ndarray] = None,
+    action_representation: str = "joint_space",
 ):
     """
     Write one successful episode into the HDF5 file.
@@ -276,7 +284,8 @@ def save_episode(
     Args:
         hf: Open HDF5 file handle.
         ep_idx: Episode id (used in the group name).
-        joint_angles: Keyframe joint angles.
+        joint_angles: Keyframe policy trajectory values. The legacy dataset name is
+            preserved for compatibility; inspect `action_representation` metadata.
         key_inds: Original indices of those keyframes.
         success: Boolean flag from the generator.
         initial_pose: Robot pose at the start of the episode (joint space).
@@ -293,6 +302,7 @@ def save_episode(
     grp.attrs["success"]       = int(success)
     grp.attrs["num_keyframes"] = joint_angles.shape[0]
     grp.attrs["trajectory_format"] = "policy"
+    grp.attrs["action_representation"] = action_representation
     grp.attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
     grp.attrs["dof"] = joint_angles.shape[1]
     grp.create_dataset("initial_pose", data=initial_pose, compression="gzip")
@@ -321,6 +331,7 @@ def worker_generate(
     max_trials: int,
     seed: int,
     save_rendered_images: bool = False,
+    action_representation: str = "joint_space",
 ) -> List[Dict[str, Any]]:
     """
     Worker process entrypoint for multiprocessing.
@@ -359,6 +370,7 @@ def worker_generate(
         "nut": generate_nut_trajectory
     }
     generator = gen_map[task_name]
+    action_representation = validate_action_representation(action_representation)
     np.random.seed(seed + worker_id)
 
     env = make_env(
@@ -374,8 +386,19 @@ def worker_generate(
         # generator now returns (actions, success, frames, initial_qpos)
         result = generator(env, render=save_rendered_images)
         q_traj, success, frames, init_qpos, environment_setting, env_param, dynamic_states = result[:7]
-        gripper_pose = result[7] if len(result) > 7 else None
-        q_policy = normalize_policy_trajectory(task_name, q_traj, gripper_pose=gripper_pose)
+        gripper_pose = None
+        eef_traj = None
+        if task_name == "wipe":
+            eef_traj = result[7] if len(result) > 7 else None
+        else:
+            gripper_pose = result[7] if len(result) > 7 else None
+            eef_traj = result[8] if len(result) > 8 else None
+        if action_representation == "task_space":
+            if eef_traj is None:
+                raise ValueError(f"{task_name} heuristic did not return an EEF pose trace")
+            q_policy = compose_task_space_trajectory(task_name, eef_traj, gripper_pose=gripper_pose)
+        else:
+            q_policy = normalize_policy_trajectory(task_name, q_traj, gripper_pose=gripper_pose)
         # print(trials, success)
         if success:
             successes.append({
@@ -435,6 +458,7 @@ def generate_data_parallel(
     base_seed: int = 12345,
     verbose: bool = True,
     save_rendered_images: bool = False,
+    action_representation: str = "joint_space",
 ):
     """
     Orchestrate parallel trajectory generation, HDF5 serialization, and optional rendering.
@@ -472,6 +496,7 @@ def generate_data_parallel(
           deterministic replay.
     """
 
+    action_representation = validate_action_representation(action_representation)
     os.makedirs(output_dir, exist_ok=True)
 
     # Sample env for metadata & fps (no offscreen / no camera obs)
@@ -485,7 +510,8 @@ def generate_data_parallel(
     hf = init_hdf5(
         h5_path,
         task_name,
-        sample_env
+        sample_env,
+        action_representation=action_representation,
     )
     sample_env.close()
 
@@ -511,6 +537,7 @@ def generate_data_parallel(
                 max_trials_per_worker,
                 base_seed,
                 save_rendered_images,
+                action_representation,
             )
             for wid in range(num_workers)
         ]
@@ -529,6 +556,7 @@ def generate_data_parallel(
                     if success_count == 0:
                         hf["meta"].attrs["policy_dof"] = entry["joint_angles"].shape[1]
                         hf["meta"].attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
+                        hf["meta"].attrs["action_representation"] = action_representation
                     # Save actions + initial_pose
                     save_episode(
                         hf,
@@ -541,6 +569,7 @@ def generate_data_parallel(
                         entry["environment_parameters"],
                         entry["dynamic_states"],
                         entry["rendered_images"],
+                        action_representation=action_representation,
                     )
 
                     pbar.update(1)
@@ -559,6 +588,7 @@ def generate_data_parallel(
                             max_trials_per_worker,
                             base_seed,
                             save_rendered_images,
+                            action_representation,
                         )
                     )
 
@@ -587,13 +617,16 @@ def generate_data_parallel(
             env_r = make_env(task_name,
                              has_offscreen_renderer=True,
                              use_camera_obs=False,
-                             use_joint_control=True,
-                             environment_setting=environment_setting)
+                             use_joint_control=(action_representation == "joint_space"),
+                             environment_setting=environment_setting,
+                             action_representation=action_representation)
 
             frames = render_trajectory(
                 env_r, task_name, q_traj, init_q,
                 fps=control_freq * 3,
-                camera_name="frontview"
+                camera_name="frontview",
+                action_representation=action_representation,
+                set_init=(action_representation == "joint_space"),
             )
             episodes_frames.append(frames)
             env_r.close()
@@ -648,6 +681,11 @@ if __name__ == "__main__":
         "--verbose", action="store_true",
         help="Print progress and debug information"
     )
+    parser.add_argument(
+        "--action_representation", type=str, default="joint_space",
+        choices=["joint_space", "task_space"],
+        help="Policy trajectory representation to save"
+    )
 
     args = parser.parse_args()
 
@@ -660,4 +698,5 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         verbose=args.verbose,
         save_rendered_images=args.save_rendered_images,
+        action_representation=args.action_representation,
     )
