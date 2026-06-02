@@ -206,6 +206,8 @@ def _eef_action_delta(env, site_id: int, target_pose: np.ndarray, pos_gain: floa
         target_quat = target_quat / quat_norm
     cur_pos = env.sim.data.site_xpos[site_id].copy()
     cur_quat = mat2quat(env.sim.data.site_xmat[site_id].reshape(3, 3))
+    if np.dot(target_quat, cur_quat) < 0.0:
+        target_quat = -target_quat
 
     action = np.zeros(6, dtype=np.float32)
     action[0:3] = (target_pos - cur_pos) * pos_gain
@@ -220,18 +222,29 @@ def _eef_action_delta(env, site_id: int, target_pose: np.ndarray, pos_gain: floa
     return action
 
 
+def _canonicalize_quat_sequence(quats: np.ndarray) -> np.ndarray:
+    quats = np.asarray(quats, dtype=np.float32).copy()
+    norms = np.linalg.norm(quats, axis=-1, keepdims=True)
+    quats = np.divide(quats, np.maximum(norms, 1e-6), out=quats, where=norms > 0)
+    for i in range(1, quats.shape[0]):
+        if np.dot(quats[i - 1], quats[i]) < 0.0:
+            quats[i] = -quats[i]
+    return quats
+
+
 def compose_task_space_trajectory(
     task_name: str,
     eef_trace: np.ndarray,
     gripper_pose: np.ndarray | None = None,
 ) -> np.ndarray:
     """Pack EEF pose traces into the policy trajectory representation."""
-    eef_trace = np.asarray(eef_trace, dtype=np.float32)
+    eef_trace = np.asarray(eef_trace, dtype=np.float32).copy()
     if task_name in ["door", "nut"]:
         if eef_trace.shape[-1] != 7:
             raise ValueError(f"{task_name} task-space trajectory must have 7 EEF pose dims")
         if gripper_pose is None:
             raise ValueError(f"{task_name} task-space trajectory requires gripper_pose")
+        eef_trace[:, 3:7] = _canonicalize_quat_sequence(eef_trace[:, 3:7])
         grip = np.clip(np.asarray(gripper_pose, dtype=np.float32).reshape(-1, 1), 0.0, 1.0)
         if grip.shape[0] != eef_trace.shape[0]:
             raise ValueError("gripper_pose length must match eef_trace length")
@@ -239,12 +252,15 @@ def compose_task_space_trajectory(
     if task_name == "wipe":
         if eef_trace.shape[-1] != 7:
             raise ValueError("wipe task-space trajectory must have 7 EEF pose dims")
+        eef_trace[:, 3:7] = _canonicalize_quat_sequence(eef_trace[:, 3:7])
         return eef_trace.astype(np.float32)
     if task_name == "two_arm":
         if eef_trace.shape[-1] != 14:
             raise ValueError("two_arm task-space trajectory must have 14 EEF pose dims")
         if gripper_pose is None:
             raise ValueError("two_arm task-space trajectory requires gripper_pose")
+        eef_trace[:, 3:7] = _canonicalize_quat_sequence(eef_trace[:, 3:7])
+        eef_trace[:, 10:14] = _canonicalize_quat_sequence(eef_trace[:, 10:14])
         grip = np.clip(np.asarray(gripper_pose, dtype=np.float32).reshape(eef_trace.shape[0], -1), 0.0, 1.0)
         if grip.shape[1] != 2:
             raise ValueError("two_arm gripper_pose must have shape (T, 2)")

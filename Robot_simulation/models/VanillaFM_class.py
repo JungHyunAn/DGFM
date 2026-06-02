@@ -1,6 +1,7 @@
 """Flow model class definitions for RoboSuite trajectory policies."""
 
 import copy
+import math
 
 import numpy as np
 import torch
@@ -136,39 +137,53 @@ class UNet1D(nn.Module):
         return self.final_conv(x)
 
 
+class SinusoidalPosEmb(nn.Module):
+    """Sinusoidal embedding for a scalar continuous or discrete time variable."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"SinusoidalPosEmb requires an even dimension, got {dim}")
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept (B,), (B, 1), scalar, or integer-like inputs.
+        x = x.reshape(-1)
+
+        half_dim = self.dim // 2
+        exponent = math.log(10000.0) / max(half_dim - 1, 1)
+
+        frequencies = torch.exp(
+            -exponent
+            * torch.arange(
+                half_dim,
+                device=x.device,
+                dtype=x.dtype,
+            )
+        )
+
+        phase = x[:, None] * frequencies[None, :]
+        return torch.cat([phase.sin(), phase.cos()], dim=-1)
+
 
 class VectorField(nn.Module):
-    """Conditional vector field v(x, t, c) over joint trajectories.
+    """Shared conditional field for FM velocity prediction and DP denoising."""
 
-    The model predicts a velocity field for every policy channel, including
-    normalized gripper pose channels. Time is encoded via a small MLP and
-    concatenated with (optionally scaled) environment parameters for FiLM
-    conditioning.
-
-    Args:
-        seq_len: Number of time steps (T) per trajectory.
-        dof: Total joint DoF per time step (includes grippers if present).
-        param_len: Dimensionality of environment parameter vector `c`.
-        gripper_idx: Optional gripper channel indices, kept for compatibility.
-            These channels are still modeled and included in the loss.
-
-    Attributes:
-        loss_mask (Tensor): (1, 1, dof) all-ones mask kept for compatibility.
-
-    Forward Args:
-        x: (B, T, dof) current state on the straight path between x0 and x1.
-        t: (B, 1) time in [0, 1].
-        env_params: (B, param_len) environment parameters (scaled by 100 internally).
-
-    Forward Returns:
-        (B, T, dof) velocity field for all policy channels.
-    """
-
-    def __init__(self, seq_len, dof, param_len, gripper_idx=None):
+    def __init__(
+        self,
+        seq_len,
+        dof,
+        param_len,
+        gripper_idx=None,
+        *,
+        time_embed_dim: int = 128,
+        time_scale: float = 100.0,
+    ):
         super().__init__()
         self.seq_len = seq_len
         self.dof = dof
         self.param_len = param_len
+        self.time_scale = float(time_scale)
 
         if gripper_idx is None:
             gripper_idx = []
@@ -177,62 +192,83 @@ class VectorField(nn.Module):
         self.register_buffer("gripper_idx", gripper_idx, persistent=False)
 
         loss_mask = torch.ones(dof, dtype=torch.float32)
-        self.register_buffer("loss_mask", loss_mask.view(1, 1, dof), persistent=False)
+        self.register_buffer(
+            "loss_mask",
+            loss_mask.view(1, 1, dof),
+            persistent=False,
+        )
 
-        # Time embedding for FiLM conditioning
+        # Shared time encoder:
+        # FM receives continuous t in [0, 1].
+        # DP receives normalized diffusion time (k + 1) / T_diff in (0, 1].
+        # Multiplying by time_scale gives the sinusoidal encoder a useful range.
         self.time_embed = nn.Sequential(
-            nn.Linear(1, 32), nn.ReLU(),
-            nn.Linear(32, 32)
+            SinusoidalPosEmb(time_embed_dim),
+            nn.Linear(time_embed_dim, time_embed_dim * 4),
+            nn.Mish(),
+            nn.Linear(time_embed_dim * 4, time_embed_dim),
         )
 
-        # additional encoding if needed
-        """
+        self.param_embed_dim = 64
         self.param_embed = nn.Sequential(
-            nn.Linear(param_len, 16), nn.ReLU(),
-            nn.Linear(16, 16)
+            nn.Linear(param_len, self.param_embed_dim),
+            nn.Mish(),
+            nn.Linear(self.param_embed_dim, self.param_embed_dim),
         )
-        """
 
-        # Condition dimension = param_len + time embedding dim
-        condition_dim = 32 + param_len
+        condition_dim = time_embed_dim + self.param_embed_dim
 
-        # 1D U-Net for sequence modeling
-        self.unet = UNet1D(dof=dof, condition_dim=condition_dim)
+        self.unet = UNet1D(
+            dof=dof,
+            condition_dim=condition_dim,
+        )
 
     def forward(self, x, t, env_params):
-        # x: (B, seq_len, dof), t: (B, 1), env_params: (B, param_len)
-        dev, dt = x.device, x.dtype
-        if torch.is_tensor(t):
-            t = t.to(dev)
-            if torch.is_floating_point(t):
-                t = t.to(dt)
-            else:
-                t = torch.as_tensor(t, device=dev, dtype=dt)
+        # x:          (B, seq_len, dof)
+        # t:          (B, 1), normalized to approximately [0, 1]
+        # env_params: (B, param_len)
 
-        if torch.is_tensor(env_params):
-            env_params = env_params.to(dev)
-            if torch.is_floating_point(env_params):
-                env_params = env_params.to(dt)
+        dev, dtype = x.device, x.dtype
+
+        if not torch.is_tensor(t):
+            t = torch.as_tensor(t, device=dev, dtype=dtype)
         else:
-            env_params = torch.as_tensor(env_params, device=dev, dtype=dt)
+            t = t.to(device=dev, dtype=dtype)
+
+        if not torch.is_tensor(env_params):
+            env_params = torch.as_tensor(
+                env_params,
+                device=dev,
+                dtype=dtype,
+            )
+        else:
+            env_params = env_params.to(device=dev, dtype=dtype)
 
         B, seq_len, dof = x.shape
         assert seq_len == self.seq_len and dof == self.dof, "Shape mismatch"
 
-        # Normalize environment parameters (optional preprocessing)
-        # env_params_norm = env_params * 100
+        # Ensure a batch-shaped scalar time.
+        if t.ndim == 0:
+            t = t.expand(B)
+        elif t.ndim == 2 and t.shape[-1] == 1:
+            t = t.squeeze(-1)
+        else:
+            t = t.reshape(B)
 
-        # Encode timestep
-        t_embed = self.time_embed(t)
-        # p_embed = self.param_embed(env_params_norm) # in cased of additional encoding
-        p_embed = env_params # without environment parameter encoding
+        # Shared encoding for FM and DP.
+        t_embed = self.time_embed(t * self.time_scale)
+        p_embed = self.param_embed(env_params)
 
-        # Create conditioning vector
-        condition = torch.cat([p_embed, t_embed], dim=-1)  # (B, cond_dim)
+        # Do not multiply raw environment parameters by 100 here.
+        # Use the same conditioning path for every method.
+        condition = torch.cat([p_embed, t_embed], dim=-1)
 
-        v = self.unet(x.permute(0, 2, 1).contiguous(), condition)
-        return v.permute(0, 2, 1).contiguous()
-
+        out = self.unet(
+            x.permute(0, 2, 1).contiguous(),
+            condition,
+        )
+        return out.permute(0, 2, 1).contiguous()
+    
 
 class VanillaFM:
     """State-conditioned Flow Matching trainer for fixed-horizon policies."""
