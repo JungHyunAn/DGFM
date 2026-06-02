@@ -505,7 +505,7 @@ def generate_data_parallel(
 
     # HDF5 init
     if hdf5_name is None:
-        hdf5_name = f"{task_name}_dataset_{n}.hdf5"
+        hdf5_name = f"{task_name}_{action_representation}_dataset_{n}.hdf5"
     h5_path = os.path.join(output_dir, hdf5_name)
     hf = init_hdf5(
         h5_path,
@@ -631,7 +631,7 @@ def generate_data_parallel(
             episodes_frames.append(frames)
             env_r.close()
 
-        grid_path = os.path.join(output_dir, f"{task_name}_grid_{n}.mp4")
+        grid_path = os.path.join(output_dir, f"{task_name}_{action_representation}_grid_{n}.mp4")
         write_grid_video(episodes_frames, grid_path, grid_shape=(5,5), fps=control_freq)
         if verbose:
             print(f"Saved grid video: {grid_path}")
