@@ -1,6 +1,6 @@
 {
   "FM_type": "DP",
-  "N": 60,
+  "N": 120,
   "task_name": "door",
   "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",
   "device": "cuda",

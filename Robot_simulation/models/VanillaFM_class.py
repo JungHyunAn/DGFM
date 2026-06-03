@@ -209,12 +209,15 @@ class VectorField(nn.Module):
             nn.Linear(time_embed_dim * 4, time_embed_dim),
         )
 
+        """
         self.param_embed_dim = 64
         self.param_embed = nn.Sequential(
             nn.Linear(param_len, self.param_embed_dim),
             nn.Mish(),
             nn.Linear(self.param_embed_dim, self.param_embed_dim),
         )
+        """
+        self.param_embed_dim = param_len
 
         condition_dim = time_embed_dim + self.param_embed_dim
 
@@ -257,7 +260,8 @@ class VectorField(nn.Module):
 
         # Shared encoding for FM and DP.
         t_embed = self.time_embed(t * self.time_scale)
-        p_embed = self.param_embed(env_params)
+        # p_embed = self.param_embed(env_params)
+        p_embed = env_params
 
         # Do not multiply raw environment parameters by 100 here.
         # Use the same conditioning path for every method.

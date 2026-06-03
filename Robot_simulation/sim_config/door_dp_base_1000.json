@@ -25,8 +25,8 @@
   "dp_T_diff": 100,
   "dp_schedule_type": "cosine",
   "dp_ddim_steps": null,
-  "dp_eta": 0.0,
-  "dp_pred_type": "x0",
+  "dp_eta": 1.0,
+  "dp_pred_type": "epsilon",
   "normalize_data": true,
   "eval_fresh": false
 }
