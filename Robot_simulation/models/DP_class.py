@@ -46,6 +46,8 @@ def run_diffusion(
     ddim_steps: int | None = None,   # if None: use all T_diff steps
     eta: float = 0.0,                # 0.0 = deterministic DDIM; >0 adds stochasticity
     pred_type: str = "x0",           # "x0" or "epsilon"
+    clip_sample: bool = True,
+    clip_sample_range: float = 3.0,
 ):
     """
     Diffusion sampler (DDIM by default).
@@ -94,6 +96,9 @@ def run_diffusion(
         else:  # epsilon
             eps = out
             x0  = (x - sqrt_omabar_k * eps) / (sqrt_abar_k + 1e-8)
+
+        if clip_sample:
+            x0 = torch.clamp(x0, -clip_sample_range, clip_sample_range)
 
         # if last step, return x0
         if j == len(ks) - 1:
