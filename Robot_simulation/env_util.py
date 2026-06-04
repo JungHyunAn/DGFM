@@ -715,18 +715,20 @@ def _render_rollout_grid(
     success_slots = min(render_num, total_slots)
     failure_slots = max(0, total_slots - success_slots)
 
-    def take_with_repeat(infos: list, count: int) -> list:
+    def take_without_repeat(infos: list, count: int) -> list:
         if count <= 0 or not infos:
             return []
-        return [infos[i % len(infos)] for i in range(count)]
+        return infos[:count]
 
-    success_grid = take_with_repeat(success_info, success_slots)
-    if len(success_grid) < success_slots:
-        success_grid += take_with_repeat(failure_info, success_slots - len(success_grid))
+    success_grid = take_without_repeat(success_info, success_slots)
+    remaining_success_slots = success_slots - len(success_grid)
+    failure_overflow = take_without_repeat(failure_info, remaining_success_slots)
+    success_grid += failure_overflow
 
-    failure_grid = take_with_repeat(failure_info, failure_slots)
-    if len(failure_grid) < failure_slots:
-        failure_grid += take_with_repeat(success_info, failure_slots - len(failure_grid))
+    used_failures = len(failure_overflow)
+    failure_grid = take_without_repeat(failure_info[used_failures:], failure_slots)
+    remaining_failure_slots = failure_slots - len(failure_grid)
+    success_grid += take_without_repeat(success_info[len(success_grid):], remaining_failure_slots)
 
     for info in success_grid + failure_grid:
         env_r = make_env(

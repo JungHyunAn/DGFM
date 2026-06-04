@@ -106,7 +106,7 @@ Behavioral notes & tips
 - Random subsampling and training are seeded for reproducibility of
   the episode subset; CUDA nondeterminism may still affect training dynamics.
 - Evaluation renders a subset of episodes into grids; tune `render_width` and
-  `render_num` inside `eval_model`. (by default 4*4 and successful trials occupy half)
+  `render_num` inside `eval_model`. (by default 4*4, seeded with up to 8 successes and then filled without duplicating failures)
 - The Asia/Seoul timestamp is used for folder naming for easier experiment
   bookkeeping.
 """
