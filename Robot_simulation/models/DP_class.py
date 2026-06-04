@@ -47,7 +47,7 @@ def run_diffusion(
     eta: float = 0.0,                # 0.0 = deterministic DDIM; >0 adds stochasticity
     pred_type: str = "x0",           # "x0" or "epsilon"
     clip_sample: bool = True,
-    clip_sample_range: float = 3.0,
+    clip_sample_range: float = 1.0,
 ):
     """
     Diffusion sampler (DDIM by default).
@@ -146,6 +146,8 @@ class DiffusionPolicy:
         ddim_steps: int | None = None,
         eta: float = 0.0,
         pred_type: str = "x0",
+        clip_sample: bool = True,
+        clip_sample_range: float = 1.0,
         normalization_stats: dict[str, np.ndarray] | None = None,
     ):
         self.model = model
@@ -162,6 +164,8 @@ class DiffusionPolicy:
         self.ddim_steps = ddim_steps
         self.eta = eta
         self.pred_type = pred_type
+        self.clip_sample = clip_sample
+        self.clip_sample_range = clip_sample_range
         self.normalization_stats = normalization_stats
 
     @torch.no_grad()
@@ -176,6 +180,8 @@ class DiffusionPolicy:
             ddim_steps=self.ddim_steps,
             eta=self.eta,
             pred_type=self.pred_type,
+            clip_sample=self.clip_sample,
+            clip_sample_range=self.clip_sample_range,
         )
 
     def train(
@@ -280,6 +286,8 @@ class DiffusionPolicy:
                         ddim_steps=self.ddim_steps,
                         eta=self.eta,
                         pred_type=self.pred_type,
+                        clip_sample=self.clip_sample,
+                        clip_sample_range=self.clip_sample_range,
                         normalization_stats=self.normalization_stats,
                         recorded_control_freq=recorded_control_freq,
                         trajectory_control_freq=trajectory_control_freq,

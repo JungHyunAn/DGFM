@@ -173,29 +173,33 @@ def _apply_config_defaults(parser: argparse.ArgumentParser, config: dict) -> Non
     parser.set_defaults(**config)
 
 
-def _fit_joint_normalization_stats(joint_data: np.ndarray, std_eps: float = 1e-8) -> dict[str, np.ndarray]:
+def _fit_joint_normalization_stats(joint_data: np.ndarray, range_eps: float = 1e-8) -> dict[str, np.ndarray]:
     joint_data = np.asarray(joint_data, dtype=np.float32)
     if joint_data.size == 0:
         raise ValueError("Cannot fit normalization stats without joint data")
     flat_q = joint_data.reshape(-1, joint_data.shape[-1])
-    mean = flat_q.mean(axis=0).astype(np.float32)
-    std = flat_q.std(axis=0).astype(np.float32)
-    std = np.where(std < std_eps, 1.0, std).astype(np.float32)
-    return {"mean": mean, "std": std}
+    q_min = flat_q.min(axis=0).astype(np.float32)
+    q_max = flat_q.max(axis=0).astype(np.float32)
+    q_range = (q_max - q_min).astype(np.float32)
+    q_range = np.where(q_range < range_eps, 1.0, q_range).astype(np.float32)
+    return {"min": q_min, "max": q_max, "range": q_range}
 
 
 def _apply_joint_normalization(joint_data: np.ndarray, stats: dict[str, np.ndarray]) -> np.ndarray:
-    mean = np.asarray(stats["mean"], dtype=np.float32)
-    std = np.asarray(stats["std"], dtype=np.float32)
-    return ((np.asarray(joint_data, dtype=np.float32) - mean) / std).astype(np.float32)
+    q = np.asarray(joint_data, dtype=np.float32)
+    q_min = np.asarray(stats["min"], dtype=np.float32)
+    q_range = np.asarray(stats["range"], dtype=np.float32)
+    q_norm = (2.0 / q_range) * (q - q_min) - 1.0
+    return np.clip(q_norm, -1.0, 1.0).astype(np.float32)
 
 
 def _normalization_stats_to_json(stats: dict[str, np.ndarray] | None) -> dict | None:
     if stats is None:
         return None
     return {
-        "joint_mean": np.asarray(stats["mean"], dtype=np.float32).tolist(),
-        "joint_std": np.asarray(stats["std"], dtype=np.float32).tolist(),
+        "joint_min": np.asarray(stats["min"], dtype=np.float32).tolist(),
+        "joint_max": np.asarray(stats["max"], dtype=np.float32).tolist(),
+        "joint_range": np.asarray(stats["range"], dtype=np.float32).tolist(),
     }
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
@@ -340,6 +344,8 @@ def train_and_eval_model(
     dp_ddim_steps: int | None = None,
     dp_eta: float = 0.0,
     dp_pred_type: str = "x0",
+    dp_clip_sample: bool = True,
+    dp_clip_sample_range: float = 1.0,
     normalize_data: bool = False,
     eval_fresh: bool = True,
     action_representation: str | None = None,
@@ -434,8 +440,8 @@ def train_and_eval_model(
         normalization_stats = _fit_joint_normalization_stats(window_traj) if normalize_data else None
         if normalize_data:
             print(
-                f"Data stats - mean : {normalization_stats['mean']}, "
-                f"stddev : {normalization_stats['std']}"
+                f"Data stats - min : {normalization_stats['min']}, "
+                f"max : {normalization_stats['max']}"
             )
             window_traj = _apply_joint_normalization(window_traj, normalization_stats)
         data_trajectories = torch.from_numpy(window_traj).float().to(device)
@@ -476,6 +482,7 @@ def train_and_eval_model(
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
+        f"dp_clip_sample={dp_clip_sample} | dp_clip_sample_range={dp_clip_sample_range} | "
         f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | "
         f"action_representation={action_representation} | "
         f"eval_fresh={eval_fresh} | seed={seed} | device={device}"
@@ -506,6 +513,8 @@ def train_and_eval_model(
                 ddim_steps=dp_ddim_steps,
                 eta=dp_eta,
                 pred_type=dp_pred_type,
+                clip_sample=dp_clip_sample,
+                clip_sample_range=dp_clip_sample_range,
                 normalization_stats=normalization_stats,
             )
         else:
@@ -716,6 +725,8 @@ def train_and_eval_model(
                 ddim_steps=dp_ddim_steps,
                 eta=dp_eta,
                 pred_type=dp_pred_type,
+                clip_sample=dp_clip_sample,
+                clip_sample_range=dp_clip_sample_range,
                 normalization_stats=normalization_stats,
                 sampler_type="diffusion",
                 action_representation=action_representation,
@@ -824,6 +835,8 @@ def train_and_eval_model(
             "dp_ddim_steps":   dp_ddim_steps if model_type == "DP" else None,
             "dp_eta":          dp_eta if model_type == "DP" else None,
             "dp_pred_type":    dp_pred_type if model_type == "DP" else None,
+            "dp_clip_sample":  dp_clip_sample if model_type == "DP" else None,
+            "dp_clip_sample_range": dp_clip_sample_range if model_type == "DP" else None,
             "n_t_global":      None,
             "n_t_local":       None,
             "maximum epoch":   max_epochs,
@@ -973,8 +986,10 @@ if __name__ == "__main__":
     parser.add_argument("--dp_ddim_steps", type=int, default=None)
     parser.add_argument("--dp_eta", type=float, default=0.0)
     parser.add_argument("--dp_pred_type", type=str, default="x0", choices=["x0", "epsilon"])
+    parser.add_argument("--dp_clip_sample", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dp_clip_sample_range", type=float, default=1.0)
     parser.add_argument("--normalize_data", action=argparse.BooleanOptionalAction, default=False,
-                        help="Normalize the selected demos per joint with fitted mean/std before training, and denormalize model outputs at inference.")
+                        help="Normalize the selected demos per joint to [-1, 1] from fitted min/max before training, and denormalize model outputs at inference.")
     parser.add_argument("--eval_fresh", action=argparse.BooleanOptionalAction, default=True,
                         help="When true, evaluate on newly generated environments after training. When false, report validation metrics and render best validation rollouts.")
     parser.add_argument("--action_representation", type=str, default=None,
@@ -1062,6 +1077,8 @@ if __name__ == "__main__":
         dp_ddim_steps      = args.dp_ddim_steps,
         dp_eta             = args.dp_eta,
         dp_pred_type       = args.dp_pred_type,
+        dp_clip_sample     = args.dp_clip_sample,
+        dp_clip_sample_range = args.dp_clip_sample_range,
         normalize_data     = args.normalize_data,
         eval_fresh         = args.eval_fresh,
         action_representation = args.action_representation,

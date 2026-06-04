@@ -27,6 +27,8 @@
   "dp_ddim_steps": null,
   "dp_eta": 1.0,
   "dp_pred_type": "epsilon",
+  "dp_clip_sample": true,
+  "dp_clip_sample_range": 1.0,
   "normalize_data": true,
   "eval_fresh": false
 }

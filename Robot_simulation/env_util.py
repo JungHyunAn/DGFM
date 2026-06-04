@@ -57,6 +57,10 @@ def get_trajectory_sample_step(
 
 def normalize_policy_data(q: np.ndarray, normalization_stats: dict[str, np.ndarray]) -> np.ndarray:
     q = np.asarray(q, dtype=np.float32)
+    if "min" in normalization_stats:
+        q_min = np.asarray(normalization_stats["min"], dtype=np.float32)
+        q_range = np.asarray(normalization_stats["range"], dtype=np.float32)
+        return np.clip((2.0 / q_range) * (q - q_min) - 1.0, -1.0, 1.0).astype(np.float32)
     mean = np.asarray(normalization_stats["mean"], dtype=np.float32)
     std = np.asarray(normalization_stats["std"], dtype=np.float32)
     return (q - mean) / std
@@ -64,6 +68,10 @@ def normalize_policy_data(q: np.ndarray, normalization_stats: dict[str, np.ndarr
 
 def denormalize_policy_data(q: np.ndarray, normalization_stats: dict[str, np.ndarray]) -> np.ndarray:
     q = np.asarray(q, dtype=np.float32)
+    if "min" in normalization_stats:
+        q_min = np.asarray(normalization_stats["min"], dtype=np.float32)
+        q_range = np.asarray(normalization_stats["range"], dtype=np.float32)
+        return ((q + 1.0) * 0.5 * q_range + q_min).astype(np.float32)
     mean = np.asarray(normalization_stats["mean"], dtype=np.float32)
     std = np.asarray(normalization_stats["std"], dtype=np.float32)
     return q * std + mean
@@ -456,6 +464,8 @@ def _run_diffusion_batched(
     ddim_steps: int | None = None,
     eta: float = 0.0,
     pred_type: str = "x0",
+    clip_sample: bool = True,
+    clip_sample_range: float = 1.0,
 ) -> np.ndarray:
     from Robot_simulation.models.DP_class import run_diffusion
 
@@ -482,6 +492,8 @@ def _run_diffusion_batched(
             ddim_steps=ddim_steps,
             eta=eta,
             pred_type=pred_type,
+            clip_sample=clip_sample,
+            clip_sample_range=clip_sample_range,
         )
         q_np = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
         out[s:e] = _clip_policy_gripper_dims(q_np, task_name)
@@ -510,6 +522,8 @@ def _run_policy_batched(
     ddim_steps: int | None,
     eta: float,
     pred_type: str,
+    clip_sample: bool,
+    clip_sample_range: float,
 ) -> np.ndarray:
     if sampler_type == "flow":
         return _run_flow_batched(
@@ -541,6 +555,8 @@ def _run_policy_batched(
             ddim_steps=ddim_steps,
             eta=eta,
             pred_type=pred_type,
+            clip_sample=clip_sample,
+            clip_sample_range=clip_sample_range,
         )
     raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
@@ -572,6 +588,8 @@ def _rollout_state_policy_synchronized(
     ddim_steps: int | None = None,
     eta: float = 0.0,
     pred_type: str = "x0",
+    clip_sample: bool = True,
+    clip_sample_range: float = 1.0,
 ) -> Tuple[float, float, list, list]:
     """Synchronize state-conditioned environments and batch inference in the parent."""
     if executed_horizon <= 0:
@@ -663,6 +681,8 @@ def _rollout_state_policy_synchronized(
                 ddim_steps=ddim_steps,
                 eta=eta,
                 pred_type=pred_type,
+                clip_sample=clip_sample,
+                clip_sample_range=clip_sample_range,
             )
             for local_i, idx in enumerate(ready):
                 conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})
@@ -770,6 +790,8 @@ def eval_model(
     ddim_steps: int | None = None,
     eta: float = 0.0,
     pred_type: str = "x0",
+    clip_sample: bool = True,
+    clip_sample_range: float = 1.0,
     return_rollouts: bool = False,
     action_representation: str = "joint_space",
 ) -> Tuple[float, float]:
@@ -813,6 +835,8 @@ def eval_model(
             ddim_steps=ddim_steps,
             eta=eta,
             pred_type=pred_type,
+            clip_sample=clip_sample,
+            clip_sample_range=clip_sample_range,
         )
         _render_rollout_grid(
             task_name,
@@ -885,6 +909,8 @@ def eval_model(
                 ddim_steps=ddim_steps,
                 eta=eta,
                 pred_type=pred_type,
+                clip_sample=clip_sample,
+                clip_sample_range=clip_sample_range,
             )
         else:
             raise ValueError(f"Unknown sampler_type: {sampler_type}")
