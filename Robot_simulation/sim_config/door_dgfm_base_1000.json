@@ -1,5 +1,6 @@
 {
   "FM_type": "DGFMv2",
+  "use_ema": false,
   "N": 40,
   "task_name": "door",
   "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/door",

@@ -11,6 +11,66 @@ from torch.distributions import Beta
 from tqdm import tqdm
 
 
+class EMAModel:
+    """Exponential moving average of model parameters."""
+
+    def __init__(
+        self,
+        model,
+        *,
+        update_after_step: int = 0,
+        inv_gamma: float = 1.0,
+        power: float = 2.0 / 3.0,
+        min_decay: float = 0.0,
+        max_decay: float = 0.9999,
+    ):
+        self.averaged_model = copy.deepcopy(model).eval()
+        self.averaged_model.requires_grad_(False)
+
+        self.update_after_step = int(update_after_step)
+        self.inv_gamma = float(inv_gamma)
+        self.power = float(power)
+        self.min_decay = float(min_decay)
+        self.max_decay = float(max_decay)
+
+        self.optimization_step = 0
+        self.decay = 0.0
+
+    def get_decay(self) -> float:
+        step = max(
+            0,
+            self.optimization_step - self.update_after_step - 1,
+        )
+
+        if step <= 0:
+            return 0.0
+
+        value = 1.0 - (
+            1.0 + step / self.inv_gamma
+        ) ** (-self.power)
+
+        return max(
+            self.min_decay,
+            min(value, self.max_decay),
+        )
+
+    @torch.no_grad()
+    def step(self, model):
+        self.decay = self.get_decay()
+
+        for ema_param, param in zip(
+            self.averaged_model.parameters(),
+            model.parameters(),
+        ):
+            ema_param.mul_(self.decay)
+            ema_param.add_(
+                param.detach(),
+                alpha=1.0 - self.decay,
+            )
+
+        self.optimization_step += 1
+
+
 class FiLM(nn.Module):
     """Feature-wise Linear Modulation (FiLM) for 1D feature maps.
 
@@ -291,6 +351,7 @@ class VanillaFM:
         beta_b: float = 1.0,
         device: str = "cuda",
         normalization_stats: dict[str, np.ndarray] | None = None,
+        use_ema: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -305,6 +366,22 @@ class VanillaFM:
         self.beta_b = beta_b
         self.device = device
         self.normalization_stats = normalization_stats
+        self.use_ema = bool(use_ema)
+        self.ema = None
+
+    def _init_ema(self):
+        if self.use_ema and self.ema is None:
+            self.ema = EMAModel(self.model)
+
+    def _step_ema(self):
+        if self.ema is not None:
+            self.ema.step(self.model)
+
+    def _eval_model(self):
+        return self.ema.averaged_model if self.ema is not None else self.model
+
+    def _copy_eval_model(self):
+        return copy.deepcopy(self._eval_model()).eval()
 
     def sample_t(self, n: int) -> torch.Tensor:
         if self.time_sampling == "shifted":
@@ -362,6 +439,7 @@ class VanillaFM:
 
         try:
             self.model = self.model.to(self.device)
+            self._init_ema()
             target_trajectories = target_trajectories.to(self.device)
             conditions = conditions.to(self.device)
             for epoch in tqdm(range(1, max_epochs + 1), desc=f"{self.time_sampling.title()}FM Training", unit="epoch"):
@@ -391,14 +469,17 @@ class VanillaFM:
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
+                    self._step_ema()
                     loss_sum += float(loss.item())
 
                 if self.scheduler is not None:
                     self.scheduler.step()
 
                 if do_validation and epoch % val_period == 0:
+                    eval_model_obj = self._eval_model()
+                    eval_model_obj.eval()
                     success_rate, avg_reward, validation_rollouts = eval_model(
-                        self.model,
+                        eval_model_obj,
                         VectorField,
                         self.task_name,
                         self.horizon,
@@ -429,7 +510,7 @@ class VanillaFM:
                     elif best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
                         best_avg_reward = avg_reward
                         best_success_rate = success_rate
-                        best_model = copy.deepcopy(self.model)
+                        best_model = self._copy_eval_model()
                         best_validation_rollouts = validation_rollouts
                         self.best_validation_rollouts = best_validation_rollouts
                         stop_count = 0
@@ -440,7 +521,7 @@ class VanillaFM:
             tqdm.write("Training interrupted by user. Returning best model so far...")
 
         if not records:
-            best_model = copy.deepcopy(self.model)
+            best_model = self._copy_eval_model()
         return best_model, self.model, records
 
 

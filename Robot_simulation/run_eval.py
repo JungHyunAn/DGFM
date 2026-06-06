@@ -347,6 +347,7 @@ def train_and_eval_model(
     dp_clip_sample: bool = True,
     dp_clip_sample_range: float = 1.0,
     normalize_data: bool = False,
+    use_ema: bool = False,
     eval_fresh: bool = True,
     action_representation: str | None = None,
 ):
@@ -484,7 +485,7 @@ def train_and_eval_model(
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
         f"dp_clip_sample={dp_clip_sample} | dp_clip_sample_range={dp_clip_sample_range} | "
         f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | "
-        f"action_representation={action_representation} | "
+        f"use_ema={use_ema} | action_representation={action_representation} | "
         f"eval_fresh={eval_fresh} | seed={seed} | device={device}"
     )
     model = None
@@ -516,6 +517,7 @@ def train_and_eval_model(
                 clip_sample=dp_clip_sample,
                 clip_sample_range=dp_clip_sample_range,
                 normalization_stats=normalization_stats,
+                use_ema=use_ema,
             )
         else:
             flow = fm_class_map[model_type](
@@ -532,6 +534,7 @@ def train_and_eval_model(
                 beta_b=beta_b,
                 device=device,
                 normalization_stats=normalization_stats,
+                use_ema=use_ema,
             )
     elif model_type in ("MPPCA", "MPPCAv2"):
         mppca_cls = MPPCAv2 if model_type == "MPPCAv2" else MPPCA
@@ -799,6 +802,7 @@ def train_and_eval_model(
             "trajectory_control_freq": trajectory_control_freq,
             "trajectory_sample_step": sample_step,
             "normalize_data": normalize_data,
+            "use_ema": use_ema,
             "action_representation": action_representation,
             "eval_fresh": eval_fresh,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
@@ -990,6 +994,8 @@ if __name__ == "__main__":
     parser.add_argument("--dp_clip_sample_range", type=float, default=1.0)
     parser.add_argument("--normalize_data", action=argparse.BooleanOptionalAction, default=False,
                         help="Normalize the selected demos per joint to [-1, 1] from fitted min/max before training, and denormalize model outputs at inference.")
+    parser.add_argument("--use_ema", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use an exponential moving average of model weights for validation, final evaluation, and checkpoint saving.")
     parser.add_argument("--eval_fresh", action=argparse.BooleanOptionalAction, default=True,
                         help="When true, evaluate on newly generated environments after training. When false, report validation metrics and render best validation rollouts.")
     parser.add_argument("--action_representation", type=str, default=None,
@@ -1080,6 +1086,7 @@ if __name__ == "__main__":
         dp_clip_sample     = args.dp_clip_sample,
         dp_clip_sample_range = args.dp_clip_sample_range,
         normalize_data     = args.normalize_data,
+        use_ema            = args.use_ema,
         eval_fresh         = args.eval_fresh,
         action_representation = args.action_representation,
     )

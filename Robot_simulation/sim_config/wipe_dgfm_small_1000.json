@@ -1,5 +1,6 @@
 {
   "FM_type": "DGFMv2",
+  "use_ema": false,
   "N": 20,
   "task_name": "wipe",
   "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/wipe",

@@ -960,6 +960,7 @@ class DGFM(VanillaFM):
 
         try:
             self.model = self.model.to(self.device)
+            self._init_ema()
             target_trajectories = target_trajectories.to(self.device)
             conditions = conditions.to(self.device)
 
@@ -999,6 +1000,7 @@ class DGFM(VanillaFM):
                         self.optimizer.zero_grad()
                         loss.backward()
                         self.optimizer.step()
+                        self._step_ema()
 
                         loss_sum += float(loss.item())
                         batch_count += 1
@@ -1008,9 +1010,10 @@ class DGFM(VanillaFM):
 
                 avg_loss = loss_sum / max(1, batch_count)
                 if do_validation and epoch % val_period == 0:
-                    self.model.eval()
+                    eval_model_obj = self._eval_model()
+                    eval_model_obj.eval()
                     success_rate, avg_reward, validation_rollouts = eval_model(
-                        self.model, VectorField, self.task_name, self.horizon, self.dof,
+                        eval_model_obj, VectorField, self.task_name, self.horizon, self.dof,
                         self.condition_dim, self.gripper_idx, val_params,
                         env_settings_all, self.device, trials=val_trials,
                         base_seed=eval_base_seed,
@@ -1044,7 +1047,7 @@ class DGFM(VanillaFM):
                         if best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
                             best_avg_reward = avg_reward
                             best_success_rate = success_rate
-                            best_model = copy.deepcopy(self.model)
+                            best_model = self._copy_eval_model()
                             best_validation_rollouts = validation_rollouts
                             self.best_validation_rollouts = best_validation_rollouts
                             stop_count = 0
@@ -1058,6 +1061,6 @@ class DGFM(VanillaFM):
             tqdm.write("Training interrupted by user. Returning best model so far...")
 
         if not success_rate_recs:
-            best_model = copy.deepcopy(self.model)
+            best_model = self._copy_eval_model()
         return best_model, self.model, success_rate_recs, mixture_sampler
 

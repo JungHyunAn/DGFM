@@ -5,6 +5,7 @@ import torch
 from tqdm import tqdm
 
 from Robot_simulation.env_util import _generate_val_env, eval_model
+from Robot_simulation.models.VanillaFM_class import EMAModel
 
 
 def cosine_beta_schedule(T: int, s: float = 0.008, max_beta: float = 0.999):
@@ -149,6 +150,7 @@ class DiffusionPolicy:
         clip_sample: bool = True,
         clip_sample_range: float = 1.0,
         normalization_stats: dict[str, np.ndarray] | None = None,
+        use_ema: bool = False,
     ):
         self.model = model
         self.optimizer = optimizer
@@ -167,6 +169,22 @@ class DiffusionPolicy:
         self.clip_sample = clip_sample
         self.clip_sample_range = clip_sample_range
         self.normalization_stats = normalization_stats
+        self.use_ema = bool(use_ema)
+        self.ema = None
+
+    def _init_ema(self):
+        if self.use_ema and self.ema is None:
+            self.ema = EMAModel(self.model)
+
+    def _step_ema(self):
+        if self.ema is not None:
+            self.ema.step(self.model)
+
+    def _eval_model(self):
+        return self.ema.averaged_model if self.ema is not None else self.model
+
+    def _copy_eval_model(self):
+        return copy.deepcopy(self._eval_model()).eval()
 
     @torch.no_grad()
     def run_diffusion(self, x, c):
@@ -219,6 +237,7 @@ class DiffusionPolicy:
 
         try:
             self.model = self.model.to(self.device)
+            self._init_ema()
             target_trajectories = target_trajectories.to(self.device)
             conditions = conditions.to(self.device)
             sched = DiffusionSchedule(
@@ -257,6 +276,7 @@ class DiffusionPolicy:
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
+                    self._step_ema()
                     loss_sum += float(loss.item())
                     batch_count += 1
 
@@ -265,9 +285,10 @@ class DiffusionPolicy:
 
                 avg_loss = loss_sum / max(1, batch_count)
                 if do_validation and epoch % val_period == 0:
-                    self.model.eval()
+                    eval_model_obj = self._eval_model()
+                    eval_model_obj.eval()
                     success_rate, avg_reward, validation_rollouts = eval_model(
-                        model=self.model,
+                        model=eval_model_obj,
                         model_class=None,
                         task_name=self.task_name,
                         seq_len=self.horizon,
@@ -307,7 +328,7 @@ class DiffusionPolicy:
                     elif best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
                         best_avg_reward = avg_reward
                         best_success_rate = success_rate
-                        best_model = copy.deepcopy(self.model)
+                        best_model = self._copy_eval_model()
                         best_validation_rollouts = validation_rollouts
                         self.best_validation_rollouts = best_validation_rollouts
                         stop_count = 0
@@ -318,7 +339,7 @@ class DiffusionPolicy:
             tqdm.write("Training interrupted by user. Returning best model so far...")
 
         if not records:
-            best_model = copy.deepcopy(self.model)
+            best_model = self._copy_eval_model()
         return best_model, self.model, records
 
 
@@ -351,6 +372,7 @@ def train_DP(
     schedule_type: str = "cosine",
     ddim_steps: int | None = None,
     eta: float = 0.0,
+    use_ema: bool = False,
 ):
     policy = DiffusionPolicy(
         model=model,
@@ -367,6 +389,7 @@ def train_DP(
         ddim_steps=ddim_steps,
         eta=eta,
         pred_type=pred_type,
+        use_ema=use_ema,
     )
     return policy.train(
         target_trajectories=target_trajectories,

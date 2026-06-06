@@ -1,8 +1,9 @@
 {
   "FM_type": "DGFMv2",
+  "use_ema": false,
   "N": 40,
   "task_name": "nut",
-  "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/nut",
+  "results_path": "Robot_simulation/eval_results/nut",
   "device": "cuda",
   "n_t": 1,
   "cluster_partition": 10,
