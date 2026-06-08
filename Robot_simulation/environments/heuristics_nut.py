@@ -198,9 +198,9 @@ def generate_nut_trajectory(
                  frames=frames,
                  camera_name="frontview")
     
-     # ---------- PHASE5: 10-step opening gripper ----------
+     # ---------- PHASE5: 30-step opening gripper ----------
     gripper_pose = 1.0
-    for _ in range(10):
+    for _ in range(30):
         a = np.zeros(adim); a[6] = -1.0
         obs, _, _, _ = env.step(a)
         record_q()

@@ -262,12 +262,20 @@ class VectorField(nn.Module):
         # FM receives continuous t in [0, 1].
         # DP receives normalized diffusion time (k + 1) / T_diff in (0, 1].
         # Multiplying by time_scale gives the sinusoidal encoder a useful range.
+                
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(time_embed_dim),
             nn.Linear(time_embed_dim, time_embed_dim * 4),
             nn.Mish(),
             nn.Linear(time_embed_dim * 4, time_embed_dim),
         )
+        """
+        self.time_embed = nn.Sequential(
+            nn.Linear(1, time_embed_dim),
+            nn.Mish(),
+            nn.Linear(time_embed_dim, time_embed_dim)
+        )
+        """
 
         self.param_embed_dim = 32
         self.param_embed = nn.Sequential(
@@ -275,8 +283,10 @@ class VectorField(nn.Module):
             nn.Mish(),
             nn.Linear(self.param_embed_dim, self.param_embed_dim),
         )
-        # self.param_embed_dim = param_len
-
+        """
+        self.param_embed_dim = param_len
+        """
+        
         condition_dim = time_embed_dim + self.param_embed_dim
 
         self.unet = UNet1D(
@@ -318,6 +328,7 @@ class VectorField(nn.Module):
 
         # Shared encoding for FM and DP.
         t_embed = self.time_embed(t * self.time_scale)
+        # t_embed = self.time_embed(t.unsqueeze(-1))
         p_embed = self.param_embed(env_params)
         # p_embed = env_params
 
