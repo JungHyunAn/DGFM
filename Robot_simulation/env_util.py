@@ -381,6 +381,9 @@ def _make_flow_runner(
 ):
     from Robot_simulation.models.VanillaFM_class import VanillaFM
 
+    if hasattr(model, "run_flow"):
+        return model
+
     return VanillaFM(
         model,
         optimizer=None,

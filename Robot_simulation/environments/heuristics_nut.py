@@ -22,7 +22,7 @@ def generate_nut_trajectory(
       • PHASE2: 10‑step grasping handle
       • PHASE3: 50‑step approach to peg end
       • PHASE4: 50-step descend onto peg
-      • PHASE5: 10-step opening gripper
+      • PHASE5: 30-step opening gripper
 
     Args:
         env: robosuite NutAssembly environment (already constructed).

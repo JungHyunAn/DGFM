@@ -150,6 +150,7 @@ from Robot_simulation.env_util import (
 from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
 from Robot_simulation.models.DP_class import DiffusionPolicy
+from Robot_simulation.models.LatentFM_class import LatentFM, LatentFlowPolicy, TrajectoryAutoencoder
 from Robot_simulation.models.MPPCA_class import MPPCA
 from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs, validate_action_representation
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
@@ -349,6 +350,8 @@ def train_and_eval_model(
     normalize_data: bool = False,
     use_ema: bool = False,
     eval_fresh: bool = True,
+    latent_compression_rate: float = 0.25,
+    latent_ae_epochs: int | None = None,
     action_representation: str | None = None,
 ):
     fm_class_map = {
@@ -356,6 +359,7 @@ def train_and_eval_model(
         "ShiftedFM": ShiftedFM,
         "DGFM": DGFM,
         "DGFMv2": DGFMv2,
+        "LatentFM": LatentFM,
     }
     supported_model_types = sorted([*fm_class_map, "DP", "MPPCA", "MPPCAv2"])
     if model_type not in supported_model_types:
@@ -490,7 +494,45 @@ def train_and_eval_model(
     )
     model = None
     flow = None
-    if model_type in fm_class_map or model_type == "DP":
+    if model_type == "LatentFM":
+        full_dimension = seq_len * dof
+        latent_dim = max(1, int(round(latent_compression_rate * full_dimension)))
+        autoencoder = TrajectoryAutoencoder(seq_len, dof, latent_dim).to(device)
+        model = VectorField(1, latent_dim, param_len, gripper_idx=None).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer=optimizer,
+            warmup_epochs=warmup_steps,
+            total_epochs=max_epochs
+        )
+        ae_optimizer = optim.Adam(autoencoder.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        ae_scheduler = get_cosine_schedule_with_warmup(
+            optimizer=ae_optimizer,
+            warmup_epochs=warmup_steps,
+            total_epochs=latent_ae_epochs or max_epochs
+        )
+        flow = LatentFM(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            task_name=task_name,
+            horizon=seq_len,
+            dof=dof,
+            condition_dim=param_len,
+            gripper_idx=gripper_idx,
+            time_sampling=time_sampling,
+            beta_a=beta_a,
+            beta_b=beta_b,
+            device=device,
+            normalization_stats=normalization_stats,
+            use_ema=use_ema,
+            compression_rate=latent_compression_rate,
+            autoencoder=autoencoder,
+            ae_optimizer=ae_optimizer,
+            ae_scheduler=ae_scheduler,
+            ae_max_epochs=latent_ae_epochs,
+        )
+    elif model_type in fm_class_map or model_type == "DP":
         model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
@@ -642,8 +684,22 @@ def train_and_eval_model(
         training_thread_time_seconds = time.thread_time() - train_time_start
         print(f"Training thread time: {training_thread_time_seconds:.3f}s")
     else:
-        best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
         state = torch.load(model_path, map_location=device)
+        if model_type == "LatentFM":
+            latent_dim = max(1, int(round(latent_compression_rate * seq_len * dof)))
+            autoencoder = TrajectoryAutoencoder(seq_len, dof, latent_dim).to(device)
+            latent_model = VectorField(1, latent_dim, param_len, gripper_idx=None).to(device)
+            best_model = LatentFlowPolicy(
+                autoencoder,
+                latent_model,
+                horizon=seq_len,
+                dof=dof,
+                latent_dim=latent_dim,
+                condition_dim=param_len,
+                device=device,
+            ).to(device)
+        else:
+            best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
         best_model.load_state_dict(state)
         best_model.eval()
 
@@ -804,6 +860,9 @@ def train_and_eval_model(
             "normalize_data": normalize_data,
             "use_ema": use_ema,
             "action_representation": action_representation,
+            "latent_compression_rate": latent_compression_rate if model_type == "LatentFM" else None,
+            "latent_dim": max(1, int(round(latent_compression_rate * seq_len * dof))) if model_type == "LatentFM" else None,
+            "latent_ae_epochs": latent_ae_epochs if model_type == "LatentFM" else None,
             "eval_fresh": eval_fresh,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
@@ -935,9 +994,9 @@ if __name__ == "__main__":
     parser.add_argument("--config",         type=str,   default=None,
                         help="JSON config with all run options except dataset_path.")
     parser.add_argument("--model_type",     type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","DP","MPPCA","MPPCAv2"])
+                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","LatentFM","DP","MPPCA","MPPCAv2"])
     parser.add_argument("--FM_type",        type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","DP","MPPCA","MPPCAv2"],
+                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","LatentFM","DP","MPPCA","MPPCAv2"],
                         help=argparse.SUPPRESS)
     parser.add_argument("--N",              type=int,   default=None)
     parser.add_argument("--dataset_path",   type=str,   default=None)
@@ -998,6 +1057,10 @@ if __name__ == "__main__":
                         help="Use an exponential moving average of model weights for validation, final evaluation, and checkpoint saving.")
     parser.add_argument("--eval_fresh", action=argparse.BooleanOptionalAction, default=True,
                         help="When true, evaluate on newly generated environments after training. When false, report validation metrics and render best validation rollouts.")
+    parser.add_argument("--latent_compression_rate", type=float, default=0.25,
+                        help="LatentFM bottleneck fraction of the flattened trajectory dimension.")
+    parser.add_argument("--latent_ae_epochs", type=int, default=None,
+                        help="LatentFM autoencoder training epochs. Defaults to --max_epochs.")
     parser.add_argument("--action_representation", type=str, default=None,
                         choices=["joint_space", "task_space"],
                         help="Policy trajectory representation. Defaults to the dataset metadata, or joint_space for old datasets.")
@@ -1088,5 +1151,7 @@ if __name__ == "__main__":
         normalize_data     = args.normalize_data,
         use_ema            = args.use_ema,
         eval_fresh         = args.eval_fresh,
+        latent_compression_rate = args.latent_compression_rate,
+        latent_ae_epochs   = args.latent_ae_epochs,
         action_representation = args.action_representation,
     )
