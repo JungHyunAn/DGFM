@@ -27,6 +27,7 @@ def run_trained(
     seed: int = 42,
     recorded_control_freq: int | float = 20,
     trajectory_control_freq: int | float = 20,
+    observation_horizon: int = 1,
 ):
     """
     Load a trained flow model and render a single trajectory rollout to video.
@@ -135,6 +136,7 @@ def run_trained(
                                                 render_width=4,
                                                 render_num=8,
                                                 base_seed=seed,
+                                                observation_horizon=observation_horizon,
                                                 recorded_control_freq=recorded_control_freq,
                                                 trajectory_control_freq=trajectory_control_freq)
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")

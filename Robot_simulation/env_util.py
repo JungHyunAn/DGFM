@@ -121,12 +121,15 @@ def build_state_conditioned_windows(
     stride: int = 1,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
+    observation_horizon: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert full episodes into state-conditioned fixed-horizon windows."""
     if horizon <= 0:
         raise ValueError("horizon must be positive")
     if stride <= 0:
         raise ValueError("stride must be positive")
+    if observation_horizon <= 0:
+        raise ValueError("observation_horizon must be positive")
     sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
 
     xs, cs = [], []
@@ -144,7 +147,13 @@ def build_state_conditioned_windows(
         max_start = len(q) - (horizon - 1) * sample_step
         for start in range(0, max_start, stride):
             xs.append(q[start:start + horizon * sample_step:sample_step])
-            cs.append(np.concatenate([q[start], dyn[start], env_c], axis=0))
+            obs_parts = []
+            first_obs_idx = start - (observation_horizon - 1) * sample_step
+            for obs_i in range(observation_horizon):
+                obs_idx = max(0, first_obs_idx + obs_i * sample_step)
+                obs_parts.extend([q[obs_idx], dyn[obs_idx]])
+            obs_parts.append(env_c)
+            cs.append(np.concatenate(obs_parts, axis=0))
 
     if not xs:
         raise ValueError(f"No training windows produced; horizon={horizon} is longer than all trajectories.")
@@ -156,17 +165,34 @@ def make_policy_condition(
     current_q: np.ndarray,
     current_dynamic_state: np.ndarray | None,
     static_env_params: np.ndarray,
+    observation_horizon: int = 1,
+    q_history: list[np.ndarray] | None = None,
+    dynamic_history: list[np.ndarray] | None = None,
 ) -> np.ndarray:
+    if observation_horizon <= 0:
+        raise ValueError("observation_horizon must be positive")
     if current_dynamic_state is None:
         current_dynamic_state = np.zeros((0,), dtype=np.float32)
-    return np.concatenate(
-        [
-            np.asarray(current_q, dtype=np.float32).reshape(-1),
-            np.asarray(current_dynamic_state, dtype=np.float32).reshape(-1),
-            np.asarray(static_env_params, dtype=np.float32).reshape(-1),
-        ],
-        axis=0,
-    )
+    q_current = np.asarray(current_q, dtype=np.float32).reshape(-1)
+    dyn_current = np.asarray(current_dynamic_state, dtype=np.float32).reshape(-1)
+    q_values = [np.asarray(q, dtype=np.float32).reshape(-1) for q in (q_history or [])]
+    dyn_values = [np.asarray(d, dtype=np.float32).reshape(-1) for d in (dynamic_history or [])]
+    if not q_values:
+        q_values = [q_current]
+    if not dyn_values:
+        dyn_values = [dyn_current]
+    q_values = q_values[-observation_horizon:]
+    dyn_values = dyn_values[-observation_horizon:]
+    while len(q_values) < observation_horizon:
+        q_values.insert(0, q_values[0])
+    while len(dyn_values) < observation_horizon:
+        dyn_values.insert(0, dyn_values[0])
+
+    condition_parts = []
+    for q, dyn in zip(q_values, dyn_values):
+        condition_parts.extend([q, dyn])
+    condition_parts.append(np.asarray(static_env_params, dtype=np.float32).reshape(-1))
+    return np.concatenate(condition_parts, axis=0)
 
 
 def _condition_from_env(
@@ -176,11 +202,22 @@ def _condition_from_env(
     param_len: int,
     normalization_stats: dict[str, np.ndarray] | None = None,
     action_representation: str = "joint_space",
+    observation_horizon: int = 1,
+    q_history: list[np.ndarray] | None = None,
+    dynamic_history: list[np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     q0 = _current_robot_q(env, task_name, action_representation)
     dyn = get_dynamic_state(env, task_name)
     static_flat = np.asarray(static_c, dtype=np.float32).reshape(-1)
-    dyn_dim = param_len - q0.shape[0] - static_flat.shape[0]
+    obs_param_len = param_len - static_flat.shape[0]
+    if obs_param_len < 0:
+        raise ValueError(f"Model param_len {param_len} is shorter than static condition length")
+    if obs_param_len % observation_horizon != 0:
+        raise ValueError(
+            f"Observation condition length {obs_param_len} is not divisible by "
+            f"observation_horizon={observation_horizon}"
+        )
+    dyn_dim = obs_param_len // observation_horizon - q0.shape[0]
     if dyn_dim < 0:
         raise ValueError(f"Model param_len {param_len} is shorter than q + static condition length")
     if dyn_dim == 0:
@@ -191,7 +228,24 @@ def _condition_from_env(
             dyn = np.pad(dyn, (0, dyn_dim - dyn.shape[0]))
         elif dyn.shape[0] > dyn_dim:
             dyn = dyn[:dyn_dim]
-    cond = make_policy_condition(q0, dyn, static_flat)
+    if dynamic_history is not None:
+        normalized_dynamic_history = []
+        for hist_dyn in dynamic_history:
+            hist_dyn = np.asarray(hist_dyn, dtype=np.float32).reshape(-1)
+            if hist_dyn.shape[0] < dyn_dim:
+                hist_dyn = np.pad(hist_dyn, (0, dyn_dim - hist_dyn.shape[0]))
+            elif hist_dyn.shape[0] > dyn_dim:
+                hist_dyn = hist_dyn[:dyn_dim]
+            normalized_dynamic_history.append(hist_dyn)
+        dynamic_history = normalized_dynamic_history
+    cond = make_policy_condition(
+        q0,
+        dyn,
+        static_flat,
+        observation_horizon=observation_horizon,
+        q_history=q_history,
+        dynamic_history=dynamic_history,
+    )
     if cond.shape[0] != param_len:
         raise ValueError(f"Condition length {cond.shape[0]} != model param_len {param_len}")
     return cond.astype(np.float32), q0
@@ -207,6 +261,7 @@ def _state_policy_env_worker(
     param_len: int,
     max_policy_steps: int,
     executed_horizon: int,
+    observation_horizon: int,
     recorded_control_freq: int | float | None,
     trajectory_control_freq: int | float | None,
     normalization_stats: dict[str, np.ndarray] | None = None,
@@ -223,7 +278,21 @@ def _state_policy_env_worker(
             action_representation=action_representation,
         )
         steps = 0
-        cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats, action_representation)
+        q0 = _current_robot_q(env, task_name, action_representation)
+        dyn0 = get_dynamic_state(env, task_name)
+        q_history = [q0]
+        dynamic_history = [dyn0]
+        cond, _ = _condition_from_env(
+            env,
+            task_name,
+            static_c,
+            param_len,
+            normalization_stats,
+            action_representation,
+            observation_horizon,
+            q_history,
+            dynamic_history,
+        )
         conn.send({"type": "cond", "idx": idx, "cond": cond})
 
         while True:
@@ -262,7 +331,21 @@ def _state_policy_env_worker(
                 })
                 break
 
-            cond, _ = _condition_from_env(env, task_name, static_c, param_len, normalization_stats, action_representation)
+            q_history.append(_current_robot_q(env, task_name, action_representation))
+            dynamic_history.append(get_dynamic_state(env, task_name))
+            q_history = q_history[-observation_horizon:]
+            dynamic_history = dynamic_history[-observation_horizon:]
+            cond, _ = _condition_from_env(
+                env,
+                task_name,
+                static_c,
+                param_len,
+                normalization_stats,
+                action_representation,
+                observation_horizon,
+                q_history,
+                dynamic_history,
+            )
             conn.send({"type": "cond", "idx": idx, "cond": cond})
     except Exception as exc:
         conn.send({"type": "error", "idx": idx, "error": repr(exc)})
@@ -579,6 +662,7 @@ def _rollout_state_policy_synchronized(
     base_seed: int,
     max_policy_steps: int,
     executed_horizon: int,
+    observation_horizon: int,
     flow_steps: int,
     gpu_chunk_size: int | None = None,
     recorded_control_freq: int | float | None = None,
@@ -599,6 +683,8 @@ def _rollout_state_policy_synchronized(
         raise ValueError(f"executed_horizon must be positive, got {executed_horizon}")
     if executed_horizon > seq_len:
         raise ValueError(f"executed_horizon={executed_horizon} exceeds planned seq_len={seq_len}")
+    if observation_horizon <= 0:
+        raise ValueError(f"observation_horizon must be positive, got {observation_horizon}")
 
     rng = np.random.RandomState(base_seed)
     total_success = 0
@@ -627,6 +713,7 @@ def _rollout_state_policy_synchronized(
                     param_len,
                     max_policy_steps,
                     executed_horizon,
+                    observation_horizon,
                     recorded_control_freq,
                     trajectory_control_freq,
                     normalization_stats,
@@ -784,6 +871,7 @@ def eval_model(
     base_mixture=False,
     max_policy_steps: int = 20,
     executed_horizon: int | None = None,
+    observation_horizon: int = 1,
     flow_steps: int = 100,
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
@@ -829,6 +917,7 @@ def eval_model(
             base_seed=base_seed,
             max_policy_steps=max_policy_steps,
             executed_horizon=executed_horizon,
+            observation_horizon=observation_horizon,
             flow_steps=flow_steps,
             gpu_chunk_size=gpu_chunk_size,
             recorded_control_freq=recorded_control_freq,

@@ -23,6 +23,7 @@
   "recorded_control_freq": 20,
   "trajectory_control_freq": 10,
   "max_policy_steps": 40,
+  "observation_horizon": 2,
   "early_stopping": false,
   "seed": 1000,
   "time_sampling": "uniform",

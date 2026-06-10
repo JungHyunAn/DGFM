@@ -27,6 +27,7 @@
   "recorded_control_freq": 20,
   "trajectory_control_freq": 10,
   "max_policy_steps": 40,
+  "observation_horizon": 2,
   "seed": 1000,
   "normalize_data": true,
   "max_epochs": 3000,

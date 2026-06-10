@@ -150,7 +150,7 @@ from Robot_simulation.env_util import (
 from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
 from Robot_simulation.models.DP_class import DiffusionPolicy
-from Robot_simulation.models.LatentFM_class import LatentFM, LatentFlowPolicy, TrajectoryAutoencoder
+from Robot_simulation.models.LatentFM_class import LatentFM, LatentFlowPolicy, LatentVectorField, TrajectoryAutoencoder
 from Robot_simulation.models.MPPCA_class import MPPCA
 from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs, validate_action_representation
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
@@ -323,6 +323,7 @@ def train_and_eval_model(
     recorded_control_freq: int | float = 20,
     trajectory_control_freq: int | float = 20,
     max_policy_steps: int = 20,
+    observation_horizon: int = 2,
     cluster_partition: int = 5,
     cluster_jaccard_thresh: float = 0.8,
     cluster_merge_k: int = 10,
@@ -352,6 +353,10 @@ def train_and_eval_model(
     eval_fresh: bool = True,
     latent_compression_rate: float = 0.25,
     latent_ae_epochs: int | None = None,
+    latent_dim: int | None = None,
+    latent_ae_latent_reg_weight: float = 1e-4,
+    latent_ae_smoothness_weight: float = 1e-3,
+    latent_hidden_dim: int = 256,
     action_representation: str | None = None,
 ):
     fm_class_map = {
@@ -441,6 +446,7 @@ def train_and_eval_model(
             stride=window_stride,
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
+            observation_horizon=observation_horizon,
         )
         normalization_stats = _fit_joint_normalization_stats(window_traj) if normalize_data else None
         if normalize_data:
@@ -472,6 +478,11 @@ def train_and_eval_model(
     elif task_name == "two_arm":
         gripper_idx = [7, 15]
 
+    latent_dim_value = None
+    if model_type == "LatentFM":
+        latent_dim_value = latent_dim if latent_dim is not None else int(round(latent_compression_rate * seq_len * dof))
+        latent_dim_value = max(1, int(latent_dim_value))
+
     # define models
     print(
         "[config] "
@@ -480,7 +491,8 @@ def train_and_eval_model(
         f"horizon_arg={horizon} | executed_horizon={executed_horizon} | window_stride={window_stride} | "
         f"recorded_control_freq={recorded_control_freq} | "
         f"trajectory_control_freq={trajectory_control_freq} | sample_step={sample_step} | "
-        f"max_policy_steps={max_policy_steps} | cluster_partition={cluster_partition} | "
+        f"max_policy_steps={max_policy_steps} | observation_horizon={observation_horizon} | "
+        f"cluster_partition={cluster_partition} | "
         f"learning_rate={learning_rate} | weight_decay={weight_decay} | "
         f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
@@ -490,15 +502,15 @@ def train_and_eval_model(
         f"dp_clip_sample={dp_clip_sample} | dp_clip_sample_range={dp_clip_sample_range} | "
         f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | "
         f"use_ema={use_ema} | action_representation={action_representation} | "
+        f"latent_dim={latent_dim_value} | latent_hidden_dim={latent_hidden_dim} | "
         f"eval_fresh={eval_fresh} | seed={seed} | device={device}"
     )
     model = None
     flow = None
     if model_type == "LatentFM":
-        full_dimension = seq_len * dof
-        latent_dim = max(1, int(round(latent_compression_rate * full_dimension)))
-        autoencoder = TrajectoryAutoencoder(seq_len, dof, latent_dim).to(device)
-        model = VectorField(1, latent_dim, param_len, gripper_idx=None).to(device)
+        resolved_latent_dim = latent_dim_value
+        autoencoder = TrajectoryAutoencoder(seq_len, dof, resolved_latent_dim, hidden_dim=latent_hidden_dim).to(device)
+        model = LatentVectorField(resolved_latent_dim, param_len, hidden_dim=latent_hidden_dim).to(device)
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -528,9 +540,12 @@ def train_and_eval_model(
             use_ema=use_ema,
             compression_rate=latent_compression_rate,
             autoencoder=autoencoder,
+            latent_dim=resolved_latent_dim,
             ae_optimizer=ae_optimizer,
             ae_scheduler=ae_scheduler,
             ae_max_epochs=latent_ae_epochs,
+            ae_latent_reg_weight=latent_ae_latent_reg_weight,
+            ae_smoothness_weight=latent_ae_smoothness_weight,
         )
     elif model_type in fm_class_map or model_type == "DP":
         model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
@@ -645,6 +660,7 @@ def train_and_eval_model(
             train_kwargs.update(
                 max_policy_steps=max_policy_steps,
                 executed_horizon=executed_horizon,
+                observation_horizon=observation_horizon,
                 eval_base_seed=seed + 1,
             )
 
@@ -677,6 +693,7 @@ def train_and_eval_model(
                 val_trials=val_trials,
                 max_policy_steps=max_policy_steps,
                 executed_horizon=executed_horizon,
+                observation_horizon=observation_horizon,
                 eval_base_seed=seed + 1,
                 recorded_control_freq=recorded_control_freq,
                 trajectory_control_freq=trajectory_control_freq,
@@ -686,15 +703,15 @@ def train_and_eval_model(
     else:
         state = torch.load(model_path, map_location=device)
         if model_type == "LatentFM":
-            latent_dim = max(1, int(round(latent_compression_rate * seq_len * dof)))
-            autoencoder = TrajectoryAutoencoder(seq_len, dof, latent_dim).to(device)
-            latent_model = VectorField(1, latent_dim, param_len, gripper_idx=None).to(device)
+            resolved_latent_dim = latent_dim_value
+            autoencoder = TrajectoryAutoencoder(seq_len, dof, resolved_latent_dim, hidden_dim=latent_hidden_dim).to(device)
+            latent_model = LatentVectorField(resolved_latent_dim, param_len, hidden_dim=latent_hidden_dim).to(device)
             best_model = LatentFlowPolicy(
                 autoencoder,
                 latent_model,
                 horizon=seq_len,
                 dof=dof,
-                latent_dim=latent_dim,
+                latent_dim=resolved_latent_dim,
                 condition_dim=param_len,
                 device=device,
             ).to(device)
@@ -777,6 +794,7 @@ def train_and_eval_model(
                 base_seed=seed+2,
                 max_policy_steps=max_policy_steps,
                 executed_horizon=executed_horizon,
+                observation_horizon=observation_horizon,
                 recorded_control_freq=recorded_control_freq,
                 trajectory_control_freq=trajectory_control_freq,
                 T_diff=dp_T_diff,
@@ -811,6 +829,7 @@ def train_and_eval_model(
                                                         base_mixture=False,
                                                         max_policy_steps=max_policy_steps,
                                                         executed_horizon=executed_horizon,
+                                                        observation_horizon=observation_horizon,
                                                         recorded_control_freq=recorded_control_freq,
                                                         trajectory_control_freq=trajectory_control_freq,
                                                         normalization_stats=normalization_stats,
@@ -861,11 +880,15 @@ def train_and_eval_model(
             "use_ema": use_ema,
             "action_representation": action_representation,
             "latent_compression_rate": latent_compression_rate if model_type == "LatentFM" else None,
-            "latent_dim": max(1, int(round(latent_compression_rate * seq_len * dof))) if model_type == "LatentFM" else None,
+            "latent_dim": latent_dim_value if model_type == "LatentFM" else None,
             "latent_ae_epochs": latent_ae_epochs if model_type == "LatentFM" else None,
+            "latent_ae_latent_reg_weight": latent_ae_latent_reg_weight if model_type == "LatentFM" else None,
+            "latent_ae_smoothness_weight": latent_ae_smoothness_weight if model_type == "LatentFM" else None,
+            "latent_hidden_dim": latent_hidden_dim if model_type == "LatentFM" else None,
             "eval_fresh": eval_fresh,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
+            "observation_horizon": observation_horizon,
             "task_name":       task_name,
             "n_t":             n_t,
             "time_sampling":   time_sampling,
@@ -1027,6 +1050,7 @@ if __name__ == "__main__":
     parser.add_argument("--recorded_control_freq", type=float, default=20)
     parser.add_argument("--trajectory_control_freq", type=float, default=20)
     parser.add_argument("--max_policy_steps", type=int, default=20)
+    parser.add_argument("--observation_horizon", type=int, default=2)
     parser.add_argument("--cluster_partition", type=int, default=5)
     parser.add_argument("--cluster_jaccard_thresh", type=float, default=0.8)
     parser.add_argument("--cluster_merge_k", type=int, default=10)
@@ -1061,6 +1085,14 @@ if __name__ == "__main__":
                         help="LatentFM bottleneck fraction of the flattened trajectory dimension.")
     parser.add_argument("--latent_ae_epochs", type=int, default=None,
                         help="LatentFM autoencoder training epochs. Defaults to --max_epochs.")
+    parser.add_argument("--latent_dim", type=int, default=None,
+                        help="Explicit LatentFM bottleneck dimension. Defaults to latent_compression_rate * horizon * dof.")
+    parser.add_argument("--latent_ae_latent_reg_weight", type=float, default=1e-4,
+                        help="LatentFM autoencoder latent L2 regularization weight.")
+    parser.add_argument("--latent_ae_smoothness_weight", type=float, default=1e-3,
+                        help="LatentFM autoencoder decoded-trajectory smoothness regularization weight.")
+    parser.add_argument("--latent_hidden_dim", type=int, default=256,
+                        help="Hidden dimension for LatentFM autoencoder and latent vector field MLPs.")
     parser.add_argument("--action_representation", type=str, default=None,
                         choices=["joint_space", "task_space"],
                         help="Policy trajectory representation. Defaults to the dataset metadata, or joint_space for old datasets.")
@@ -1124,6 +1156,7 @@ if __name__ == "__main__":
         recorded_control_freq = args.recorded_control_freq,
         trajectory_control_freq = args.trajectory_control_freq,
         max_policy_steps   = args.max_policy_steps,
+        observation_horizon = args.observation_horizon,
         cluster_partition  = args.cluster_partition,
         cluster_jaccard_thresh = args.cluster_jaccard_thresh,
         cluster_merge_k    = args.cluster_merge_k,
@@ -1153,5 +1186,9 @@ if __name__ == "__main__":
         eval_fresh         = args.eval_fresh,
         latent_compression_rate = args.latent_compression_rate,
         latent_ae_epochs   = args.latent_ae_epochs,
+        latent_dim         = args.latent_dim,
+        latent_ae_latent_reg_weight = args.latent_ae_latent_reg_weight,
+        latent_ae_smoothness_weight = args.latent_ae_smoothness_weight,
+        latent_hidden_dim  = args.latent_hidden_dim,
         action_representation = args.action_representation,
     )
