@@ -17,11 +17,11 @@ def generate_nut_trajectory(
     Heuristic trajectory generator for NutAssembly, return the **joint-angle trajectory**.
 
     Phases:
-      • PHASE1‑1: 100‑step approach to pre-grasp pose
+      • PHASE1‑1: 150‑step approach to pre-grasp pose
       • PHASE1‑2: 20‑step careful approach to nut handle
       • PHASE2: 10‑step grasping handle
-      • PHASE3: 50‑step approach to peg end
-      • PHASE4: 50-step descend onto peg
+      • PHASE3: 75‑step approach to peg end
+      • PHASE4: 75-step descend onto peg
       • PHASE5: 30-step opening gripper
 
     Args:
@@ -129,13 +129,13 @@ def generate_nut_trajectory(
         q_rot = np.concatenate([axis * np.sin(ang/2), [np.cos(ang/2)]]).astype(np.float32)
         quat0 = quat_multiply(q_rot, quat0)
 
-    # ---------- PHASE1‑1: 100‑step approach to pre-grasp pose ----------
+    # ---------- PHASE1‑1: 150‑step approach to pre-grasp pose ----------
     gripper_pose = 1.0
     pre_grasp = nut_pos + np.array([0.0, 0.0, 0.06], dtype=np.float32) # 6cm above the nut
     step_towards(env, eef_id, adim, record_q,
                  target_pos=pre_grasp,
                  target_quat=quat0,
-                 steps=100,
+                 steps=150,
                  gripper_val=-1,
                  render=render,
                  frames=frames,
@@ -164,7 +164,7 @@ def generate_nut_trajectory(
             img = env.sim.render(640, 480, camera_name="frontview")
             frames.append(np.flipud(img))
 
-    # ---------- PHASE3: 50-step approach to peg end ----------
+    # ---------- PHASE3: 75-step approach to peg end ----------
     gripper_pose = 0.0
     # Find closest alignment
     if angle > np.pi/2 and np.pi > angle:
@@ -179,20 +179,20 @@ def generate_nut_trajectory(
     step_towards(env, eef_id, adim, record_q,
                  target_pos=pre_insert,
                  target_quat=quat1,
-                 steps=50,
+                 steps=75,
                  gripper_val=1.0,
                  render=render,
                  frames=frames,
                  camera_name="frontview")
 
-    # ---------- PHASE4: 50-step descend onto peg ----------
+    # ---------- PHASE4: 75-step descend onto peg ----------
     gripper_pose = 0.0
     insert_height = pre_insert.copy()
     insert_height[2] -= 0.15
     step_towards(env, eef_id, adim, record_q,
                  target_pos=insert_height,
                  target_quat=quat1,
-                 steps=50,
+                 steps=75,
                  gripper_val=1.0,
                  render=render,
                  frames=frames,

@@ -119,17 +119,29 @@ class ConvBlock(nn.Module):
     Forward Returns:
     (B, C_out, T) tensor after convolution, normalization, activation, and FiLM.
     """
-    def __init__(self, in_channels, out_channels, condition_dim):
+    def __init__(self, in_channels, out_channels, condition_dim, num_convs_per_block: int = 1):
         super().__init__()
+        if num_convs_per_block not in (1, 2):
+            raise ValueError(f"num_convs_per_block must be 1 or 2, got {num_convs_per_block}")
+        self.num_convs_per_block = int(num_convs_per_block)
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm = nn.GroupNorm(8, out_channels)
         self.film = FiLM(out_channels, condition_dim)
+        if self.num_convs_per_block == 2:
+            self.conv2 = nn.Conv1d(out_channels, out_channels, kernel_size=3, padding=1)
+            self.norm2 = nn.GroupNorm(8, out_channels)
+            self.film2 = FiLM(out_channels, condition_dim)
 
     def forward(self, x, condition):
         x = self.conv(x)
         x = self.norm(x)
         x = F.relu(x)
         x = self.film(x, condition)
+        if self.num_convs_per_block == 2:
+            x = self.conv2(x)
+            x = self.norm2(x)
+            x = F.relu(x)
+            x = self.film2(x, condition)
         return x
 
 
@@ -150,18 +162,19 @@ class UNet1D(nn.Module):
     Forward Returns:
     (B, dof, T) tensor of predicted velocities (of the vector field).
     """
-    def __init__(self, dof, condition_dim, channels=[160, 320, 640, 640]):
+    def __init__(self, dof, condition_dim, channels=[160, 320, 640, 640], num_convs_per_block: int = 1):
         super().__init__()
         self.channels = channels
+        self.num_convs_per_block = int(num_convs_per_block)
         # Encoder
         self.enc_blocks = nn.ModuleList()
         in_ch = dof
         for ch in channels:
-            self.enc_blocks.append(ConvBlock(in_ch, ch, condition_dim))
+            self.enc_blocks.append(ConvBlock(in_ch, ch, condition_dim, num_convs_per_block))
             in_ch = ch
 
         # Bottleneck
-        self.bottleneck = ConvBlock(channels[-1], channels[-1], condition_dim)
+        self.bottleneck = ConvBlock(channels[-1], channels[-1], condition_dim, num_convs_per_block)
 
         # Decoder
         self.dec_blocks = nn.ModuleList()
@@ -169,7 +182,7 @@ class UNet1D(nn.Module):
         for skip_ch in reversed(channels):
             in_ch = prev_ch + skip_ch
             out_ch = skip_ch
-            self.dec_blocks.append(ConvBlock(in_ch, out_ch, condition_dim))
+            self.dec_blocks.append(ConvBlock(in_ch, out_ch, condition_dim, num_convs_per_block))
             prev_ch = out_ch
 
         # Final layer
@@ -238,12 +251,14 @@ class VectorField(nn.Module):
         *,
         time_embed_dim: int = 32,
         time_scale: float = 100.0,
+        num_convs_per_block: int = 1,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.dof = dof
         self.param_len = param_len
         self.time_scale = float(time_scale)
+        self.num_convs_per_block = int(num_convs_per_block)
 
         if gripper_idx is None:
             gripper_idx = []
@@ -292,6 +307,7 @@ class VectorField(nn.Module):
         self.unet = UNet1D(
             dof=dof,
             condition_dim=condition_dim,
+            num_convs_per_block=self.num_convs_per_block,
         )
 
     def forward(self, x, t, env_params):

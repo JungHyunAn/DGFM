@@ -478,6 +478,9 @@ def train_and_eval_model(
     elif task_name == "two_arm":
         gripper_idx = [7, 15]
 
+    # num_convs_per_block = 2 if task_name == "nut" else 1
+    num_convs_per_block = 1 # fix as 1
+
     latent_dim_value = None
     if model_type == "LatentFM":
         latent_dim_value = latent_dim if latent_dim is not None else int(round(latent_compression_rate * seq_len * dof))
@@ -488,6 +491,7 @@ def train_and_eval_model(
         "[config] "
         f"model_type={model_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
+        f"num_convs_per_block={num_convs_per_block} | "
         f"horizon_arg={horizon} | executed_horizon={executed_horizon} | window_stride={window_stride} | "
         f"recorded_control_freq={recorded_control_freq} | "
         f"trajectory_control_freq={trajectory_control_freq} | sample_step={sample_step} | "
@@ -548,7 +552,7 @@ def train_and_eval_model(
             ae_smoothness_weight=latent_ae_smoothness_weight,
         )
     elif model_type in fm_class_map or model_type == "DP":
-        model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
+        model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx, num_convs_per_block=num_convs_per_block).to(device)
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -716,8 +720,17 @@ def train_and_eval_model(
                 device=device,
             ).to(device)
         else:
-            best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx).to(device)
-        best_model.load_state_dict(state)
+            best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx, num_convs_per_block=num_convs_per_block).to(device)
+        try:
+            best_model.load_state_dict(state)
+        except RuntimeError as exc:
+            if task_name == "nut" and num_convs_per_block == 2 and model_type != "LatentFM":
+                raise RuntimeError(
+                    "Failed to load nut checkpoint into the two-convolution-per-block VectorField. "
+                    "Nut checkpoints trained before this architecture-capacity ablation used one convolution "
+                    "per block and are architecture-incompatible; retrain nut or evaluate with matching code."
+                ) from exc
+            raise
         best_model.eval()
 
     def _summarize_validation_records(records: dict) -> tuple[float, float, int, float]:
@@ -890,6 +903,7 @@ def train_and_eval_model(
             "max_policy_steps": max_policy_steps,
             "observation_horizon": observation_horizon,
             "task_name":       task_name,
+            "num_convs_per_block": num_convs_per_block,
             "n_t":             n_t,
             "time_sampling":   time_sampling,
             "beta_a":          beta_a,
@@ -999,7 +1013,8 @@ def train_and_eval_model(
             "eval_fresh": eval_fresh,
             "normalize_data": normalize_data,
             "action_representation": action_representation,
-            "normalization_stats": _normalization_stats_to_json(normalization_stats)
+            "normalization_stats": _normalization_stats_to_json(normalization_stats),
+            "num_convs_per_block": num_convs_per_block,
         }
         with open(json_path, "w") as f:
             json.dump(output, f, indent=2)
