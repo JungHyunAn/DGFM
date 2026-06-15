@@ -434,8 +434,11 @@ def train_and_eval_model(
         raise ValueError("vision_finetune=True requires observation_type=vision")
     if vision_encoder_lr_scale <= 0:
         raise ValueError(f"vision_encoder_lr_scale must be positive, got {vision_encoder_lr_scale}")
-    if vision_finetune and model_type != "DGFMv2":
-        raise ValueError("vision_finetune is currently supported for DGFMv2 training only")
+    vision_finetune_models = ("UniformFM", "ShiftedFM", "DGFMv2", "DP")
+    if vision_finetune and model_type not in vision_finetune_models:
+        raise ValueError(
+            f"vision_finetune is supported for {vision_finetune_models}, got {model_type}"
+        )
     fm_class_map = {
         "UniformFM": UniformFM,
         "ShiftedFM": ShiftedFM,

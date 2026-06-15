@@ -257,6 +257,9 @@ class DiffusionPolicy:
                     idx = perm[i:min(i + batch_size, N)]
                     x0_clean = target_trajectories[idx]
                     cond = conditions[idx, :]
+                    vision_condition_fn = getattr(self, "vision_condition_fn", None)
+                    if vision_condition_fn is not None:
+                        cond = vision_condition_fn(idx, cond)
                     bsz = x0_clean.shape[0]
 
                     x0r = x0_clean.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)

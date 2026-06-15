@@ -488,6 +488,9 @@ class VanillaFM:
                     x0 = torch.randn(len(idx), self.horizon, self.dof, device=self.device)
                     t = self.sample_t(len(idx) * n_t)
                     cond = conditions[idx, :]
+                    vision_condition_fn = getattr(self, "vision_condition_fn", None)
+                    if vision_condition_fn is not None:
+                        cond = vision_condition_fn(idx, cond)
 
                     x1r = x1.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
                     x0r = x0.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
