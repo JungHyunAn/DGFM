@@ -71,6 +71,8 @@ class LatentVectorField(nn.Module):
         hidden_dim: int = 256,
         time_embed_dim: int = 32,
         time_scale: float = 100.0,
+        num_layers: int = 4,
+        residual: bool = False,
     ):
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -79,6 +81,10 @@ class LatentVectorField(nn.Module):
         self.param_len = self.condition_dim
         self.hidden_dim = int(hidden_dim)
         self.time_scale = float(time_scale)
+        self.num_layers = int(num_layers)
+        self.residual = bool(residual)
+        if self.num_layers < 2:
+            raise ValueError(f"num_layers must be at least 2, got {num_layers}")
 
         self.time_embed = nn.Sequential(
             SinusoidalPosEmb(time_embed_dim),
@@ -94,15 +100,38 @@ class LatentVectorField(nn.Module):
         )
 
         in_dim = self.latent_dim + time_embed_dim + self.condition_embed_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, self.hidden_dim),
-            nn.Mish(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.Mish(),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
-            nn.Mish(),
-            nn.Linear(self.hidden_dim, self.latent_dim),
-        )
+        if self.residual:
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, self.hidden_dim),
+                nn.Mish(),
+            )
+            self.blocks = nn.ModuleList(
+                nn.Sequential(
+                    nn.LayerNorm(self.hidden_dim),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.Mish(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+                for _ in range(self.num_layers - 2)
+            )
+            self.output_proj = nn.Sequential(
+                nn.LayerNorm(self.hidden_dim),
+                nn.Mish(),
+                nn.Linear(self.hidden_dim, self.latent_dim),
+            )
+            self.net = None
+        else:
+            layers: list[nn.Module] = [
+                nn.Linear(in_dim, self.hidden_dim),
+                nn.Mish(),
+            ]
+            for _ in range(self.num_layers - 2):
+                layers.extend([
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                    nn.Mish(),
+                ])
+            layers.append(nn.Linear(self.hidden_dim, self.latent_dim))
+            self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor, t: torch.Tensor, env_params: torch.Tensor) -> torch.Tensor:
         dev, dtype = z.device, z.dtype
@@ -129,7 +158,14 @@ class LatentVectorField(nn.Module):
         z_flat = z.squeeze(1)
         t_emb = self.time_embed(t * self.time_scale)
         c_emb = self.condition_embed(env_params)
-        out = self.net(torch.cat([z_flat, t_emb, c_emb], dim=-1))
+        h = torch.cat([z_flat, t_emb, c_emb], dim=-1)
+        if self.residual:
+            h = self.input_proj(h)
+            for block in self.blocks:
+                h = h + block(h)
+            out = self.output_proj(h)
+        else:
+            out = self.net(h)
         return out.unsqueeze(1)
 
 
@@ -220,6 +256,8 @@ class LatentFM:
         ae_max_epochs: int | None = None,
         ae_latent_reg_weight: float = 1e-4,
         ae_smoothness_weight: float = 1e-3,
+        ae_latent_whiten_weight: float = 0.0,
+        ae_latent_noise_std: float = 0.0,
     ):
         del gripper_idx
         self.model = model
@@ -245,6 +283,8 @@ class LatentFM:
         self.ae_max_epochs = ae_max_epochs
         self.ae_latent_reg_weight = float(ae_latent_reg_weight)
         self.ae_smoothness_weight = float(ae_smoothness_weight)
+        self.ae_latent_whiten_weight = float(ae_latent_whiten_weight)
+        self.ae_latent_noise_std = float(ae_latent_noise_std)
         self.best_validation_rollouts = None
         self.latent_mean = torch.zeros(1, self.latent_dim, device=self.device)
         self.latent_std = torch.ones(1, self.latent_dim, device=self.device)
@@ -262,7 +302,7 @@ class LatentFM:
         return self.ema.averaged_model if self.ema is not None else self.model
 
     def _policy(self, latent_model=None):
-        return LatentFlowPolicy(
+        policy = LatentFlowPolicy(
             copy.deepcopy(self.autoencoder).eval(),
             copy.deepcopy(latent_model or self._eval_latent_model()).eval(),
             horizon=self.horizon,
@@ -273,6 +313,17 @@ class LatentFM:
             latent_std=self.latent_std.detach().cpu(),
             device=self.device,
         ).to(self.device)
+        for attr in (
+            "observation_type",
+            "camera_names",
+            "state_condition_dim",
+            "vision_image_height",
+            "vision_image_width",
+        ):
+            if hasattr(self, attr):
+                setattr(policy, attr, getattr(self, attr))
+        object.__setattr__(policy, "vision_encoder", getattr(self, "vision_encoder", None))
+        return policy
 
     def sample_t(self, n: int) -> torch.Tensor:
         if self.time_sampling == "shifted":
@@ -295,6 +346,8 @@ class LatentFM:
             "reconstruction_rmse": math.nan,
             "latent_reg": math.nan,
             "smoothness_reg": math.nan,
+            "latent_whiten_reg": math.nan,
+            "denoising_rmse": math.nan,
             "total_loss": math.nan,
         }
         for epoch in tqdm(range(1, ae_epochs + 1), desc="LatentFM Autoencoder Training", unit="epoch"):
@@ -309,16 +362,28 @@ class LatentFM:
                 recon = self.autoencoder.decode(z)
 
                 recon_loss = F.mse_loss(recon, x)
+                denoising_loss = recon_loss.new_zeros(())
+                if self.ae_latent_noise_std > 0:
+                    z_noisy = z + torch.randn_like(z) * self.ae_latent_noise_std
+                    recon_noisy = self.autoencoder.decode(z_noisy)
+                    denoising_loss = F.mse_loss(recon_noisy, x)
                 latent_reg = z.square().mean()
+                z_centered = z - z.mean(dim=0, keepdim=True)
+                z_std = z_centered.std(dim=0, unbiased=False).clamp_min(1e-4)
+                z_norm = z_centered / z_std
+                cov = z_norm.T @ z_norm / max(1, z_norm.shape[0])
+                eye = torch.eye(self.latent_dim, device=z.device, dtype=z.dtype)
+                latent_whiten_reg = F.mse_loss(cov, eye)
                 perm2 = torch.randperm(z.shape[0], device=z.device)
                 alpha = torch.empty(z.shape[0], 1, device=z.device).uniform_(-0.4, 1.4)
                 z_aug = alpha * z + (1.0 - alpha) * z[perm2]
                 decoded_aug = self.autoencoder.decode(z_aug)
                 smoothness_reg = (decoded_aug[:, 1:] - decoded_aug[:, :-1]).square().mean()
                 loss = (
-                    recon_loss
+                    recon_loss + denoising_loss
                     + self.ae_latent_reg_weight * latent_reg
                     + self.ae_smoothness_weight * smoothness_reg
+                    + self.ae_latent_whiten_weight * latent_whiten_reg
                 )
 
                 self.ae_optimizer.zero_grad()
@@ -328,6 +393,8 @@ class LatentFM:
                 totals["reconstruction_rmse"] += float(torch.sqrt(recon_loss.detach() + 1e-8).item())
                 totals["latent_reg"] += float(latent_reg.detach().item())
                 totals["smoothness_reg"] += float(smoothness_reg.detach().item())
+                totals["latent_whiten_reg"] += float(latent_whiten_reg.detach().item())
+                totals["denoising_rmse"] += float(torch.sqrt(denoising_loss.detach() + 1e-8).item())
                 totals["total_loss"] += float(loss.detach().item())
                 batches += 1
             if self.ae_scheduler is not None:
@@ -338,6 +405,8 @@ class LatentFM:
                     "AE epoch "
                     f"{epoch}: reconstruction_rmse={metrics['reconstruction_rmse']:.6f}, "
                     f"latent_reg={metrics['latent_reg']:.6f}, "
+                    f"latent_whiten_reg={metrics['latent_whiten_reg']:.6f}, "
+                    f"denoising_rmse={metrics['denoising_rmse']:.6f}, "
                     f"smoothness_reg={metrics['smoothness_reg']:.6f}, "
                     f"total_loss={metrics['total_loss']:.6f}"
                 )
@@ -470,6 +539,8 @@ class LatentFM:
                         "ae_reconstruction_rmse": ae_metrics["reconstruction_rmse"],
                         "ae_latent_reg": ae_metrics["latent_reg"],
                         "ae_smoothness_reg": ae_metrics["smoothness_reg"],
+                        "ae_latent_whiten_reg": ae_metrics["latent_whiten_reg"],
+                        "ae_denoising_rmse": ae_metrics["denoising_rmse"],
                         "ae_total_loss": ae_metrics["total_loss"],
                         **self.latent_stats_summary,
                     }
@@ -507,6 +578,8 @@ class LatentFM:
                 "ae_reconstruction_rmse": ae_metrics["reconstruction_rmse"],
                 "ae_latent_reg": ae_metrics["latent_reg"],
                 "ae_smoothness_reg": ae_metrics["smoothness_reg"],
+                "ae_latent_whiten_reg": ae_metrics["latent_whiten_reg"],
+                "ae_denoising_rmse": ae_metrics["denoising_rmse"],
                 "ae_total_loss": ae_metrics["total_loss"],
                 **self.latent_stats_summary,
             }

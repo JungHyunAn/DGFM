@@ -15,7 +15,9 @@ from robosuite.utils.transform_utils import mat2quat
 from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 
-from Robot_simulation.environments.heuristics_util import get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import (
+    DEFAULT_VISION_CAMERAS, capture_camera_views, get_environment_state, step_towards,
+)
 
 
 def generate_wipe_trajectory(
@@ -23,6 +25,10 @@ def generate_wipe_trajectory(
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
+    save_video: bool = True,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_width: int = 224,
+    image_height: int = 224,
 ) -> Tuple[np.ndarray, bool, List[np.ndarray], np.ndarray, Dict[str, np.ndarray]]:
     """
     Heuristic trajectory generator for Wipe, return the **joint-angle trajectory**.
@@ -57,15 +63,15 @@ def generate_wipe_trajectory(
             }
         environment_parameters : tuple
             Empty for wipe; current dirt center/radius is recorded dynamically.
-        dynamic_traj : np.ndarray
+        environment_state_traj : np.ndarray
             (T, 3) values of (center_x, center_y, max_radius) sampled every env.step().
     """
 
     # ---------- storage ----------
     q_traj: List[np.ndarray] = []
     eef_traj: List[np.ndarray] = []
-    dynamic_traj: List[np.ndarray] = []
-    frames: List[np.ndarray] = []
+    environment_state_traj: List[np.ndarray] = []
+    frames = {name: [] for name in camera_names}
 
     # ---------- reset & joint indices ----------
     env.reset()
@@ -93,7 +99,12 @@ def generate_wipe_trajectory(
             env.sim.data.site_xpos[eef_id].copy(),
             mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3)),
         ]).astype(np.float32))
-        dynamic_traj.append(get_dynamic_state(env, "wipe"))
+        environment_state_traj.append(get_environment_state(env, "wipe"))
+        if render:
+            for name, image in capture_camera_views(
+                env, camera_names, image_width, image_height
+            ).items():
+                frames[name].append(image)
 
     # ---------- helper for step then check & record ----------
     def episode_done():
@@ -105,7 +116,7 @@ def generate_wipe_trajectory(
         try:
             step_towards(env, eef_id, adim, record_q,
                             target_pos=pos, target_quat=quat, steps=steps,
-                            render=render, frames=frames)
+                            render=False, frames=None)
         except ValueError as exc:
             if "terminated episode" in str(exc):
                 return True
@@ -182,10 +193,10 @@ def generate_wipe_trajectory(
     success = env._check_success()
 
     # ---------- optionally save frontview videos ----------
-    if render:
+    if render and save_video:
         os.makedirs(video_folder, exist_ok=True)
         out = os.path.join(video_folder, "wipe_heuristic_frontview.mp4")
-        imageio.mimsave(out, frames, fps=env.control_freq)
+        imageio.mimsave(out, frames[camera_names[0]], fps=env.control_freq)
         if verbose:
             print(f"Saved frontview video to {out}")
 
@@ -196,7 +207,7 @@ def generate_wipe_trajectory(
         init_qpos,
         env_setting,
         environment_parameters,
-        np.stack(dynamic_traj, axis=0),
+        np.stack(environment_state_traj, axis=0),
         np.stack(eef_traj, axis=0),
     )
 

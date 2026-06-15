@@ -9,6 +9,8 @@ import numpy as np
 import torch
 from scipy.interpolate import CubicSpline
 
+from Robot_simulation.models.vision_encoder import encode_camera_history
+
 from Robot_simulation.environments.heuristics_util import (
     _clip_policy_gripper_dims,
     _current_robot_q,
@@ -17,13 +19,17 @@ from Robot_simulation.environments.heuristics_util import (
     _to_action_from_q,
     configure_nut_pegs,
     validate_action_representation,
-    get_dynamic_state,
+    get_environment_state,
     make_env,
     render_trajectory,
     restore_environment,
     restore_mj_state,
     save_mj_state,
     write_grid_video,
+    capture_camera_views,
+    DEFAULT_VISION_CAMERAS,
+    DEFAULT_VISION_HEIGHT,
+    DEFAULT_VISION_WIDTH,
 )
 
 
@@ -122,6 +128,8 @@ def build_state_conditioned_windows(
     recorded_control_freq: int | float | None = None,
     trajectory_control_freq: int | float | None = None,
     observation_horizon: int = 1,
+    vision_features: list[np.ndarray] | None = None,
+    observation_type: str = "state",
 ) -> tuple[np.ndarray, np.ndarray]:
     """Convert full episodes into state-conditioned fixed-horizon windows."""
     if horizon <= 0:
@@ -130,29 +138,48 @@ def build_state_conditioned_windows(
         raise ValueError("stride must be positive")
     if observation_horizon <= 0:
         raise ValueError("observation_horizon must be positive")
+    if observation_type not in ("state", "vision"):
+        raise ValueError(f"Unsupported observation_type={observation_type!r}")
+    if observation_type == "vision" and vision_features is None:
+        raise ValueError("Vision windows require vision_features")
+    use_oracle_environment_state = observation_type == "state"
     sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
 
     xs, cs = [], []
     n_eps = len(trajectories)
     for ep in range(n_eps):
         q = np.asarray(trajectories[ep], dtype=np.float32)
-        dyn = None if dynamic_states is None else dynamic_states[ep]
+        dyn = None if not use_oracle_environment_state or dynamic_states is None else dynamic_states[ep]
         if dyn is None:
             dyn = np.zeros((len(q), 0), dtype=np.float32)
         else:
             dyn = np.asarray(dyn, dtype=np.float32)
             if dyn.shape[0] != len(q):
                 raise ValueError(f"dynamic_states[{ep}] length {dyn.shape[0]} != trajectory length {len(q)}")
-        env_c = np.asarray(static_env_params[ep], dtype=np.float32)
+        env_c = (
+            np.asarray(static_env_params[ep], dtype=np.float32)
+            if use_oracle_environment_state
+            else np.zeros((0,), dtype=np.float32)
+        )
+        vision = None if vision_features is None else np.asarray(vision_features[ep], dtype=np.float32)
+        if vision is not None and vision.shape[0] != len(q):
+            raise ValueError(f"vision_features[{ep}] length {vision.shape[0]} != trajectory length {len(q)}")
         max_start = len(q) - (horizon - 1) * sample_step
         for start in range(0, max_start, stride):
             xs.append(q[start:start + horizon * sample_step:sample_step])
             obs_parts = []
+            vision_parts = []
             first_obs_idx = start - (observation_horizon - 1) * sample_step
             for obs_i in range(observation_horizon):
                 obs_idx = max(0, first_obs_idx + obs_i * sample_step)
-                obs_parts.extend([q[obs_idx], dyn[obs_idx]])
-            obs_parts.append(env_c)
+                obs_parts.append(q[obs_idx])
+                if use_oracle_environment_state:
+                    obs_parts.append(dyn[obs_idx])
+                if vision is not None:
+                    vision_parts.append(vision[obs_idx])
+            if use_oracle_environment_state:
+                obs_parts.append(env_c)
+            obs_parts.extend(vision_parts)
             cs.append(np.concatenate(obs_parts, axis=0))
 
     if not xs:
@@ -205,10 +232,19 @@ def _condition_from_env(
     observation_horizon: int = 1,
     q_history: list[np.ndarray] | None = None,
     dynamic_history: list[np.ndarray] | None = None,
+    include_environment_state: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     q0 = _current_robot_q(env, task_name, action_representation)
-    dyn = get_dynamic_state(env, task_name)
-    static_flat = np.asarray(static_c, dtype=np.float32).reshape(-1)
+    dyn = (
+        get_environment_state(env, task_name)
+        if include_environment_state
+        else np.zeros((0,), dtype=np.float32)
+    )
+    static_flat = (
+        np.asarray(static_c, dtype=np.float32).reshape(-1)
+        if include_environment_state
+        else np.zeros((0,), dtype=np.float32)
+    )
     obs_param_len = param_len - static_flat.shape[0]
     if obs_param_len < 0:
         raise ValueError(f"Model param_len {param_len} is shorter than static condition length")
@@ -266,6 +302,10 @@ def _state_policy_env_worker(
     trajectory_control_freq: int | float | None,
     normalization_stats: dict[str, np.ndarray] | None = None,
     action_representation: str = "joint_space",
+    observation_type: str = "state",
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_height: int = DEFAULT_VISION_HEIGHT,
+    image_width: int = DEFAULT_VISION_WIDTH,
 ):
     env = None
     executed = []
@@ -276,24 +316,41 @@ def _state_policy_env_worker(
             environment_setting=setting,
             training=True,
             action_representation=action_representation,
+            has_offscreen_renderer=(observation_type == "vision"),
+            camera_names=camera_names,
+            camera_heights=[image_height] * len(camera_names),
+            camera_widths=[image_width] * len(camera_names),
         )
         steps = 0
         q0 = _current_robot_q(env, task_name, action_representation)
-        dyn0 = get_dynamic_state(env, task_name)
+        include_environment_state = observation_type == "state"
+        condition_static_c = static_c if include_environment_state else np.zeros((0,), dtype=np.float32)
+        dyn0 = (
+            get_environment_state(env, task_name)
+            if include_environment_state
+            else np.zeros((0,), dtype=np.float32)
+        )
         q_history = [q0]
         dynamic_history = [dyn0]
+        image_history = []
+        if observation_type == "vision":
+            image_history.append(capture_camera_views(env, camera_names, image_width, image_height))
         cond, _ = _condition_from_env(
             env,
             task_name,
-            static_c,
+            condition_static_c,
             param_len,
             normalization_stats,
             action_representation,
             observation_horizon,
             q_history,
             dynamic_history,
+            include_environment_state=include_environment_state,
         )
-        conn.send({"type": "cond", "idx": idx, "cond": cond})
+        padded_images = None
+        if image_history:
+            padded_images = [image_history[0]] * (observation_horizon - len(image_history)) + image_history
+        conn.send({"type": "cond", "idx": idx, "cond": cond, "images": padded_images})
 
         while True:
             msg = conn.recv()
@@ -332,21 +389,32 @@ def _state_policy_env_worker(
                 break
 
             q_history.append(_current_robot_q(env, task_name, action_representation))
-            dynamic_history.append(get_dynamic_state(env, task_name))
+            dynamic_history.append(
+                get_environment_state(env, task_name)
+                if include_environment_state
+                else np.zeros((0,), dtype=np.float32)
+            )
             q_history = q_history[-observation_horizon:]
             dynamic_history = dynamic_history[-observation_horizon:]
+            if observation_type == "vision":
+                image_history.append(capture_camera_views(env, camera_names, image_width, image_height))
+                image_history = image_history[-observation_horizon:]
             cond, _ = _condition_from_env(
                 env,
                 task_name,
-                static_c,
+                condition_static_c,
                 param_len,
                 normalization_stats,
                 action_representation,
                 observation_horizon,
                 q_history,
                 dynamic_history,
+                include_environment_state=include_environment_state,
             )
-            conn.send({"type": "cond", "idx": idx, "cond": cond})
+            padded_images = None
+            if image_history:
+                padded_images = [image_history[0]] * (observation_horizon - len(image_history)) + image_history
+            conn.send({"type": "cond", "idx": idx, "cond": cond, "images": padded_images})
     except Exception as exc:
         conn.send({"type": "error", "idx": idx, "error": repr(exc)})
     finally:
@@ -686,6 +754,15 @@ def _rollout_state_policy_synchronized(
     if observation_horizon <= 0:
         raise ValueError(f"observation_horizon must be positive, got {observation_horizon}")
 
+    observation_type = getattr(model, "observation_type", "state")
+    state_param_len = int(getattr(model, "state_condition_dim", param_len))
+    vision_encoder = getattr(model, "vision_encoder", None)
+    camera_names = tuple(getattr(model, "camera_names", DEFAULT_VISION_CAMERAS))
+    image_height = int(getattr(model, "vision_image_height", DEFAULT_VISION_HEIGHT))
+    image_width = int(getattr(model, "vision_image_width", DEFAULT_VISION_WIDTH))
+    if observation_type == "vision" and vision_encoder is None:
+        raise ValueError("Vision-conditioned rollout is missing its vision_encoder")
+
     rng = np.random.RandomState(base_seed)
     total_success = 0
     total_reward = 0.0
@@ -710,7 +787,7 @@ def _rollout_state_policy_synchronized(
                     env_settings[idx],
                     static_params[idx],
                     seq_len,
-                    param_len,
+                    state_param_len,
                     max_policy_steps,
                     executed_horizon,
                     observation_horizon,
@@ -718,6 +795,10 @@ def _rollout_state_policy_synchronized(
                     trajectory_control_freq,
                     normalization_stats,
                     action_representation,
+                    observation_type,
+                    camera_names,
+                    image_height,
+                    image_width,
                 ),
             )
             proc.start()
@@ -734,7 +815,7 @@ def _rollout_state_policy_synchronized(
                 msg = conns[idx].recv()
                 mtype = msg.get("type")
                 if mtype == "cond":
-                    pending_conditions[idx] = msg["cond"]
+                    pending_conditions[idx] = msg
                 elif mtype == "result":
                     active.remove(idx)
                     if msg["success"]:
@@ -752,7 +833,16 @@ def _rollout_state_policy_synchronized(
             if not ready:
                 continue
 
-            cond_batch = np.stack([pending_conditions.pop(idx) for idx in ready], axis=0)
+            ready_messages = [pending_conditions.pop(idx) for idx in ready]
+            cond_batch = np.stack([message["cond"] for message in ready_messages], axis=0)
+            if observation_type == "vision":
+                vision_batch = np.stack([
+                    encode_camera_history(message["images"], vision_encoder, device)
+                    for message in ready_messages
+                ], axis=0)
+                cond_batch = np.concatenate([cond_batch, vision_batch], axis=1)
+            if cond_batch.shape[1] != param_len:
+                raise ValueError(f"Live condition length {cond_batch.shape[1]} != model param_len {param_len}")
             q_low_batch = _run_policy_batched(
                 model,
                 sampler_type,

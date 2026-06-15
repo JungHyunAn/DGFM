@@ -238,6 +238,7 @@ class DGFMv2(DGFM):
         yr = y.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
         zr = z.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
         cr = c.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
+        source_idx = idx.unsqueeze(1).expand(-1, n_t).reshape(-1)
 
         a, b, cc, a_dot, b_dot, c_dot = self._path_weights(t, interpolation_path)
         xt = a.view(-1, 1, 1) * zr + b.view(-1, 1, 1) * yr + cc.view(-1, 1, 1) * xr
@@ -248,7 +249,7 @@ class DGFMv2(DGFM):
         )
 
         perm = torch.randperm(xt.shape[0], device=self.device)
-        return xt[perm], t[perm], vt[perm], cr[perm]
+        return xt[perm], t[perm], vt[perm], cr[perm], source_idx[perm]
 
     def train(
         self,
@@ -366,7 +367,7 @@ class DGFMv2(DGFM):
                 self.model.train()
                 perm_t = torch.randperm(N, device=self.device)
 
-                XT, TIN, VT, CT = self._build_joint_interpolants(
+                XT, TIN, VT, CT, SOURCE_IDX = self._build_joint_interpolants(
                     target_trajectories=target_trajectories,
                     conditions=conditions,
                     perm_t=perm_t,
@@ -387,8 +388,12 @@ class DGFMv2(DGFM):
                     tb = TIN[i:i + batch_size]
                     vb = VT[i:i + batch_size]
                     cb = CT[i:i + batch_size]
+                    source_idx = SOURCE_IDX[i:i + batch_size]
 
                     with torch.enable_grad():
+                        vision_condition_fn = getattr(self, "vision_condition_fn", None)
+                        if vision_condition_fn is not None:
+                            cb = vision_condition_fn(source_idx, cb)
                         pred = self.model(xb, tb, cb)
                         sq_err = (pred - vb) ** 2
                         if hasattr(self.model, "loss_mask") and self.model.loss_mask is not None:

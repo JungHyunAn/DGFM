@@ -24,6 +24,14 @@ To generate a dataset, run ```bash Robot_simulation.environments.generate_data``
 python -m Robot_simulation.environments.generate_data --n 1000 --task_name door --render --num_workers 10 --verbose
 ```
 
+For a vision dataset, enable both default cameras (`frontview` and `robot0_eye_in_hand`):
+
+```bash
+python -m Robot_simulation.environments.generate_data --n 1000 --task_name door --vision --num_workers 10
+```
+
+Images are written as compact JPEG files beside the HDF5 file. The HDF5 stores relative per-step paths under each episode's `image_paths` group and uses the `_vision.hdf5` suffix. Camera names, image size, and JPEG quality can be changed with `--camera_names`, `--image_height`, `--image_width`, and `--jpeg_quality`.
+
 Each call automatically invokes the corresponding heuristic trajectory generator. Generated datasets are saved to:
 
 ```bash
@@ -40,6 +48,14 @@ To evaluate a flow-matching method (**UniformFM**, **ShiftedFM**, or **DGFM**) o
 python -m Robot_simulation.run_eval --config Robot_simulation/sim_config/door_uniform.json \
   --dataset_path Robot_simulation/heuristic_dataset/door_dataset_10000.hdf5 \
 ```
+
+For vision-conditioned training and live rendered evaluation, add:
+
+```bash
+  --observation_type vision
+```
+
+The policy concatenates state history with features from one shared, frozen ImageNet ResNet-18 across both camera views.
 
 The JSON config bundles simulation and training settings for reproducibility. Keep
 `dataset_path` on the command line so the same config can be reused across

@@ -7,7 +7,9 @@ from robosuite.controllers.composite.composite_controller_factory import load_co
 from robosuite.utils.transform_utils import mat2quat, quat_multiply
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
-from Robot_simulation.environments.heuristics_util import get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import (
+    DEFAULT_VISION_CAMERAS, capture_camera_views, get_environment_state, step_towards,
+)
 
 
 def generate_door_trajectory(
@@ -16,6 +18,10 @@ def generate_door_trajectory(
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
+    save_video: bool = True,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_width: int = 224,
+    image_height: int = 224,
 ):
     """
     Heuristic trajectory generator for Door, return the **joint-angle trajectory**.
@@ -64,8 +70,8 @@ def generate_door_trajectory(
     q_traj = []
     gripper_traj = []
     eef_traj = []
-    dynamic_traj = []
-    frontview_frames = []
+    environment_state_traj = []
+    frames = {name: [] for name in camera_names}
 
     # ---------- reset & indices ----------
     env.reset()
@@ -110,7 +116,12 @@ def generate_door_trajectory(
             env.sim.data.site_xpos[eef_id].copy(),
             mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3)),
         ]).astype(np.float32))
-        dynamic_traj.append(get_dynamic_state(env, "door"))
+        environment_state_traj.append(get_environment_state(env, "door"))
+        if render:
+            for name, image in capture_camera_views(
+                env, camera_names, image_width, image_height
+            ).items():
+                frames[name].append(image)
 
     # ---------- begin recording ----------
     record_q()
@@ -137,8 +148,8 @@ def generate_door_trajectory(
                  target_quat=q_handle,
                  steps=100,
                  gripper_val=-1,
-                 render=render,
-                 frames=frontview_frames,
+                 render=False,
+                 frames=None,
                  camera_name="frontview")
     # ---------- PHASE1‑2: 50-step careful approach to handle ----------
     gripper_pose = 1.0
@@ -148,9 +159,6 @@ def generate_door_trajectory(
         env.step(a)
         # print(env._gripper_to_handle)
         record_q()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frontview_frames.append(np.flipud(img))
 
     # ---------- PHASE2: 10-step grasping handle ----------
     gripper_pose = 0.0
@@ -158,9 +166,6 @@ def generate_door_trajectory(
         a = np.zeros(adim); a[6] = 1.0
         env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frontview_frames.append(np.flipud(img))
 
     # ---------- PHASE3: (open_steps)-step turning handle ----------
     gripper_pose = 0.0
@@ -189,9 +194,6 @@ def generate_door_trajectory(
         # print(env._gripper_to_handle)
         record_q()
         eef_pos = target_pos.copy()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frontview_frames.append(np.flipud(img))
 
     # ---------- PHASE4: (open_steps)-step pulling door ----------
     gripper_pose = 0.0
@@ -199,28 +201,25 @@ def generate_door_trajectory(
         a = np.zeros(adim); a[0] = -60/open_steps; a[6] = 1.0
         env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frontview_frames.append(np.flipud(img))
 
     success = env._check_success()
 
     # ---------- optionally save frontview videos ----------
-    if render:
+    if render and save_video:
         os.makedirs(video_folder, exist_ok=True)
         out = os.path.join(video_folder, "door_heuristic_frontview.mp4")
-        imageio.mimsave(out, frontview_frames, fps=env.control_freq)
+        imageio.mimsave(out, frames[camera_names[0]], fps=env.control_freq)
         if verbose:
             print(f"Saved frontview video to {out}")
 
     return (
         np.stack(q_traj, axis=0),
         success,
-        frontview_frames,
+        frames,
         init_qpos,
         environment_setting,
         environment_parameters,
-        np.stack(dynamic_traj, axis=0),
+        np.stack(environment_state_traj, axis=0),
         np.asarray(gripper_traj, dtype=np.float32),
         np.stack(eef_traj, axis=0),
     )

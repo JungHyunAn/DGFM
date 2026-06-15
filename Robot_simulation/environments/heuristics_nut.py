@@ -5,13 +5,20 @@ import numpy as np
 from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
-from Robot_simulation.environments.heuristics_util import configure_nut_pegs, get_dynamic_state, step_towards
+from Robot_simulation.environments.heuristics_util import (
+    DEFAULT_VISION_CAMERAS, capture_camera_views, configure_nut_pegs,
+    get_environment_state, step_towards,
+)
 
 def generate_nut_trajectory(
     env,
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
+    save_video: bool = True,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_width: int = 224,
+    image_height: int = 224,
 ):
     """
     Heuristic trajectory generator for NutAssembly, return the **joint-angle trajectory**.
@@ -58,8 +65,8 @@ def generate_nut_trajectory(
     q_traj = []
     gripper_traj = []
     eef_traj = []
-    dynamic_traj = []
-    frames = []
+    environment_state_traj = []
+    frames = {name: [] for name in camera_names}
 
     # ---------- reset & deterministic peg layout ----------
     env.reset()
@@ -100,7 +107,12 @@ def generate_nut_trajectory(
             env.sim.data.site_xpos[eef_id].copy(),
             mat2quat(env.sim.data.site_xmat[eef_id].reshape(3, 3)),
         ]).astype(np.float32))
-        dynamic_traj.append(get_dynamic_state(env, "nut"))
+        environment_state_traj.append(get_environment_state(env, "nut"))
+        if render:
+            for name, image in capture_camera_views(
+                env, camera_names, image_width, image_height
+            ).items():
+                frames[name].append(image)
 
     # ---------- begin recording ----------
     record_q()
@@ -137,8 +149,8 @@ def generate_nut_trajectory(
                  target_quat=quat0,
                  steps=100,
                  gripper_val=-1,
-                 render=render,
-                 frames=frames,
+                 render=False,
+                 frames=None,
                  camera_name="frontview")    
     environment_parameters = ()
 
@@ -150,8 +162,8 @@ def generate_nut_trajectory(
                  target_quat=quat0,
                  steps=20,
                  gripper_val=-1,
-                 render=render,
-                 frames=frames,
+                 render=False,
+                 frames=None,
                  camera_name="frontview")
     
     # ---------- PHASE2: 10‑step grasping handle ----------
@@ -160,9 +172,6 @@ def generate_nut_trajectory(
         a = np.zeros(adim); a[6] = 1.0
         obs, _, _, _ = env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640, 480, camera_name="frontview")
-            frames.append(np.flipud(img))
 
     # ---------- PHASE3: 50-step approach to peg end ----------
     gripper_pose = 0.0
@@ -181,8 +190,8 @@ def generate_nut_trajectory(
                  target_quat=quat1,
                  steps=50,
                  gripper_val=1.0,
-                 render=render,
-                 frames=frames,
+                 render=False,
+                 frames=None,
                  camera_name="frontview")
 
     # ---------- PHASE4: 75-step descend onto peg ----------
@@ -194,8 +203,8 @@ def generate_nut_trajectory(
                  target_quat=quat1,
                  steps=75,
                  gripper_val=1.0,
-                 render=render,
-                 frames=frames,
+                 render=False,
+                 frames=None,
                  camera_name="frontview")
     
      # ---------- PHASE5: 30-step opening gripper ----------
@@ -204,17 +213,14 @@ def generate_nut_trajectory(
         a = np.zeros(adim); a[6] = -1.0
         obs, _, _, _ = env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640, 480, camera_name="frontview")
-            frames.append(np.flipud(img))
 
     success = env._check_success()
 
     # ---------- optionally save frontview videos ----------
-    if render:
+    if render and save_video:
         os.makedirs(video_folder, exist_ok=True)
         path = os.path.join(video_folder, "nut_assembly_frontview.mp4")
-        imageio.mimsave(path, frames, fps=env.control_freq)
+        imageio.mimsave(path, frames[camera_names[0]], fps=env.control_freq)
         if verbose:
             print(f"Saved frontview video to {path}")
 
@@ -225,7 +231,7 @@ def generate_nut_trajectory(
         init_qpos,
         environment_setting,
         environment_parameters,
-        np.stack(dynamic_traj, axis=0),
+        np.stack(environment_state_traj, axis=0),
         np.asarray(gripper_traj, dtype=np.float32),
         np.stack(eef_traj, axis=0),
     )

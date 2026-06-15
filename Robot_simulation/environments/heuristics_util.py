@@ -71,6 +71,22 @@ from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multipl
 
 PANDA_GRIPPER_OPEN_QPOS = 0.04
 ACTION_REPRESENTATIONS = ("joint_space", "task_space")
+DEFAULT_VISION_CAMERAS = ("frontview", "robot0_eye_in_hand")
+DEFAULT_VISION_HEIGHT = 224
+DEFAULT_VISION_WIDTH = 224
+
+
+def capture_camera_views(
+    env,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    width: int = DEFAULT_VISION_WIDTH,
+    height: int = DEFAULT_VISION_HEIGHT,
+) -> dict[str, np.ndarray]:
+    """Capture vertically-correct RGB images for all configured cameras."""
+    return {
+        name: np.flipud(env.sim.render(width, height, camera_name=name)).copy()
+        for name in camera_names
+    }
 
 
 def validate_action_representation(action_representation: str) -> str:
@@ -336,8 +352,8 @@ def _safe_qpos_by_joint_substring(env, substrings):
     return values
 
 
-def get_dynamic_state(env, task_name: str) -> np.ndarray:
-    """Extract task dynamic state recorded alongside robot joint angles.
+def get_environment_state(env, task_name: str) -> np.ndarray:
+    """Return task oracle state recorded separately from robot joint angles.
 
     Door records handle/latch angle and door hinge angle. Wipe records the
     current remaining-dirt center and maximum radius. Nut records the live
@@ -393,6 +409,11 @@ def get_dynamic_state(env, task_name: str) -> np.ndarray:
         return state
 
     return np.zeros((0,), dtype=np.float32)
+
+
+def get_dynamic_state(env, task_name: str) -> np.ndarray:
+    """Backward-compatible alias for datasets produced before environment_states."""
+    return get_environment_state(env, task_name)
 
 
 SIG = (mujoco.mjtState.mjSTATE_INTEGRATION)
@@ -518,6 +539,9 @@ def make_env(
     environment_setting: Optional[List[float]] = None,
     training: bool = False,
     action_representation: str = "joint_space",
+    camera_names=None,
+    camera_heights=None,
+    camera_widths=None,
 ):
     """
     Build and reset a robosuite environment (currently only 'door'), optionally
@@ -552,6 +576,13 @@ def make_env(
         reproducibility when bodies are attached via joints. Copying the entire
         state arrays is robust.
     """
+
+    camera_names = list(camera_names or DEFAULT_VISION_CAMERAS)
+    camera_heights = list(camera_heights or [DEFAULT_VISION_HEIGHT] * len(camera_names))
+    camera_widths = list(camera_widths or [DEFAULT_VISION_WIDTH] * len(camera_names))
+    if not (len(camera_names) == len(camera_heights) == len(camera_widths)):
+        raise ValueError("camera_names, camera_heights, and camera_widths must have equal lengths")
+    camera_depths = [False] * len(camera_names)
 
     # 1) for task "door"
     assert (task_name in {"door", "wipe", "two_arm", "nut"}), f"Unsupported task for {task_name}"
@@ -604,10 +635,10 @@ def make_env(
             has_offscreen_renderer=has_offscreen_renderer,
             initialization_noise={'magnitude': initialization_noise_magnitude, 'type': "uniform"},
             use_camera_obs=use_camera_obs,
-            camera_names=["frontview"],
-            camera_heights=[480],
-            camera_widths=[640],
-            camera_depths=[False],
+            camera_names=camera_names,
+            camera_heights=camera_heights,
+            camera_widths=camera_widths,
+            camera_depths=camera_depths,
             control_freq=control_freq,
             reward_shaping=True,
         )
@@ -643,10 +674,10 @@ def make_env(
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
             use_camera_obs=use_camera_obs,
-            camera_names=["frontview"],
-            camera_heights=[480] * 3,
-            camera_widths =[640] * 3,
-            camera_depths =[False] * 3,
+            camera_names=camera_names,
+            camera_heights=camera_heights,
+            camera_widths=camera_widths,
+            camera_depths=camera_depths,
             control_freq=control_freq,
         )
         env.task_config["num_markers"] = 50
@@ -697,10 +728,10 @@ def make_env(
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
             use_camera_obs=use_camera_obs,
-            camera_names=["frontview"],
-            camera_heights=[480],
-            camera_widths=[640],
-            camera_depths=[False],
+            camera_names=camera_names,
+            camera_heights=camera_heights,
+            camera_widths=camera_widths,
+            camera_depths=camera_depths,
             control_freq=control_freq,
         )
         env.reset()
@@ -736,10 +767,10 @@ def make_env(
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
             use_camera_obs=use_camera_obs,
-            camera_names=["frontview"],
-            camera_heights=[480],
-            camera_widths =[640],
-            camera_depths =[False],
+            camera_names=camera_names,
+            camera_heights=camera_heights,
+            camera_widths=camera_widths,
+            camera_depths=camera_depths,
             control_freq=20,
         )
         delta_z = 0.1       

@@ -42,7 +42,7 @@ What this script does
          │    ├─ body_pos
          │    └─ body_quat
          ├─ environment_parameters/values       # task-specific static params (P,)
-         └─ dynamic_states                      # per-step task dynamics
+         └─ environment_states                      # per-step task dynamics
 
 4) **Parallel collection** (`generate_data_parallel`):
    - Launches `num_workers` processes; each worker repeatedly calls the heuristic
@@ -76,7 +76,7 @@ python -m Robot_simulation.environments.generate_data
 Important notes & assumptions
 -----------------------------
 - The **heuristic generator** must return:
-    (q_traj, success, frames, initial_qpos, environment_setting, env_param, dynamic_states)
+    (q_traj, success, frames, initial_qpos, environment_setting, env_param, environment_states)
   where `environment_setting` contains full MuJoCo state arrays. Only episodes
   with `success=True` are saved.
 - Keyframes are sampled from a potentially downsampled trace but `key_inds`
@@ -105,6 +105,7 @@ Gotchas / tips
 import os
 import time
 import h5py
+import imageio.v2 as imageio
 import numpy as np
 import math
 import argparse
@@ -131,6 +132,9 @@ from Robot_simulation.environments.heuristics_util import (
     render_trajectory,
     validate_action_representation,
     write_grid_video,
+    DEFAULT_VISION_CAMERAS,
+    DEFAULT_VISION_HEIGHT,
+    DEFAULT_VISION_WIDTH,
 )
 from Robot_simulation import DEFAULT_DATASET_DIR
 
@@ -167,7 +171,11 @@ KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
                     }
 
 
-def init_hdf5(path: str, task_name: str, env, action_representation: str = "joint_space"):
+def init_hdf5(
+    path: str, task_name: str, env, action_representation: str = "joint_space",
+    vision: bool = False, camera_names=DEFAULT_VISION_CAMERAS,
+    image_height: int = DEFAULT_VISION_HEIGHT, image_width: int = DEFAULT_VISION_WIDTH,
+):
     """
     Create and initialize the root HDF5 file for this dataset.
 
@@ -187,6 +195,10 @@ def init_hdf5(path: str, task_name: str, env, action_representation: str = "join
     meta.attrs["robot"] = env.robots[0].robot_model.naming_prefix
     meta.attrs["robot_dof"] = env.robots[0].dof
     meta.attrs["action_representation"] = action_representation
+    meta.attrs["observation_type"] = "vision" if vision else "state"
+    meta.attrs["camera_names"] = np.asarray(camera_names, dtype="S")
+    meta.attrs["image_height"] = int(image_height)
+    meta.attrs["image_width"] = int(image_width)
     return f
 
 
@@ -261,8 +273,8 @@ def save_episode(
     initial_pose: np.ndarray,
     env_setting,
     env_param,
-    dynamic_states: Optional[np.ndarray] = None,
-    rendered_images: Optional[np.ndarray] = None,
+    environment_states: Optional[np.ndarray] = None,
+    image_paths: Optional[Dict[str, List[str]]] = None,
     action_representation: str = "joint_space",
 ):
     """
@@ -277,9 +289,9 @@ def save_episode(
             - environment_setting/ (group of arrays: qpos, qvel, body_pos, body_quat, ...)
             - environment_parameters/ (tuple of parameters for the environment
                                         - Door   : door handle x coordinate, y coordinate, yaw
-                                        - Wipe   : none; current dirt center/radius is stored in dynamic_states
+                                        - Wipe   : none; current dirt center/radius is stored in environment_states
                                         - TwoArm : pot x coordinate, y coordinate, yaw
-                                        - Nut    : none; live square-nut xyz/rpy is stored in dynamic_states)
+                                        - Nut    : none; live square-nut xyz/rpy is stored in environment_states)
 
     Args:
         hf: Open HDF5 file handle.
@@ -306,11 +318,17 @@ def save_episode(
     grp.attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
     grp.attrs["dof"] = joint_angles.shape[1]
     grp.create_dataset("initial_pose", data=initial_pose, compression="gzip")
-    if dynamic_states is None:
-        dynamic_states = np.zeros((joint_angles.shape[0], 0), dtype=np.float32)
-    grp.create_dataset("dynamic_states", data=dynamic_states, compression="gzip")
-    if rendered_images is not None:
-        grp.create_dataset("rendered_images", data=rendered_images, compression="gzip")
+    if environment_states is None:
+        environment_states = np.zeros((joint_angles.shape[0], 0), dtype=np.float32)
+    environment_state_ds = grp.create_dataset(
+        "environment_states", data=environment_states, compression="gzip"
+    )
+    grp["dynamic_states"] = environment_state_ds
+    if image_paths:
+        image_grp = grp.create_group("image_paths")
+        string_dtype = h5py.string_dtype(encoding="utf-8")
+        for camera_name, paths in image_paths.items():
+            image_grp.create_dataset(camera_name, data=np.asarray(paths, dtype=object), dtype=string_dtype)
     # save environment settings
     env_setting_grp = grp.create_group("environment_setting")
     for k, v in env_setting.items():
@@ -330,7 +348,10 @@ def worker_generate(
     chunk_size: int,
     max_trials: int,
     seed: int,
-    save_rendered_images: bool = False,
+    vision: bool = False,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_height: int = DEFAULT_VISION_HEIGHT,
+    image_width: int = DEFAULT_VISION_WIDTH,
     action_representation: str = "joint_space",
 ) -> List[Dict[str, Any]]:
     """
@@ -375,8 +396,11 @@ def worker_generate(
 
     env = make_env(
         task_name,
-        has_offscreen_renderer=save_rendered_images,
+        has_offscreen_renderer=vision,
         use_camera_obs=False,
+        camera_names=camera_names,
+        camera_heights=[image_height] * len(camera_names),
+        camera_widths=[image_width] * len(camera_names),
     )
     successes = []
     trials = 0
@@ -384,8 +408,11 @@ def worker_generate(
     while len(successes) < chunk_size and trials < max_trials:
         trials += 1
         # generator now returns (actions, success, frames, initial_qpos)
-        result = generator(env, render=save_rendered_images)
-        q_traj, success, frames, init_qpos, environment_setting, env_param, dynamic_states = result[:7]
+        result = generator(
+            env, render=vision, save_video=False, camera_names=camera_names,
+            image_height=image_height, image_width=image_width,
+        )
+        q_traj, success, frames, init_qpos, environment_setting, env_param, environment_states = result[:7]
         gripper_pose = None
         eef_traj = None
         if task_name == "wipe":
@@ -407,8 +434,8 @@ def worker_generate(
                 "initial_pose":  q_policy[0],
                 "environment_setting":  environment_setting,
                 "environment_parameters": env_param,
-                "dynamic_states": dynamic_states,
-                "rendered_images": np.asarray(frames, dtype=np.uint8) if save_rendered_images else None,
+                "environment_states": environment_states,
+                "camera_frames": frames if vision else None,
             })
 
     env.close()
@@ -445,6 +472,25 @@ def wait_first(futures):
     return done, pending
 
 
+def _write_episode_images(
+    h5_path: str, ep_idx: int, frames: Dict[str, List[np.ndarray]], jpeg_quality: int
+) -> Dict[str, List[str]]:
+    """Write episode RGB frames beside the HDF5 file and return relative paths."""
+    image_root = os.path.splitext(h5_path)[0] + "_images"
+    h5_dir = os.path.dirname(h5_path) or "."
+    paths_by_camera = {}
+    for camera_name, camera_frames in frames.items():
+        camera_dir = os.path.join(image_root, f"episode_{ep_idx:06d}", camera_name)
+        os.makedirs(camera_dir, exist_ok=True)
+        camera_paths = []
+        for frame_idx, frame in enumerate(camera_frames):
+            image_path = os.path.join(camera_dir, f"{frame_idx:06d}.jpg")
+            imageio.imwrite(image_path, np.asarray(frame, dtype=np.uint8), quality=jpeg_quality)
+            camera_paths.append(os.path.relpath(image_path, h5_dir))
+        paths_by_camera[camera_name] = camera_paths
+    return paths_by_camera
+
+
 def generate_data_parallel(
     n: int,
     task_name: str,
@@ -457,7 +503,11 @@ def generate_data_parallel(
     max_trials_per_worker: int = 200,
     base_seed: int = 12345,
     verbose: bool = True,
-    save_rendered_images: bool = False,
+    vision: bool = False,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_height: int = DEFAULT_VISION_HEIGHT,
+    image_width: int = DEFAULT_VISION_WIDTH,
+    jpeg_quality: int = 80,
     action_representation: str = "joint_space",
 ):
     """
@@ -500,18 +550,24 @@ def generate_data_parallel(
     os.makedirs(output_dir, exist_ok=True)
 
     # Sample env for metadata & fps (no offscreen / no camera obs)
-    sample_env = make_env(task_name, has_offscreen_renderer=False, use_camera_obs=False)
+    sample_env = make_env(
+        task_name, has_offscreen_renderer=False, use_camera_obs=False,
+        camera_names=camera_names, camera_heights=[image_height] * len(camera_names),
+        camera_widths=[image_width] * len(camera_names),
+    )
     control_freq = sample_env.control_freq
 
     # HDF5 init
     if hdf5_name is None:
-        hdf5_name = f"{task_name}_{action_representation}_dataset_{n}.hdf5"
+        hdf5_name = f"{task_name}_{action_representation}_dataset_{n}{'_vision' if vision else ''}.hdf5"
     h5_path = os.path.join(output_dir, hdf5_name)
     hf = init_hdf5(
         h5_path,
         task_name,
         sample_env,
         action_representation=action_representation,
+        vision=vision, camera_names=camera_names,
+        image_height=image_height, image_width=image_width,
     )
     sample_env.close()
 
@@ -536,7 +592,10 @@ def generate_data_parallel(
                 chunk_size,
                 max_trials_per_worker,
                 base_seed,
-                save_rendered_images,
+                vision,
+                camera_names,
+                image_height,
+                image_width,
                 action_representation,
             )
             for wid in range(num_workers)
@@ -557,6 +616,19 @@ def generate_data_parallel(
                         hf["meta"].attrs["policy_dof"] = entry["joint_angles"].shape[1]
                         hf["meta"].attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
                         hf["meta"].attrs["action_representation"] = action_representation
+                    image_paths = None
+                    if vision:
+                        frames = entry["camera_frames"]
+                        expected_len = len(entry["joint_angles"])
+                        bad = {name: len(values) for name, values in frames.items() if len(values) != expected_len}
+                        if bad:
+                            raise ValueError(
+                                f"Episode {episode_idx} image/trajectory length mismatch: "
+                                f"expected {expected_len}, got {bad}"
+                            )
+                        image_paths = _write_episode_images(
+                            h5_path, episode_idx, frames, jpeg_quality
+                        )
                     # Save actions + initial_pose
                     save_episode(
                         hf,
@@ -567,8 +639,8 @@ def generate_data_parallel(
                         entry["initial_pose"],
                         entry["environment_setting"],
                         entry["environment_parameters"],
-                        entry["dynamic_states"],
-                        entry["rendered_images"],
+                        entry["environment_states"],
+                        image_paths,
                         action_representation=action_representation,
                     )
 
@@ -587,7 +659,10 @@ def generate_data_parallel(
                             chunk_size,
                             max_trials_per_worker,
                             base_seed,
-                            save_rendered_images,
+                            vision,
+                            camera_names,
+                            image_height,
+                            image_width,
                             action_representation,
                         )
                     )
@@ -662,9 +737,16 @@ if __name__ == "__main__":
         help="Whether to replay and render videos of the collected episodes"
     )
     parser.add_argument(
-        "--save_rendered_images", action="store_true",
-        help="Save per-step rendered images inside each successful HDF5 episode"
+        "--vision", action=argparse.BooleanOptionalAction, default=False,
+        help="Save external camera images and image paths for vision-conditioned training"
     )
+    parser.add_argument(
+        "--camera_names", nargs="+", default=list(DEFAULT_VISION_CAMERAS),
+        help="Camera views to save when --vision is enabled"
+    )
+    parser.add_argument("--image_height", type=int, default=DEFAULT_VISION_HEIGHT)
+    parser.add_argument("--image_width", type=int, default=DEFAULT_VISION_WIDTH)
+    parser.add_argument("--jpeg_quality", type=int, default=80)
     parser.add_argument(
         "--output_dir", type=str, default=DEFAULT_DATASET_DIR,
         help="Directory to save generated HDF5 datasets"
@@ -697,6 +779,10 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
         verbose=args.verbose,
-        save_rendered_images=args.save_rendered_images,
+        vision=args.vision,
+        camera_names=args.camera_names,
+        image_height=args.image_height,
+        image_width=args.image_width,
+        jpeg_quality=args.jpeg_quality,
         action_representation=args.action_representation,
     )

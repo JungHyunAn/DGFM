@@ -33,6 +33,7 @@ What this script does
 
 5) **Save artifacts** under `--results_path/<Asia/Seoul timestamp>/`:
    - `results.json`: full config + metrics across training.
+   - `training.log`: terminal output from dataset loading, training, and evaluation.
    - `success_rates.png`: success / loss vs. epoch.
    - `model.pt`: best model weights (PyTorch).
    - `*_grid_*.mp4`: optional rendered grids from evaluation.
@@ -76,6 +77,7 @@ Outputs & folder structure
 --------------------------
 `<results_path>/<YYYYMMDDTHHMMSS+09:00>/`
   ├── results.json
+  ├── training.log
   ├── success_rates.png
   ├── model.pt
   ├── (optional) door_grid_best.mp4
@@ -125,6 +127,7 @@ import pickle
 import h5py
 import argparse
 import time
+import sys
 import matplotlib.pyplot as plt
 from zoneinfo import ZoneInfo
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -138,6 +141,10 @@ for h in list(robosuite_logger.handlers):
     robosuite_logger.removeHandler(h)
 
 from Robot_simulation.models.VanillaFM_class import VectorField
+from Robot_simulation.models.vision_encoder import (
+    FrozenResNet18Encoder, encode_image_path_episodes, encode_image_path_windows, load_camera_path_matrix,
+    validate_observation_type,
+)
 from Robot_simulation.models.UniformFM_class import UniformFM
 from Robot_simulation.models.ShiftedFM_class import ShiftedFM
 from Robot_simulation.env_util import (
@@ -152,8 +159,38 @@ from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
 from Robot_simulation.models.DP_class import DiffusionPolicy
 from Robot_simulation.models.LatentFM_class import LatentFM, LatentFlowPolicy, LatentVectorField, TrajectoryAutoencoder
 from Robot_simulation.models.MPPCA_class import MPPCA
-from Robot_simulation.environments.heuristics_util import _get_environment_params, configure_nut_pegs, validate_action_representation
+from Robot_simulation.environments.heuristics_util import (
+    DEFAULT_VISION_CAMERAS, DEFAULT_VISION_HEIGHT, DEFAULT_VISION_WIDTH,
+    _get_environment_params, configure_nut_pegs, validate_action_representation,
+)
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
+
+
+class _TeeStream:
+    """Mirror text output to the terminal and an experiment log file."""
+
+    def __init__(self, terminal, log_file):
+        self.terminal = terminal
+        self.log_file = log_file
+
+    def write(self, text):
+        self.terminal.write(text)
+        self.log_file.write(text)
+        return len(text)
+
+    def flush(self):
+        self.terminal.flush()
+        self.log_file.flush()
+
+    def isatty(self):
+        return self.terminal.isatty()
+
+    def fileno(self):
+        return self.terminal.fileno()
+
+    @property
+    def encoding(self):
+        return self.terminal.encoding
 
 
 def _load_json_config(path: str | None) -> dict:
@@ -292,6 +329,29 @@ def _spawn_env_once(task_name: str, seed: int, idx: int,
     return idx, setting, params, vision
         
 
+def _build_vision_path_windows(
+    path_episodes,
+    horizon: int,
+    stride: int,
+    observation_horizon: int,
+    recorded_control_freq: int | float,
+    trajectory_control_freq: int | float,
+):
+    """Build image-path histories in the same order as trajectory windows."""
+    sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
+    windows = []
+    for paths in path_episodes:
+        max_start = len(paths) - (horizon - 1) * sample_step
+        for start in range(0, max_start, stride):
+            first_obs_idx = start - (observation_horizon - 1) * sample_step
+            indices = [
+                max(0, first_obs_idx + obs_i * sample_step)
+                for obs_i in range(observation_horizon)
+            ]
+            windows.append(paths[indices])
+    return np.asarray(windows, dtype=object)
+
+
 def train_and_eval_model(
     model_type: str,
     N: int,
@@ -356,9 +416,26 @@ def train_and_eval_model(
     latent_dim: int | None = None,
     latent_ae_latent_reg_weight: float = 1e-4,
     latent_ae_smoothness_weight: float = 1e-3,
+    latent_ae_latent_whiten_weight: float = 0.0,
+    latent_ae_latent_noise_std: float = 0.0,
     latent_hidden_dim: int = 256,
+    latent_num_layers: int = 4,
+    latent_residual: bool = False,
     action_representation: str | None = None,
+    observation_type: str = "state",
+    camera_names=None,
+    vision_batch_size: int = 128,
+    condition_embed_dim: int = 32,
+    vision_finetune: bool = False,
+    vision_encoder_lr_scale: float = 0.1,
 ):
+    observation_type = validate_observation_type(observation_type)
+    if vision_finetune and observation_type != "vision":
+        raise ValueError("vision_finetune=True requires observation_type=vision")
+    if vision_encoder_lr_scale <= 0:
+        raise ValueError(f"vision_encoder_lr_scale must be positive, got {vision_encoder_lr_scale}")
+    if vision_finetune and model_type != "DGFMv2":
+        raise ValueError("vision_finetune is currently supported for DGFMv2 training only")
     fm_class_map = {
         "UniformFM": UniformFM,
         "ShiftedFM": ShiftedFM,
@@ -379,6 +456,13 @@ def train_and_eval_model(
         os.makedirs(exp_dir, exist_ok=True)
     else:
         exp_dir = results_path
+
+    log_path = os.path.join(exp_dir, "training.log")
+    log_file = open(log_path, "a", buffering=1)
+    original_stdout, original_stderr = sys.stdout, sys.stderr
+    sys.stdout = _TeeStream(original_stdout, log_file)
+    sys.stderr = _TeeStream(original_stderr, log_file)
+    print(f"[Logging console output to {log_path}]")
 
     # load dataset
     with h5py.File(dataset_path, "r") as hf:
@@ -406,8 +490,27 @@ def train_and_eval_model(
         # read the first to get shapes/dtypes
         first = data_grp[selected_ep_keys[0]]
         traj0 = first["joint_angles"][:]                         # shape (T, dof)
-        param0 = first["environment_parameters"]["values"][:]    # shape (P,)
-        dyn0 = first["dynamic_states"][:] if "dynamic_states" in first else np.zeros((traj0.shape[0], 0), dtype=np.float32)
+        if observation_type == "state":
+            param0 = first["environment_parameters"]["values"][:]
+            environment_state_key = "environment_states" if "environment_states" in first else "dynamic_states"
+            dyn0 = first[environment_state_key][:] if environment_state_key in first else np.zeros((traj0.shape[0], 0), dtype=np.float32)
+        else:
+            stored_environment_state_key = (
+                "environment_states" if "environment_states" in first else "dynamic_states"
+            )
+            stored_environment_state_shape = (
+                tuple(first[stored_environment_state_key].shape)
+                if stored_environment_state_key in first else None
+            )
+            stored_static_shape = tuple(first["environment_parameters"]["values"].shape)
+            print(
+                "[dataset-schema] vision policy will ignore oracle datasets | "
+                f"joint_angles={tuple(traj0.shape)} | "
+                f"{stored_environment_state_key}={stored_environment_state_shape} | "
+                f"environment_parameters={stored_static_shape}"
+            )
+            param0 = np.zeros((0,), dtype=np.float32)
+            dyn0 = np.zeros((traj0.shape[0], 0), dtype=np.float32)
 
         full_len, dof = traj0.shape
         dyn_dim = dyn0.shape[1]
@@ -426,17 +529,63 @@ def train_and_eval_model(
         data_trajectories = []
         data_dynamic = []
         data_static_env = []
+        data_image_paths = []
+        dataset_camera_names = []
+        if observation_type == "vision":
+            dataset_observation_type = hf["meta"].attrs.get("observation_type", "state")
+            if isinstance(dataset_observation_type, bytes):
+                dataset_observation_type = dataset_observation_type.decode("utf-8")
+            if dataset_observation_type != "vision":
+                raise ValueError("observation_type=vision requires a dataset generated with --vision")
+            stored_cameras = hf["meta"].attrs.get("camera_names", DEFAULT_VISION_CAMERAS)
+            dataset_camera_names = [
+                value.decode("utf-8") if isinstance(value, bytes) else str(value)
+                for value in stored_cameras
+            ]
+            if camera_names is not None and tuple(camera_names) != tuple(dataset_camera_names):
+                raise ValueError(
+                    f"Requested cameras {camera_names} do not match dataset cameras {dataset_camera_names}"
+                )
+            camera_names = dataset_camera_names
+
         # fill
         for i, ep in enumerate(selected_ep_keys):
             grp = data_grp[ep]
             q_ep = grp["joint_angles"][:]
             data_trajectories.append(q_ep)
-            if "dynamic_states" in grp:
-                data_dynamic.append(grp["dynamic_states"][:])
+            if observation_type == "state":
+                environment_state_key = "environment_states" if "environment_states" in grp else "dynamic_states"
+                if environment_state_key in grp:
+                    data_dynamic.append(grp[environment_state_key][:])
+                else:
+                    data_dynamic.append(np.zeros((q_ep.shape[0], dyn_dim), dtype=np.float32))
+                data_static_env.append(grp["environment_parameters"]["values"][:])
             else:
-                data_dynamic.append(np.zeros((q_ep.shape[0], dyn_dim), dtype=np.float32))
-            data_static_env.append(grp["environment_parameters"]["values"][:])
+                data_dynamic.append(np.zeros((q_ep.shape[0], 0), dtype=np.float32))
+                data_static_env.append(np.zeros((0,), dtype=np.float32))
+            if observation_type == "vision":
+                if "image_paths" not in grp:
+                    raise ValueError(f"Episode {ep} is missing image_paths")
+                data_image_paths.append(load_camera_path_matrix(grp["image_paths"], camera_names))
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
+        state_param_len = (
+            observation_horizon * dof
+            if observation_type == "vision"
+            else observation_horizon * (dof + dyn_dim) + param0.shape[0]
+        )
+        vision_encoder = None
+        vision_features = None
+        if observation_type == "vision":
+            vision_encoder = FrozenResNet18Encoder(camera_names, finetune=vision_finetune)
+            print(
+                "[vision-input] oracle environment data disabled | "
+                f"joint_dof={dof} | observation_horizon={observation_horizon} | "
+                f"cameras={camera_names} | image_paths_episodes={len(data_image_paths)}"
+            )
+            vision_features = encode_image_path_episodes(
+                data_image_paths, os.path.dirname(os.path.abspath(dataset_path)),
+                vision_encoder, device, batch_size=vision_batch_size, verbose=True,
+            )
 
         window_traj, window_cond = build_state_conditioned_windows(
             data_trajectories,
@@ -447,7 +596,52 @@ def train_and_eval_model(
             recorded_control_freq=recorded_control_freq,
             trajectory_control_freq=trajectory_control_freq,
             observation_horizon=observation_horizon,
+            vision_features=vision_features,
+            observation_type=observation_type,
         )
+        vision_window_paths = None
+        if observation_type == "vision" and vision_finetune:
+            vision_window_paths = _build_vision_path_windows(
+                data_image_paths, seq_len, window_stride, observation_horizon,
+                recorded_control_freq, trajectory_control_freq,
+            )
+            if len(vision_window_paths) != len(window_traj):
+                raise ValueError(
+                    f"Vision path windows {len(vision_window_paths)} != trajectory windows {len(window_traj)}"
+                )
+        vision_feature_dim = 0 if vision_encoder is None else vision_encoder.output_dim
+        if observation_type == "vision":
+            expected_condition_dim = observation_horizon * (dof + vision_feature_dim)
+            condition_components = {
+                "joint_history": observation_horizon * dof,
+                "vision_history": observation_horizon * vision_feature_dim,
+                "environment_state_history": 0,
+                "static_environment_params": 0,
+            }
+        else:
+            expected_condition_dim = observation_horizon * (dof + dyn_dim) + param0.shape[0]
+            condition_components = {
+                "joint_history": observation_horizon * dof,
+                "environment_state_history": observation_horizon * dyn_dim,
+                "static_environment_params": param0.shape[0],
+                "vision_history": 0,
+            }
+        print(
+            f"[window-build] window_traj_shape={tuple(window_traj.shape)} | "
+            f"window_cond_shape={tuple(window_cond.shape)}"
+        )
+        print(
+            f"[window-build] condition_components={condition_components} | "
+            f"expected_condition_dim={expected_condition_dim} | "
+            f"actual_condition_dim={window_cond.shape[1]}"
+        )
+        if window_cond.shape[1] != expected_condition_dim:
+            raise ValueError(
+                "Condition schema mismatch: unexpected data entered window_cond; "
+                f"expected {expected_condition_dim}, got {window_cond.shape[1]}"
+            )
+        if not np.all(np.isfinite(window_traj)) or not np.all(np.isfinite(window_cond)):
+            raise ValueError("Non-finite values found in window_traj or window_cond")
         normalization_stats = _fit_joint_normalization_stats(window_traj) if normalize_data else None
         if normalize_data:
             print(
@@ -469,6 +663,8 @@ def train_and_eval_model(
     perm_idx = torch.randperm(data_trajectories.shape[0], device=device)
     target_trajectories = data_trajectories[perm_idx]
     env_params = data_env_params[perm_idx]
+    if vision_window_paths is not None:
+        vision_window_paths = vision_window_paths[perm_idx.detach().cpu().numpy()]
     train_N = target_trajectories.shape[0]
 
     # obtain gripper indexes
@@ -489,8 +685,10 @@ def train_and_eval_model(
     # define models
     print(
         "[config] "
-        f"model_type={model_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
+        f"model_type={model_type} | observation_type={observation_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
+        f"condition_embed_dim={condition_embed_dim} | "
+        f"vision_finetune={vision_finetune} | vision_encoder_lr_scale={vision_encoder_lr_scale} | "
         f"num_convs_per_block={num_convs_per_block} | "
         f"horizon_arg={horizon} | executed_horizon={executed_horizon} | window_stride={window_stride} | "
         f"recorded_control_freq={recorded_control_freq} | "
@@ -507,6 +705,7 @@ def train_and_eval_model(
         f"normalize_data={normalize_data} | normalization_stats={normalization_stats is not None} | "
         f"use_ema={use_ema} | action_representation={action_representation} | "
         f"latent_dim={latent_dim_value} | latent_hidden_dim={latent_hidden_dim} | "
+        f"latent_num_layers={latent_num_layers} | latent_residual={latent_residual} | "
         f"eval_fresh={eval_fresh} | seed={seed} | device={device}"
     )
     model = None
@@ -514,7 +713,13 @@ def train_and_eval_model(
     if model_type == "LatentFM":
         resolved_latent_dim = latent_dim_value
         autoencoder = TrajectoryAutoencoder(seq_len, dof, resolved_latent_dim, hidden_dim=latent_hidden_dim).to(device)
-        model = LatentVectorField(resolved_latent_dim, param_len, hidden_dim=latent_hidden_dim).to(device)
+        model = LatentVectorField(
+            resolved_latent_dim,
+            param_len,
+            hidden_dim=latent_hidden_dim,
+            num_layers=latent_num_layers,
+            residual=latent_residual,
+        ).to(device)
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
@@ -550,10 +755,37 @@ def train_and_eval_model(
             ae_max_epochs=latent_ae_epochs,
             ae_latent_reg_weight=latent_ae_latent_reg_weight,
             ae_smoothness_weight=latent_ae_smoothness_weight,
+            ae_latent_whiten_weight=latent_ae_latent_whiten_weight,
+            ae_latent_noise_std=latent_ae_latent_noise_std,
         )
     elif model_type in fm_class_map or model_type == "DP":
-        model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx, num_convs_per_block=num_convs_per_block).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        model = VectorField(
+            seq_len, dof, param_len, gripper_idx=gripper_idx,
+            num_convs_per_block=num_convs_per_block,
+            observation_type=observation_type,
+            condition_embed_dim=condition_embed_dim,
+        ).to(device)
+        if vision_finetune:
+            model.vision_encoder = vision_encoder
+            policy_parameters = [
+                parameter for name, parameter in model.named_parameters()
+                if not name.startswith("vision_encoder.")
+            ]
+            encoder_parameters = list(vision_encoder.trainable_parameters())
+            optimizer = optim.Adam(
+                [
+                    {"params": policy_parameters, "lr": learning_rate},
+                    {"params": encoder_parameters, "lr": learning_rate * vision_encoder_lr_scale},
+                ],
+                weight_decay=weight_decay,
+            )
+            print(
+                "[vision-finetune] trainable=backbone.layer4 | "
+                f"policy_lr={learning_rate} | encoder_lr={learning_rate * vision_encoder_lr_scale} | "
+                f"encoder_parameters={sum(p.numel() for p in encoder_parameters)}"
+            )
+        else:
+            optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
             optimizer=optimizer,
             warmup_epochs=warmup_steps,
@@ -610,6 +842,29 @@ def train_and_eval_model(
 
     if flow is not None:
         flow.action_representation = action_representation
+
+    for observation_owner in (model, flow):
+        if observation_owner is None:
+            continue
+        observation_owner.observation_type = observation_type
+        observation_owner.camera_names = tuple(camera_names or DEFAULT_VISION_CAMERAS)
+        observation_owner.state_condition_dim = state_param_len
+        if not (vision_finetune and observation_owner is model):
+            object.__setattr__(observation_owner, "vision_encoder", vision_encoder)
+        observation_owner.vision_image_height = DEFAULT_VISION_HEIGHT
+        observation_owner.vision_image_width = DEFAULT_VISION_WIDTH
+
+    if vision_finetune and flow is not None:
+        dataset_dir = os.path.dirname(os.path.abspath(dataset_path))
+
+        def vision_condition_fn(indices, base_conditions):
+            path_batch = vision_window_paths[indices.detach().cpu().numpy()]
+            vision_condition = encode_image_path_windows(
+                path_batch, dataset_dir, model.vision_encoder, device
+            )
+            return torch.cat([base_conditions[:, :state_param_len], vision_condition], dim=1)
+
+        flow.vision_condition_fn = vision_condition_fn
 
     # train model
     print(
@@ -709,7 +964,13 @@ def train_and_eval_model(
         if model_type == "LatentFM":
             resolved_latent_dim = latent_dim_value
             autoencoder = TrajectoryAutoencoder(seq_len, dof, resolved_latent_dim, hidden_dim=latent_hidden_dim).to(device)
-            latent_model = LatentVectorField(resolved_latent_dim, param_len, hidden_dim=latent_hidden_dim).to(device)
+            latent_model = LatentVectorField(
+                resolved_latent_dim,
+                param_len,
+                hidden_dim=latent_hidden_dim,
+                num_layers=latent_num_layers,
+                residual=latent_residual,
+            ).to(device)
             best_model = LatentFlowPolicy(
                 autoencoder,
                 latent_model,
@@ -720,7 +981,14 @@ def train_and_eval_model(
                 device=device,
             ).to(device)
         else:
-            best_model = VectorField(seq_len, dof, param_len, gripper_idx=gripper_idx, num_convs_per_block=num_convs_per_block).to(device)
+            best_model = VectorField(
+                seq_len, dof, param_len, gripper_idx=gripper_idx,
+                num_convs_per_block=num_convs_per_block,
+                observation_type=observation_type,
+                condition_embed_dim=condition_embed_dim,
+            ).to(device)
+            if vision_finetune:
+                best_model.vision_encoder = vision_encoder
         try:
             best_model.load_state_dict(state)
         except RuntimeError as exc:
@@ -732,6 +1000,15 @@ def train_and_eval_model(
                 ) from exc
             raise
         best_model.eval()
+
+    if best_model is not None:
+        best_model.observation_type = observation_type
+        best_model.camera_names = tuple(camera_names or DEFAULT_VISION_CAMERAS)
+        best_model.state_condition_dim = state_param_len
+        if not vision_finetune:
+            object.__setattr__(best_model, "vision_encoder", vision_encoder)
+        best_model.vision_image_height = DEFAULT_VISION_HEIGHT
+        best_model.vision_image_width = DEFAULT_VISION_WIDTH
 
     def _summarize_validation_records(records: dict) -> tuple[float, float, int, float]:
         if not records:
@@ -779,7 +1056,11 @@ def train_and_eval_model(
             for fut in as_completed(futs):
                 idx, setting, params, _ = fut.result() # vision not used for training+evaluation
                 env_settings_all[idx] = setting
-                env_params_list[idx]  = params
+                env_params_list[idx] = (
+                    np.zeros((0,), dtype=np.float32)
+                    if observation_type == "vision"
+                    else params
+                )
 
         # stack to (N, Dc) float32 (order matches idx)
         eval_params = np.asarray(env_params_list, dtype=np.float32)
@@ -897,11 +1178,24 @@ def train_and_eval_model(
             "latent_ae_epochs": latent_ae_epochs if model_type == "LatentFM" else None,
             "latent_ae_latent_reg_weight": latent_ae_latent_reg_weight if model_type == "LatentFM" else None,
             "latent_ae_smoothness_weight": latent_ae_smoothness_weight if model_type == "LatentFM" else None,
+            "latent_ae_latent_whiten_weight": latent_ae_latent_whiten_weight if model_type == "LatentFM" else None,
+            "latent_ae_latent_noise_std": latent_ae_latent_noise_std if model_type == "LatentFM" else None,
             "latent_hidden_dim": latent_hidden_dim if model_type == "LatentFM" else None,
+            "latent_num_layers": latent_num_layers if model_type == "LatentFM" else None,
+            "latent_residual": latent_residual if model_type == "LatentFM" else None,
             "eval_fresh": eval_fresh,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
             "observation_horizon": observation_horizon,
+            "observation_type": observation_type,
+            "camera_names": list(camera_names or []),
+            "vision_encoder": (
+                "imagenet_resnet18_layer4_finetuned" if vision_finetune
+                else "frozen_imagenet_resnet18"
+            ) if observation_type == "vision" else None,
+            "vision_finetune": vision_finetune,
+            "vision_encoder_lr_scale": vision_encoder_lr_scale,
+            "condition_embed_dim": condition_embed_dim,
             "task_name":       task_name,
             "num_convs_per_block": num_convs_per_block,
             "n_t":             n_t,
@@ -1013,6 +1307,11 @@ def train_and_eval_model(
             "eval_fresh": eval_fresh,
             "normalize_data": normalize_data,
             "action_representation": action_representation,
+            "observation_type": observation_type,
+            "camera_names": list(camera_names or []),
+            "condition_embed_dim": condition_embed_dim,
+            "vision_finetune": vision_finetune,
+            "vision_encoder_lr_scale": vision_encoder_lr_scale,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "num_convs_per_block": num_convs_per_block,
         }
@@ -1020,6 +1319,11 @@ def train_and_eval_model(
             json.dump(output, f, indent=2)
         print(f"[saved results to {json_path}]")
 
+    print(f"[Training log saved to {log_path}]")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stdout, sys.stderr = original_stdout, original_stderr
+    log_file.close()
     return best_model, recs
 
 
@@ -1066,6 +1370,16 @@ if __name__ == "__main__":
     parser.add_argument("--trajectory_control_freq", type=float, default=20)
     parser.add_argument("--max_policy_steps", type=int, default=20)
     parser.add_argument("--observation_horizon", type=int, default=2)
+    parser.add_argument("--observation_type", choices=["state", "vision"], default="state")
+    parser.add_argument("--camera_names", nargs="+", default=None,
+                        help="Must match camera_names stored in a vision dataset")
+    parser.add_argument("--vision_batch_size", type=int, default=128)
+    parser.add_argument("--condition_embed_dim", type=int, default=32,
+                        help="Width of the trajectory-model condition encoder. Must match the checkpoint at evaluation time.")
+    parser.add_argument("--vision_finetune", action=argparse.BooleanOptionalAction, default=False,
+                        help="Fine-tune both residual blocks in the final ResNet-18 stage during vision-policy training.")
+    parser.add_argument("--vision_encoder_lr_scale", type=float, default=0.1,
+                        help="Vision encoder learning rate as a fraction of the policy learning rate.")
     parser.add_argument("--cluster_partition", type=int, default=5)
     parser.add_argument("--cluster_jaccard_thresh", type=float, default=0.8)
     parser.add_argument("--cluster_merge_k", type=int, default=10)
@@ -1106,8 +1420,16 @@ if __name__ == "__main__":
                         help="LatentFM autoencoder latent L2 regularization weight.")
     parser.add_argument("--latent_ae_smoothness_weight", type=float, default=1e-3,
                         help="LatentFM autoencoder decoded-trajectory smoothness regularization weight.")
+    parser.add_argument("--latent_ae_latent_whiten_weight", type=float, default=0.0,
+                        help="LatentFM autoencoder latent covariance whitening regularization weight.")
+    parser.add_argument("--latent_ae_latent_noise_std", type=float, default=0.0,
+                        help="Stddev of latent noise used for LatentFM autoencoder denoising reconstruction.")
     parser.add_argument("--latent_hidden_dim", type=int, default=256,
                         help="Hidden dimension for LatentFM autoencoder and latent vector field MLPs.")
+    parser.add_argument("--latent_num_layers", type=int, default=4,
+                        help="Number of MLP layers in the LatentFM vector field.")
+    parser.add_argument("--latent_residual", action=argparse.BooleanOptionalAction, default=False,
+                        help="Use residual LayerNorm MLP blocks in the LatentFM vector field.")
     parser.add_argument("--action_representation", type=str, default=None,
                         choices=["joint_space", "task_space"],
                         help="Policy trajectory representation. Defaults to the dataset metadata, or joint_space for old datasets.")
@@ -1138,7 +1460,10 @@ if __name__ == "__main__":
 
     dataset_path = args.dataset_path
     if dataset_path is None:
-        dataset_path = os.path.join(DEFAULT_DATASET_DIR, f"{args.task_name}_dataset_{args.N}.hdf5")
+        dataset_path = os.path.join(
+            DEFAULT_DATASET_DIR,
+            f"{args.task_name}_joint_space_dataset_{args.N}{'_vision' if args.observation_type == 'vision' else ''}.hdf5",
+        )
 
     train_and_eval_model(
         model_type         = args.model_type,
@@ -1172,6 +1497,12 @@ if __name__ == "__main__":
         trajectory_control_freq = args.trajectory_control_freq,
         max_policy_steps   = args.max_policy_steps,
         observation_horizon = args.observation_horizon,
+        observation_type   = args.observation_type,
+        camera_names       = args.camera_names,
+        vision_batch_size  = args.vision_batch_size,
+        condition_embed_dim = args.condition_embed_dim,
+        vision_finetune     = args.vision_finetune,
+        vision_encoder_lr_scale = args.vision_encoder_lr_scale,
         cluster_partition  = args.cluster_partition,
         cluster_jaccard_thresh = args.cluster_jaccard_thresh,
         cluster_merge_k    = args.cluster_merge_k,
@@ -1204,6 +1535,10 @@ if __name__ == "__main__":
         latent_dim         = args.latent_dim,
         latent_ae_latent_reg_weight = args.latent_ae_latent_reg_weight,
         latent_ae_smoothness_weight = args.latent_ae_smoothness_weight,
+        latent_ae_latent_whiten_weight = args.latent_ae_latent_whiten_weight,
+        latent_ae_latent_noise_std = args.latent_ae_latent_noise_std,
         latent_hidden_dim  = args.latent_hidden_dim,
+        latent_num_layers  = args.latent_num_layers,
+        latent_residual    = args.latent_residual,
         action_representation = args.action_representation,
     )

@@ -252,6 +252,8 @@ class VectorField(nn.Module):
         time_embed_dim: int = 32,
         time_scale: float = 100.0,
         num_convs_per_block: int = 1,
+        observation_type: str = "state",
+        condition_embed_dim: int = 32,
     ):
         super().__init__()
         self.seq_len = seq_len
@@ -259,6 +261,12 @@ class VectorField(nn.Module):
         self.param_len = param_len
         self.time_scale = float(time_scale)
         self.num_convs_per_block = int(num_convs_per_block)
+        self.observation_type = observation_type
+        self.condition_embed_dim = int(condition_embed_dim)
+        if self.condition_embed_dim <= 0:
+            raise ValueError(
+                f"condition_embed_dim must be positive, got {self.condition_embed_dim}"
+            )
 
         if gripper_idx is None:
             gripper_idx = []
@@ -292,7 +300,7 @@ class VectorField(nn.Module):
         )
         """
 
-        self.param_embed_dim = 32
+        self.param_embed_dim = self.condition_embed_dim
         self.param_embed = nn.Sequential(
             nn.Linear(param_len, self.param_embed_dim),
             nn.Mish(),

@@ -6,7 +6,9 @@ from typing import List, Dict, Tuple
 from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_slerp, quat_multiply, quat_inverse
-from Robot_simulation.environments.heuristics_util import get_dynamic_state
+from Robot_simulation.environments.heuristics_util import (
+    DEFAULT_VISION_CAMERAS, capture_camera_views, get_environment_state,
+)
 
 
 def generate_two_arm_trajectory(
@@ -15,6 +17,10 @@ def generate_two_arm_trajectory(
     render: bool = False,
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
+    save_video: bool = True,
+    camera_names=DEFAULT_VISION_CAMERAS,
+    image_width: int = 224,
+    image_height: int = 224,
 ) -> Tuple[np.ndarray, bool, List[np.ndarray], np.ndarray, Dict[str, np.ndarray]]:
     """
     Heuristic trajectory generator for TwoArmLift, return the **joint-angle trajectory**.
@@ -41,10 +47,11 @@ def generate_two_arm_trajectory(
     """
 
     # ---------- storage ----------
-    q_traj, frames = [], []
+    q_traj = []
+    frames = {name: [] for name in camera_names}
     gripper_traj = []
     eef_traj = []
-    dynamic_traj = []
+    environment_state_traj = []
 
     # ---------- reset & indices ----------
     env.reset()
@@ -93,7 +100,12 @@ def generate_two_arm_trajectory(
             mat2quat(env.sim.data.site_xmat[eefR].reshape(3, 3)),
         ]).astype(np.float32))
         # TODO(two_arm): Replace empty placeholder with pot / handle dynamic state.
-        dynamic_traj.append(get_dynamic_state(env, "two_arm"))
+        environment_state_traj.append(get_environment_state(env, "two_arm"))
+        if render:
+            for name, image in capture_camera_views(
+                env, camera_names, image_width, image_height
+            ).items():
+                frames[name].append(image)
 
     # ---------- begin recording ----------
     record_q()
@@ -160,9 +172,6 @@ def generate_two_arm_trajectory(
 
         env.step(a)
         record_q()
-        if render and frames is not None:
-            img = env.sim.render(640, 480, camera_name="frontview")
-            frames.append(np.flipud(img))
     # ---------- PHASE1‑2: 30-step descend to handle ----------
     gripper_pose = np.array([1.0, 1.0], dtype=np.float32)
     for _ in range(30):
@@ -175,9 +184,6 @@ def generate_two_arm_trajectory(
         a[13] = -1
         env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frames.append(np.flipud(img))
 
     # ---------- PHASE2: 10-step grasping handle ----------
     gripper_pose = np.array([0.0, 0.0], dtype=np.float32)
@@ -188,9 +194,6 @@ def generate_two_arm_trajectory(
         a[13] = 1.0
         _, _, _, _ = env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frames.append(np.flipud(img))
 
     # ---------- PHASE3: (lift_steps)-step lifting the pot ----------
     gripper_pose = np.array([0.0, 0.0], dtype=np.float32)
@@ -241,17 +244,14 @@ def generate_two_arm_trajectory(
 
         env.step(a)
         record_q()
-        if render:
-            img = env.sim.render(640,480, camera_name="frontview")
-            frames.append(np.flipud(img))
 
     success = env._check_success()
 
     # ---------- optionally save frontview videos ----------
-    if render:
+    if render and save_video:
         os.makedirs(video_folder, exist_ok=True)
         path = os.path.join(video_folder, "two_arm_lift_frontview.mp4")
-        imageio.mimsave(path, frames, fps=env.control_freq)
+        imageio.mimsave(path, frames[camera_names[0]], fps=env.control_freq)
         if verbose:
             print(f"Saved video to {path}")
 
@@ -262,7 +262,7 @@ def generate_two_arm_trajectory(
         init_qpos,
         env_setting,
         environment_parameters,
-        np.stack(dynamic_traj, axis=0),
+        np.stack(environment_state_traj, axis=0),
         np.stack(gripper_traj, axis=0),
         np.stack(eef_traj, axis=0),
     )
