@@ -11,6 +11,27 @@ import torch
 import torch.nn as nn
 
 
+_IMAGE_CACHE: dict[str, np.ndarray] = {}
+
+
+def _resolve_image_path(path: str, dataset_dir: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(dataset_dir, path)
+
+
+def _read_rgb_image(path: str, dataset_dir: str, cache_images: bool = False) -> np.ndarray:
+    full_path = _resolve_image_path(path, dataset_dir)
+    if cache_images and full_path in _IMAGE_CACHE:
+        return _IMAGE_CACHE[full_path]
+    image = np.asarray(imageio.imread(full_path)[..., :3], dtype=np.uint8).copy()
+    if cache_images:
+        _IMAGE_CACHE[full_path] = image
+    return image
+
+
+def image_cache_size() -> int:
+    return len(_IMAGE_CACHE)
+
+
 
 class _BasicBlock(nn.Module):
     expansion = 1
@@ -199,6 +220,7 @@ def encode_image_path_windows(
     dataset_dir: str,
     encoder: FrozenResNet18Encoder,
     device: torch.device | str,
+    cache_images: bool = True,
 ) -> torch.Tensor:
     """Differentiably encode image windows shaped (B, observation_horizon, views)."""
     paths = np.asarray(path_windows, dtype=object)
@@ -209,9 +231,7 @@ def encode_image_path_windows(
         raise ValueError(f"Expected {len(encoder.camera_names)} views, got {num_views}")
     images = np.stack([
         np.stack([
-            imageio.imread(
-                path if os.path.isabs(path) else os.path.join(dataset_dir, path)
-            )[..., :3]
+            _read_rgb_image(path, dataset_dir, cache_images)
             for path in row
         ], axis=0)
         for row in paths.reshape(-1, num_views)
@@ -228,6 +248,7 @@ def encode_image_path_episodes(
     device: torch.device | str,
     batch_size: int = 128,
     verbose: bool = False,
+    cache_images: bool = False,
 ) -> list[np.ndarray]:
     """Load external images and return one (T, V*512) feature array per episode."""
     encoder = encoder.to(device).eval()
@@ -252,9 +273,7 @@ def encode_image_path_episodes(
             rows = path_matrix[start:start + batch_size]
             images = np.stack([
                 np.stack([
-                    imageio.imread(
-                        path if os.path.isabs(path) else os.path.join(dataset_dir, path)
-                    )[..., :3]
+                    _read_rgb_image(path, dataset_dir, cache_images)
                     for path in row
                 ], axis=0)
                 for row in rows
@@ -271,7 +290,7 @@ def encode_image_path_episodes(
         feature_shapes = sorted({tuple(features.shape[1:]) for features in outputs})
         print(
             f"[vision-encode] complete | episode_feature_shapes={feature_shapes} | "
-            f"encoded_frames={sum(len(features) for features in outputs)}"
+            f"encoded_frames={sum(len(features) for features in outputs)} | image_cache_size={image_cache_size()}"
         )
     return outputs
 

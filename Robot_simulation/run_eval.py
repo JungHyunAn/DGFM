@@ -587,7 +587,7 @@ def train_and_eval_model(
             )
             vision_features = encode_image_path_episodes(
                 data_image_paths, os.path.dirname(os.path.abspath(dataset_path)),
-                vision_encoder, device, batch_size=vision_batch_size, verbose=True,
+                vision_encoder, device, batch_size=vision_batch_size, verbose=True, cache_images=vision_finetune,
             )
 
         window_traj, window_cond = build_state_conditioned_windows(
