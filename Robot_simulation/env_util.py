@@ -310,6 +310,11 @@ def _state_policy_env_worker(
     env = None
     executed = []
     try:
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+        os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+        os.environ.setdefault("MUJOCO_GL", "egl")
+        os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
         env = make_env(
             task_name,
             use_joint_control=(action_representation == "joint_space"),
@@ -586,7 +591,7 @@ def _run_flow_batched(
         x0 = torch.from_numpy(rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
         c = torch.from_numpy(cond_batch[s:e].astype(np.float32)).to(device)
         if use_cuda:
-            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            with torch.inference_mode():
                 q_low = flow.run_flow(x0, c, n_steps=flow_steps)
             q_np = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
             out[s:e] = _clip_policy_gripper_dims(q_np, task_name)
@@ -762,6 +767,9 @@ def _rollout_state_policy_synchronized(
     image_width = int(getattr(model, "vision_image_width", DEFAULT_VISION_WIDTH))
     if observation_type == "vision" and vision_encoder is None:
         raise ValueError("Vision-conditioned rollout is missing its vision_encoder")
+    if observation_type == "vision":
+        vision_workers = int(os.getenv("VISION_EVAL_WORKERS", "10"))
+        num_workers = max(1, min(num_workers, vision_workers))
 
     rng = np.random.RandomState(base_seed)
     total_success = 0
@@ -812,7 +820,17 @@ def _rollout_state_policy_synchronized(
             for idx in list(active):
                 if idx in pending_conditions:
                     continue
-                msg = conns[idx].recv()
+                try:
+                    msg = conns[idx].recv()
+                except EOFError as exc:
+                    proc = procs[idx]
+                    proc.join(timeout=0.1)
+                    raise RuntimeError(
+                        f"State rollout worker {idx} closed its pipe before sending a message; "
+                        f"exitcode={proc.exitcode}. For vision rollouts this often means the "
+                        "offscreen renderer crashed. Try VISION_EVAL_WORKERS=1 or check "
+                        "MUJOCO_GL/PYOPENGL_PLATFORM."
+                    ) from exc
                 mtype = msg.get("type")
                 if mtype == "cond":
                     pending_conditions[idx] = msg
@@ -1052,7 +1070,7 @@ def eval_model(
                 x0 = torch.from_numpy(np_rng.randn(trials, seq_len, dof).astype(np.float32)).to(device)
                 c = torch.from_numpy(val_params).to(device)
                 if use_cuda:
-                    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                    with torch.inference_mode():
                         q_low = flow.run_flow(x0, c)
                     q_low_all[:] = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
                     del q_low
@@ -1068,7 +1086,7 @@ def eval_model(
                     x0 = torch.from_numpy(np_rng.randn(bs, seq_len, dof).astype(np.float32)).to(device)
                     c = torch.from_numpy(val_params[s:e]).to(device)
                     if use_cuda:
-                        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                        with torch.inference_mode():
                             q_low = flow.run_flow(x0, c)
                         q_low_all[s:e] = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
                         del q_low
@@ -1112,7 +1130,7 @@ def eval_model(
             c = torch.from_numpy(val_params).to(device)
 
             if use_cuda:
-                with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                with torch.inference_mode():
                     q_low = flow.run_flow(x0, c)
                 q_low_all[:] = _maybe_denormalize_policy_data(q_low.float().cpu().numpy(), normalization_stats)
                 del q_low

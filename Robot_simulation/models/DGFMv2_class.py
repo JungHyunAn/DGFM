@@ -237,7 +237,7 @@ class DGFMv2(DGFM):
         xr = x.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
         yr = y.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
         zr = z.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
-        cr = c.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
+        cr = c.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, c.shape[-1])
         source_idx = idx.unsqueeze(1).expand(-1, n_t).reshape(-1)
 
         a, b, cc, a_dot, b_dot, c_dot = self._path_weights(t, interpolation_path)
@@ -365,6 +365,9 @@ class DGFMv2(DGFM):
 
             for epoch in tqdm(range(1, max_epochs + 1), desc="DGFMv2 Training", unit="epoch"):
                 self.model.train()
+                vision_epoch_hook = getattr(self, "vision_epoch_hook", None)
+                if vision_epoch_hook is not None:
+                    vision_epoch_hook(epoch)
                 perm_t = torch.randperm(N, device=self.device)
 
                 XT, TIN, VT, CT, SOURCE_IDX = self._build_joint_interpolants(
@@ -402,6 +405,9 @@ class DGFMv2(DGFM):
 
                         self.optimizer.zero_grad()
                         loss.backward()
+                        vision_after_backward_hook = getattr(self, "vision_after_backward_hook", None)
+                        if vision_after_backward_hook is not None:
+                            vision_after_backward_hook()
                         self.optimizer.step()
 
                         loss_sum += float(loss.item())

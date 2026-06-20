@@ -480,6 +480,9 @@ class VanillaFM:
             conditions = conditions.to(self.device)
             for epoch in tqdm(range(1, max_epochs + 1), desc=f"{self.time_sampling.title()}FM Training", unit="epoch"):
                 self.model.train()
+                vision_epoch_hook = getattr(self, "vision_epoch_hook", None)
+                if vision_epoch_hook is not None:
+                    vision_epoch_hook(epoch)
                 perm_t = torch.randperm(N, device=self.device)
                 loss_sum = 0.0
                 for i in range(0, N, batch_size):
@@ -507,6 +510,9 @@ class VanillaFM:
 
                     self.optimizer.zero_grad()
                     loss.backward()
+                    vision_after_backward_hook = getattr(self, "vision_after_backward_hook", None)
+                    if vision_after_backward_hook is not None:
+                        vision_after_backward_hook()
                     self.optimizer.step()
                     self._step_ema()
                     loss_sum += float(loss.item())

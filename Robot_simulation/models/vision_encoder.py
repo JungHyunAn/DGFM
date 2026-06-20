@@ -9,6 +9,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 _IMAGE_CACHE: dict[str, np.ndarray] = {}
@@ -88,12 +89,16 @@ class _ResNet18(nn.Module):
         layers.extend(_BasicBlock(out_channels, out_channels) for _ in range(1, blocks))
         return nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_features(self, x: torch.Tensor) -> torch.Tensor:
         x = self.maxpool(self.relu(self.bn1(self.conv1(x))))
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.forward_features(x)
         x = self.avgpool(x)
         return self.fc(torch.flatten(x, 1))
 
@@ -112,6 +117,9 @@ def _make_resnet18(pretrained: bool) -> nn.Module:
     return model
 
 OBSERVATION_TYPES = ("state", "vision")
+VISION_FINETUNE_MODES = ("frozen", "layer4", "layer3_layer4", "all")
+VISION_POOL_TYPES = ("avg", "spatial_softmax")
+VISION_FEATURE_NORMS = ("none", "layernorm")
 
 
 def validate_observation_type(observation_type: str) -> str:
@@ -125,18 +133,73 @@ def validate_observation_type(observation_type: str) -> str:
 class FrozenResNet18Encoder(nn.Module):
     """Encode RGB views with a frozen or partially fine-tuned ResNet-18."""
 
-    feature_dim = 512
+    backbone_feature_dim = 512
 
     def __init__(
         self,
         camera_names: Sequence[str],
         pretrained: bool = True,
         finetune: bool = False,
+        finetune_mode: str | None = None,
+        train_bn: bool = False,
+        pool: str = "avg",
+        spatial_softmax_temperature: float = 1.0,
+        feature_proj_dim: int = 0,
+        feature_norm: str = "none",
+        augmentation: bool = False,
+        random_shift: int = 4,
+        color_jitter: float = 0.1,
     ):
         super().__init__()
         self.camera_names = tuple(camera_names)
+        if finetune_mode is None:
+            finetune_mode = "layer4" if finetune else "frozen"
+        if finetune_mode not in VISION_FINETUNE_MODES:
+            raise ValueError(
+                f"Unsupported finetune_mode={finetune_mode!r}; expected one of {VISION_FINETUNE_MODES}"
+            )
+        if pool not in VISION_POOL_TYPES:
+            raise ValueError(f"Unsupported pool={pool!r}; expected one of {VISION_POOL_TYPES}")
+        if feature_norm not in VISION_FEATURE_NORMS:
+            raise ValueError(
+                f"Unsupported feature_norm={feature_norm!r}; expected one of {VISION_FEATURE_NORMS}"
+            )
+        if spatial_softmax_temperature <= 0:
+            raise ValueError("spatial_softmax_temperature must be positive")
+        if feature_proj_dim < 0:
+            raise ValueError("feature_proj_dim must be non-negative")
+        if random_shift < 0:
+            raise ValueError("random_shift must be non-negative")
+        if color_jitter < 0:
+            raise ValueError("color_jitter must be non-negative")
+
         self.backbone = _make_resnet18(pretrained)
-        self.finetune = bool(finetune)
+        self.finetune_mode = finetune_mode
+        self.finetune = finetune_mode != "frozen"
+        self.train_bn = bool(train_bn)
+        self.pool = pool
+        self.spatial_softmax_temperature = float(spatial_softmax_temperature)
+        self.feature_proj_dim = int(feature_proj_dim)
+        self.feature_norm = feature_norm
+        self.augmentation = bool(augmentation)
+        self.random_shift = int(random_shift)
+        self.color_jitter = float(color_jitter)
+        self.raw_feature_dim = 1024 if self.pool == "spatial_softmax" else self.backbone_feature_dim
+        if self.feature_proj_dim > 0:
+            self.feature_dim = self.feature_proj_dim
+            self.projection_head = nn.Sequential(
+                nn.Linear(self.raw_feature_dim, self.feature_proj_dim),
+                nn.LayerNorm(self.feature_proj_dim),
+                nn.Mish(),
+                nn.Linear(self.feature_proj_dim, self.feature_proj_dim),
+            )
+            self.feature_norm_layer = nn.Identity()
+        else:
+            self.feature_dim = self.raw_feature_dim
+            self.projection_head = nn.Identity()
+            self.feature_norm_layer = (
+                nn.LayerNorm(self.feature_dim) if self.feature_norm == "layernorm" else nn.Identity()
+            )
         self.register_buffer(
             "image_mean",
             torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
@@ -147,26 +210,86 @@ class FrozenResNet18Encoder(nn.Module):
             torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
             persistent=False,
         )
-        self.requires_grad_(False)
-        if self.finetune:
-            self.backbone.layer4.requires_grad_(True)
-            for module in self.backbone.layer4.modules():
-                if isinstance(module, nn.BatchNorm2d):
-                    module.requires_grad_(False)
+        self.set_backbone_trainable(self.finetune_mode)
         self.eval()
 
     @property
     def output_dim(self) -> int:
         return self.feature_dim * len(self.camera_names)
 
+    def _selected_backbone_modules(self, mode: str) -> tuple[nn.Module, ...]:
+        if mode == "frozen":
+            return ()
+        if mode == "layer4":
+            return (self.backbone.layer4,)
+        if mode == "layer3_layer4":
+            return (self.backbone.layer3, self.backbone.layer4)
+        if mode == "all":
+            return (self.backbone,)
+        raise ValueError(f"Unsupported finetune mode: {mode}")
+
+    def _freeze_batchnorm(self) -> None:
+        if self.train_bn:
+            return
+        for module in self.backbone.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.requires_grad_(False)
+                module.eval()
+
+    def set_backbone_trainable(self, mode: str | None = None) -> None:
+        if mode is None:
+            mode = self.finetune_mode
+        self.backbone.requires_grad_(False)
+        for module in self._selected_backbone_modules(mode):
+            module.requires_grad_(True)
+        self._freeze_batchnorm()
+
+    def _apply_augmentation(self, x: torch.Tensor) -> torch.Tensor:
+        if not (self.training and self.augmentation):
+            return x
+        if self.random_shift > 0:
+            pad = self.random_shift
+            x = F.pad(x, (pad, pad, pad, pad), mode="replicate")
+            max_offset = 2 * pad
+            offsets_y = torch.randint(0, max_offset + 1, (x.shape[0],), device=x.device)
+            offsets_x = torch.randint(0, max_offset + 1, (x.shape[0],), device=x.device)
+            x = torch.cat([
+                x[i:i + 1, :, offsets_y[i]:offsets_y[i] + 224, offsets_x[i]:offsets_x[i] + 224]
+                for i in range(x.shape[0])
+            ], dim=0)
+        if self.color_jitter > 0:
+            jitter = self.color_jitter
+            brightness = torch.empty(x.shape[0], 1, 1, 1, device=x.device).uniform_(
+                1.0 - jitter, 1.0 + jitter
+            )
+            contrast = torch.empty(x.shape[0], 1, 1, 1, device=x.device).uniform_(
+                1.0 - jitter, 1.0 + jitter
+            )
+            mean = x.mean(dim=(2, 3), keepdim=True)
+            x = (x - mean) * contrast + mean
+            x = torch.clamp(x * brightness, 0.0, 1.0)
+        return x
+
+    def _pool_features(self, feature_map: torch.Tensor) -> torch.Tensor:
+        if self.pool == "avg":
+            return torch.flatten(self.backbone.avgpool(feature_map), 1)
+        batch, channels, height, width = feature_map.shape
+        logits = feature_map.reshape(batch, channels, height * width) / self.spatial_softmax_temperature
+        weights = torch.softmax(logits, dim=-1)
+        ys = torch.linspace(-1.0, 1.0, height, device=feature_map.device, dtype=feature_map.dtype)
+        xs = torch.linspace(-1.0, 1.0, width, device=feature_map.device, dtype=feature_map.dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        expected_x = torch.sum(weights * grid_x.reshape(1, 1, height * width), dim=-1)
+        expected_y = torch.sum(weights * grid_y.reshape(1, 1, height * width), dim=-1)
+        return torch.stack([expected_x, expected_y], dim=-1).reshape(batch, channels * 2)
+
     def train(self, mode: bool = True):
-        super().train(mode if self.finetune else False)
+        super().train(mode)
         self.backbone.eval()
         if self.finetune and mode:
-            self.backbone.layer4.train(True)
-            for module in self.backbone.layer4.modules():
-                if isinstance(module, nn.BatchNorm2d):
-                    module.eval()
+            for module in self._selected_backbone_modules(self.finetune_mode):
+                module.train(True)
+        self._freeze_batchnorm()
         return self
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
@@ -187,13 +310,29 @@ class FrozenResNet18Encoder(nn.Module):
             x = torch.nn.functional.interpolate(
                 x, size=(224, 224), mode="bilinear", align_corners=False
             )
+        x = self._apply_augmentation(x)
         x = (x - self.image_mean) / self.image_std
-        features = self.backbone(x)
+        features = self._pool_features(self.backbone.forward_features(x))
+        features = self.projection_head(features)
+        features = self.feature_norm_layer(features)
         return features.reshape(batch_size, num_views * self.feature_dim)
+
+    def backbone_parameters(self):
+        return (
+            parameter
+            for name, parameter in self.named_parameters()
+            if name.startswith("backbone.") and parameter.requires_grad
+        )
+
+    def projection_parameters(self):
+        return (
+            parameter
+            for name, parameter in self.named_parameters()
+            if not name.startswith("backbone.") and parameter.requires_grad
+        )
 
     def trainable_parameters(self):
         return (parameter for parameter in self.parameters() if parameter.requires_grad)
-
 
 def load_camera_path_matrix(
     image_path_group,

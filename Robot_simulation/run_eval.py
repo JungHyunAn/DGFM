@@ -114,6 +114,8 @@ Behavioral notes & tips
 """
 
 import os
+# Avoid cuBLASLt addmm heuristic failures on some CUDA/PyTorch/GPU combinations.
+os.environ.setdefault("DISABLE_ADDMM_CUDA_LT", "1")
 import numpy as np
 import random
 import math
@@ -142,7 +144,8 @@ for h in list(robosuite_logger.handlers):
 
 from Robot_simulation.models.VanillaFM_class import VectorField
 from Robot_simulation.models.vision_encoder import (
-    FrozenResNet18Encoder, encode_image_path_episodes, encode_image_path_windows, load_camera_path_matrix,
+    FrozenResNet18Encoder, VISION_FEATURE_NORMS, VISION_FINETUNE_MODES, VISION_POOL_TYPES,
+    encode_image_path_episodes, encode_image_path_windows, load_camera_path_matrix,
     validate_observation_type,
 )
 from Robot_simulation.models.UniformFM_class import UniformFM
@@ -250,6 +253,21 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
         return min_lr_scale + (1.0 - min_lr_scale) * cosine
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
+
+
+def _count_parameters(parameters) -> int:
+    return sum(parameter.numel() for parameter in parameters)
+
+
+def _grad_norm(parameters) -> float:
+    total = 0.0
+    found = False
+    for parameter in parameters:
+        if parameter.grad is None:
+            continue
+        found = True
+        total += float(parameter.grad.detach().norm(2).item()) ** 2
+    return math.sqrt(total) if found else 0.0
 
 def _default_cluster_rank(task_name: str, seq_len: int, param_len: int) -> int | None:
     if task_name == "door":
@@ -425,19 +443,59 @@ def train_and_eval_model(
     observation_type: str = "state",
     camera_names=None,
     vision_batch_size: int = 128,
-    condition_embed_dim: int = 32,
+    condition_embed_dim: int | None = None,
     vision_finetune: bool = False,
+    vision_finetune_mode: str | None = None,
+    vision_train_bn: bool = False,
+    vision_pool: str = "avg",
+    vision_spatial_softmax_temperature: float = 1.0,
+    vision_feature_proj_dim: int = 0,
+    vision_feature_norm: str = "none",
+    vision_aug: bool = False,
+    vision_random_shift: int = 4,
+    vision_color_jitter: float = 0.1,
     vision_encoder_lr_scale: float = 0.1,
+    vision_projection_lr_scale: float = 1.0,
+    vision_warmup_freeze_epochs: int = 0,
 ):
     observation_type = validate_observation_type(observation_type)
+    if vision_finetune_mode is None:
+        vision_finetune_mode = "layer4" if vision_finetune else "frozen"
+    if vision_finetune_mode not in VISION_FINETUNE_MODES:
+        raise ValueError(
+            f"Unsupported vision_finetune_mode={vision_finetune_mode!r}; expected one of {VISION_FINETUNE_MODES}"
+        )
+    if vision_pool not in VISION_POOL_TYPES:
+        raise ValueError(f"Unsupported vision_pool={vision_pool!r}; expected one of {VISION_POOL_TYPES}")
+    if vision_feature_norm not in VISION_FEATURE_NORMS:
+        raise ValueError(
+            f"Unsupported vision_feature_norm={vision_feature_norm!r}; expected one of {VISION_FEATURE_NORMS}"
+        )
+    if vision_finetune_mode != "frozen":
+        vision_finetune = True
     if vision_finetune and observation_type != "vision":
         raise ValueError("vision_finetune=True requires observation_type=vision")
     if vision_encoder_lr_scale <= 0:
         raise ValueError(f"vision_encoder_lr_scale must be positive, got {vision_encoder_lr_scale}")
+    if vision_projection_lr_scale <= 0:
+        raise ValueError(f"vision_projection_lr_scale must be positive, got {vision_projection_lr_scale}")
+    if vision_warmup_freeze_epochs < 0:
+        raise ValueError("vision_warmup_freeze_epochs must be non-negative")
+    if condition_embed_dim is None:
+        condition_embed_dim = 128 if observation_type == "vision" else 32
+    vision_online_training = (
+        observation_type == "vision"
+        and (
+            vision_finetune
+            or vision_feature_proj_dim > 0
+            or vision_feature_norm == "layernorm"
+            or vision_aug
+        )
+    )
     vision_finetune_models = ("UniformFM", "ShiftedFM", "DGFMv2", "DP")
-    if vision_finetune and model_type not in vision_finetune_models:
+    if vision_online_training and model_type not in vision_finetune_models:
         raise ValueError(
-            f"vision_finetune is supported for {vision_finetune_models}, got {model_type}"
+            f"online vision encoder training is supported for {vision_finetune_models}, got {model_type}"
         )
     fm_class_map = {
         "UniformFM": UniformFM,
@@ -579,16 +637,30 @@ def train_and_eval_model(
         vision_encoder = None
         vision_features = None
         if observation_type == "vision":
-            vision_encoder = FrozenResNet18Encoder(camera_names, finetune=vision_finetune)
+            vision_encoder = FrozenResNet18Encoder(
+                camera_names,
+                finetune=vision_finetune,
+                finetune_mode=vision_finetune_mode,
+                train_bn=vision_train_bn,
+                pool=vision_pool,
+                spatial_softmax_temperature=vision_spatial_softmax_temperature,
+                feature_proj_dim=vision_feature_proj_dim,
+                feature_norm=vision_feature_norm,
+                augmentation=vision_aug,
+                random_shift=vision_random_shift,
+                color_jitter=vision_color_jitter,
+            )
             print(
                 "[vision-input] oracle environment data disabled | "
                 f"joint_dof={dof} | observation_horizon={observation_horizon} | "
-                f"cameras={camera_names} | image_paths_episodes={len(data_image_paths)}"
+                f"cameras={camera_names} | image_paths_episodes={len(data_image_paths)} | "
+                f"online_training={vision_online_training}"
             )
-            vision_features = encode_image_path_episodes(
-                data_image_paths, os.path.dirname(os.path.abspath(dataset_path)),
-                vision_encoder, device, batch_size=vision_batch_size, verbose=True, cache_images=vision_finetune,
-            )
+            if not vision_online_training:
+                vision_features = encode_image_path_episodes(
+                    data_image_paths, os.path.dirname(os.path.abspath(dataset_path)),
+                    vision_encoder, device, batch_size=vision_batch_size, verbose=True, cache_images=False,
+                )
 
         window_traj, window_cond = build_state_conditioned_windows(
             data_trajectories,
@@ -600,10 +672,10 @@ def train_and_eval_model(
             trajectory_control_freq=trajectory_control_freq,
             observation_horizon=observation_horizon,
             vision_features=vision_features,
-            observation_type=observation_type,
+            observation_type="state" if vision_online_training else observation_type,
         )
         vision_window_paths = None
-        if observation_type == "vision" and vision_finetune:
+        if observation_type == "vision" and vision_online_training:
             vision_window_paths = _build_vision_path_windows(
                 data_image_paths, seq_len, window_stride, observation_horizon,
                 recorded_control_freq, trajectory_control_freq,
@@ -614,7 +686,8 @@ def train_and_eval_model(
                 )
         vision_feature_dim = 0 if vision_encoder is None else vision_encoder.output_dim
         if observation_type == "vision":
-            expected_condition_dim = observation_horizon * (dof + vision_feature_dim)
+            expected_full_condition_dim = observation_horizon * (dof + vision_feature_dim)
+            expected_window_condition_dim = state_param_len if vision_online_training else expected_full_condition_dim
             condition_components = {
                 "joint_history": observation_horizon * dof,
                 "vision_history": observation_horizon * vision_feature_dim,
@@ -622,7 +695,8 @@ def train_and_eval_model(
                 "static_environment_params": 0,
             }
         else:
-            expected_condition_dim = observation_horizon * (dof + dyn_dim) + param0.shape[0]
+            expected_full_condition_dim = observation_horizon * (dof + dyn_dim) + param0.shape[0]
+            expected_window_condition_dim = expected_full_condition_dim
             condition_components = {
                 "joint_history": observation_horizon * dof,
                 "environment_state_history": observation_horizon * dyn_dim,
@@ -635,13 +709,14 @@ def train_and_eval_model(
         )
         print(
             f"[window-build] condition_components={condition_components} | "
-            f"expected_condition_dim={expected_condition_dim} | "
+            f"expected_window_condition_dim={expected_window_condition_dim} | "
+            f"expected_full_condition_dim={expected_full_condition_dim} | "
             f"actual_condition_dim={window_cond.shape[1]}"
         )
-        if window_cond.shape[1] != expected_condition_dim:
+        if window_cond.shape[1] != expected_window_condition_dim:
             raise ValueError(
                 "Condition schema mismatch: unexpected data entered window_cond; "
-                f"expected {expected_condition_dim}, got {window_cond.shape[1]}"
+                f"expected {expected_window_condition_dim}, got {window_cond.shape[1]}"
             )
         if not np.all(np.isfinite(window_traj)) or not np.all(np.isfinite(window_cond)):
             raise ValueError("Non-finite values found in window_traj or window_cond")
@@ -654,7 +729,7 @@ def train_and_eval_model(
             window_traj = _apply_joint_normalization(window_traj, normalization_stats)
         data_trajectories = torch.from_numpy(window_traj).float().to(device)
         data_env_params = torch.from_numpy(window_cond).float().to(device)
-        param_len = window_cond.shape[1]
+        param_len = expected_full_condition_dim
         num_demos = len(selected_ep_keys)
         num_windows = window_traj.shape[0]
 
@@ -691,7 +766,12 @@ def train_and_eval_model(
         f"model_type={model_type} | observation_type={observation_type} | task={task_name} | demos={num_demos} | windows={num_windows} | "
         f"seq_len={seq_len} | dof={dof} | param_len={param_len} | gripper_idx={gripper_idx} | "
         f"condition_embed_dim={condition_embed_dim} | "
-        f"vision_finetune={vision_finetune} | vision_encoder_lr_scale={vision_encoder_lr_scale} | "
+        f"vision_finetune={vision_finetune} | vision_finetune_mode={vision_finetune_mode} | "
+        f"vision_pool={vision_pool} | vision_feature_proj_dim={vision_feature_proj_dim} | "
+        f"vision_feature_norm={vision_feature_norm} | vision_train_bn={vision_train_bn} | "
+        f"vision_aug={vision_aug} | vision_encoder_lr_scale={vision_encoder_lr_scale} | "
+        f"vision_projection_lr_scale={vision_projection_lr_scale} | "
+        f"vision_warmup_freeze_epochs={vision_warmup_freeze_epochs} | "
         f"num_convs_per_block={num_convs_per_block} | "
         f"horizon_arg={horizon} | executed_horizon={executed_horizon} | window_stride={window_stride} | "
         f"recorded_control_freq={recorded_control_freq} | "
@@ -768,25 +848,44 @@ def train_and_eval_model(
             observation_type=observation_type,
             condition_embed_dim=condition_embed_dim,
         ).to(device)
-        if vision_finetune:
+        if vision_online_training:
             model.vision_encoder = vision_encoder
             policy_parameters = [
                 parameter for name, parameter in model.named_parameters()
                 if not name.startswith("vision_encoder.")
             ]
-            encoder_parameters = list(vision_encoder.trainable_parameters())
-            optimizer = optim.Adam(
-                [
-                    {"params": policy_parameters, "lr": learning_rate},
-                    {"params": encoder_parameters, "lr": learning_rate * vision_encoder_lr_scale},
-                ],
-                weight_decay=weight_decay,
-            )
+            backbone_parameters = list(vision_encoder.backbone_parameters())
+            projection_parameters = list(vision_encoder.projection_parameters())
+            param_groups = [{"params": policy_parameters, "lr": learning_rate}]
+            if projection_parameters:
+                param_groups.append({
+                    "params": projection_parameters,
+                    "lr": learning_rate * vision_projection_lr_scale,
+                })
+            if backbone_parameters:
+                param_groups.append({
+                    "params": backbone_parameters,
+                    "lr": learning_rate * vision_encoder_lr_scale,
+                })
+            optimizer = optim.Adam(param_groups, weight_decay=weight_decay)
+            if vision_warmup_freeze_epochs > 0:
+                vision_encoder.set_backbone_trainable("frozen")
+            total_trainable_model_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            trainable_encoder_parameters = _count_parameters(list(vision_encoder.trainable_parameters()))
+            trainable_projection_parameters = _count_parameters(list(vision_encoder.projection_parameters()))
             print(
-                "[vision-finetune] trainable=backbone.layer4 | "
-                f"policy_lr={learning_rate} | encoder_lr={learning_rate * vision_encoder_lr_scale} | "
-                f"encoder_parameters={sum(p.numel() for p in encoder_parameters)}"
+                "[vision-train] "
+                f"mode={vision_finetune_mode} | pool={vision_pool} | "
+                f"feature_proj_dim={vision_feature_proj_dim} | condition_embed_dim={condition_embed_dim} | "
+                f"batchnorm_train={vision_train_bn} | augmentation={vision_aug} | "
+                f"policy_lr={learning_rate} | projection_lr={learning_rate * vision_projection_lr_scale} | "
+                f"encoder_lr={learning_rate * vision_encoder_lr_scale} | "
+                f"trainable_encoder_parameters={trainable_encoder_parameters} | "
+                f"trainable_projection_parameters={trainable_projection_parameters} | "
+                f"total_trainable_model_parameters={total_trainable_model_parameters}"
             )
+            if vision_finetune_mode != "frozen" and not backbone_parameters:
+                raise AssertionError("vision_finetune_mode is not frozen, but no backbone parameters are trainable")
         else:
             optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
         scheduler = get_cosine_schedule_with_warmup(
@@ -852,12 +951,12 @@ def train_and_eval_model(
         observation_owner.observation_type = observation_type
         observation_owner.camera_names = tuple(camera_names or DEFAULT_VISION_CAMERAS)
         observation_owner.state_condition_dim = state_param_len
-        if not (vision_finetune and observation_owner is model):
+        if not (vision_online_training and observation_owner is model):
             object.__setattr__(observation_owner, "vision_encoder", vision_encoder)
         observation_owner.vision_image_height = DEFAULT_VISION_HEIGHT
         observation_owner.vision_image_width = DEFAULT_VISION_WIDTH
 
-    if vision_finetune and flow is not None:
+    if vision_online_training and flow is not None:
         dataset_dir = os.path.dirname(os.path.abspath(dataset_path))
 
         def vision_condition_fn(indices, base_conditions):
@@ -868,6 +967,27 @@ def train_and_eval_model(
             return torch.cat([base_conditions[:, :state_param_len], vision_condition], dim=1)
 
         flow.vision_condition_fn = vision_condition_fn
+
+        def vision_epoch_hook(epoch):
+            if vision_warmup_freeze_epochs > 0 and epoch <= vision_warmup_freeze_epochs:
+                model.vision_encoder.set_backbone_trainable("frozen")
+            else:
+                model.vision_encoder.set_backbone_trainable(vision_finetune_mode)
+
+        grad_logged = {"done": False}
+
+        def vision_after_backward_hook():
+            if grad_logged["done"]:
+                return
+            print(
+                "[vision-grad] "
+                f"backbone_grad_norm={_grad_norm(model.vision_encoder.backbone_parameters()):.6f} | "
+                f"projection_grad_norm={_grad_norm(model.vision_encoder.projection_parameters()):.6f}"
+            )
+            grad_logged["done"] = True
+
+        flow.vision_epoch_hook = vision_epoch_hook
+        flow.vision_after_backward_hook = vision_after_backward_hook
 
     # train model
     print(
@@ -990,7 +1110,7 @@ def train_and_eval_model(
                 observation_type=observation_type,
                 condition_embed_dim=condition_embed_dim,
             ).to(device)
-            if vision_finetune:
+            if vision_online_training:
                 best_model.vision_encoder = vision_encoder
         try:
             best_model.load_state_dict(state)
@@ -1008,7 +1128,7 @@ def train_and_eval_model(
         best_model.observation_type = observation_type
         best_model.camera_names = tuple(camera_names or DEFAULT_VISION_CAMERAS)
         best_model.state_condition_dim = state_param_len
-        if not vision_finetune:
+        if not vision_online_training:
             object.__setattr__(best_model, "vision_encoder", vision_encoder)
         best_model.vision_image_height = DEFAULT_VISION_HEIGHT
         best_model.vision_image_width = DEFAULT_VISION_WIDTH
@@ -1193,11 +1313,21 @@ def train_and_eval_model(
             "observation_type": observation_type,
             "camera_names": list(camera_names or []),
             "vision_encoder": (
-                "imagenet_resnet18_layer4_finetuned" if vision_finetune
-                else "frozen_imagenet_resnet18"
+                f"imagenet_resnet18_{vision_finetune_mode}_{vision_pool}"
             ) if observation_type == "vision" else None,
             "vision_finetune": vision_finetune,
+            "vision_finetune_mode": vision_finetune_mode,
+            "vision_train_bn": vision_train_bn,
+            "vision_pool": vision_pool,
+            "vision_spatial_softmax_temperature": vision_spatial_softmax_temperature,
+            "vision_feature_proj_dim": vision_feature_proj_dim,
+            "vision_feature_norm": vision_feature_norm,
+            "vision_aug": vision_aug,
+            "vision_random_shift": vision_random_shift,
+            "vision_color_jitter": vision_color_jitter,
             "vision_encoder_lr_scale": vision_encoder_lr_scale,
+            "vision_projection_lr_scale": vision_projection_lr_scale,
+            "vision_warmup_freeze_epochs": vision_warmup_freeze_epochs,
             "condition_embed_dim": condition_embed_dim,
             "task_name":       task_name,
             "num_convs_per_block": num_convs_per_block,
@@ -1314,7 +1444,18 @@ def train_and_eval_model(
             "camera_names": list(camera_names or []),
             "condition_embed_dim": condition_embed_dim,
             "vision_finetune": vision_finetune,
+            "vision_finetune_mode": vision_finetune_mode,
+            "vision_train_bn": vision_train_bn,
+            "vision_pool": vision_pool,
+            "vision_spatial_softmax_temperature": vision_spatial_softmax_temperature,
+            "vision_feature_proj_dim": vision_feature_proj_dim,
+            "vision_feature_norm": vision_feature_norm,
+            "vision_aug": vision_aug,
+            "vision_random_shift": vision_random_shift,
+            "vision_color_jitter": vision_color_jitter,
             "vision_encoder_lr_scale": vision_encoder_lr_scale,
+            "vision_projection_lr_scale": vision_projection_lr_scale,
+            "vision_warmup_freeze_epochs": vision_warmup_freeze_epochs,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "num_convs_per_block": num_convs_per_block,
         }
@@ -1377,12 +1518,30 @@ if __name__ == "__main__":
     parser.add_argument("--camera_names", nargs="+", default=None,
                         help="Must match camera_names stored in a vision dataset")
     parser.add_argument("--vision_batch_size", type=int, default=128)
-    parser.add_argument("--condition_embed_dim", type=int, default=32,
-                        help="Width of the trajectory-model condition encoder. Must match the checkpoint at evaluation time.")
+    parser.add_argument("--condition_embed_dim", type=int, default=None,
+                        help="Width of the trajectory-model condition encoder. Defaults to 32 for state policies and 128 for vision policies.")
     parser.add_argument("--vision_finetune", action=argparse.BooleanOptionalAction, default=False,
-                        help="Fine-tune both residual blocks in the final ResNet-18 stage during vision-policy training.")
+                        help="Backward-compatible shortcut for --vision_finetune_mode layer4.")
+    parser.add_argument("--vision_finetune_mode", choices=VISION_FINETUNE_MODES, default=None,
+                        help="ResNet-18 finetuning scope. Defaults to layer4 when --vision_finetune is true, otherwise frozen.")
+    parser.add_argument("--vision_train_bn", action=argparse.BooleanOptionalAction, default=False,
+                        help="Allow ResNet BatchNorm parameters and running statistics to train.")
+    parser.add_argument("--vision_pool", choices=VISION_POOL_TYPES, default="avg",
+                        help="Visual feature pooling head.")
+    parser.add_argument("--vision_spatial_softmax_temperature", type=float, default=1.0)
+    parser.add_argument("--vision_feature_proj_dim", type=int, default=0,
+                        help="Optional per-view projection head width. Set >0 to train and save a vision projection head.")
+    parser.add_argument("--vision_feature_norm", choices=VISION_FEATURE_NORMS, default="none")
+    parser.add_argument("--vision_aug", action=argparse.BooleanOptionalAction, default=False,
+                        help="Apply train-time random shift and mild color jitter during online vision encoding.")
+    parser.add_argument("--vision_random_shift", type=int, default=4)
+    parser.add_argument("--vision_color_jitter", type=float, default=0.1)
     parser.add_argument("--vision_encoder_lr_scale", type=float, default=0.1,
-                        help="Vision encoder learning rate as a fraction of the policy learning rate.")
+                        help="Vision backbone learning rate as a fraction of the policy learning rate.")
+    parser.add_argument("--vision_projection_lr_scale", type=float, default=1.0,
+                        help="Vision projection / normalization learning rate as a fraction of the policy learning rate.")
+    parser.add_argument("--vision_warmup_freeze_epochs", type=int, default=0,
+                        help="Train policy/projection first, then unfreeze the ResNet according to --vision_finetune_mode.")
     parser.add_argument("--cluster_partition", type=int, default=5)
     parser.add_argument("--cluster_jaccard_thresh", type=float, default=0.8)
     parser.add_argument("--cluster_merge_k", type=int, default=10)
@@ -1505,7 +1664,18 @@ if __name__ == "__main__":
         vision_batch_size  = args.vision_batch_size,
         condition_embed_dim = args.condition_embed_dim,
         vision_finetune     = args.vision_finetune,
+        vision_finetune_mode = args.vision_finetune_mode,
+        vision_train_bn      = args.vision_train_bn,
+        vision_pool          = args.vision_pool,
+        vision_spatial_softmax_temperature = args.vision_spatial_softmax_temperature,
+        vision_feature_proj_dim = args.vision_feature_proj_dim,
+        vision_feature_norm  = args.vision_feature_norm,
+        vision_aug           = args.vision_aug,
+        vision_random_shift  = args.vision_random_shift,
+        vision_color_jitter  = args.vision_color_jitter,
         vision_encoder_lr_scale = args.vision_encoder_lr_scale,
+        vision_projection_lr_scale = args.vision_projection_lr_scale,
+        vision_warmup_freeze_epochs = args.vision_warmup_freeze_epochs,
         cluster_partition  = args.cluster_partition,
         cluster_jaccard_thresh = args.cluster_jaccard_thresh,
         cluster_merge_k    = args.cluster_merge_k,

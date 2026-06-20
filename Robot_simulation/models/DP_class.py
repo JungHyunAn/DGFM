@@ -249,6 +249,9 @@ class DiffusionPolicy:
 
             for epoch in tqdm(range(1, max_epochs + 1), desc="DiffusionPolicy Training", unit="epoch"):
                 self.model.train()
+                vision_epoch_hook = getattr(self, "vision_epoch_hook", None)
+                if vision_epoch_hook is not None:
+                    vision_epoch_hook(epoch)
                 perm = torch.randperm(N, device=self.device)
                 loss_sum = 0.0
                 batch_count = 0
@@ -279,6 +282,9 @@ class DiffusionPolicy:
 
                     self.optimizer.zero_grad()
                     loss.backward()
+                    vision_after_backward_hook = getattr(self, "vision_after_backward_hook", None)
+                    if vision_after_backward_hook is not None:
+                        vision_after_backward_hook()
                     self.optimizer.step()
                     self._step_ema()
                     loss_sum += float(loss.item())
