@@ -7,8 +7,11 @@ from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_slerp, quat_multiply, quat_inverse
 from Robot_simulation.environments.heuristics_util import (
-    DEFAULT_VISION_CAMERAS, capture_camera_views, get_environment_state,
+    capture_camera_views, get_environment_state,
 )
+
+
+TWO_ARM_VISION_CAMERAS = ("frontview", "robot0_eye_in_hand", "robot1_eye_in_hand")
 
 
 def generate_two_arm_trajectory(
@@ -18,7 +21,7 @@ def generate_two_arm_trajectory(
     video_folder: str = "Robot_simulation/videos",
     verbose: bool = False,
     save_video: bool = True,
-    camera_names=DEFAULT_VISION_CAMERAS,
+    camera_names=TWO_ARM_VISION_CAMERAS,
     image_width: int = 224,
     image_height: int = 224,
 ) -> Tuple[np.ndarray, bool, List[np.ndarray], np.ndarray, Dict[str, np.ndarray]]:
@@ -27,7 +30,7 @@ def generate_two_arm_trajectory(
 
     Trajectory Phases:
       • PHASE1‑1: 100‑step approach to a random offset around each handle
-      • PHASE1‑2: 30-step descend to handle
+      • PHASE1‑2: 100-step descend to handle
       • PHASE2: 10-step grasping handle
       • PHASE3: (lift_steps)‑step lift (keep level)
 
@@ -172,13 +175,13 @@ def generate_two_arm_trajectory(
 
         env.step(a)
         record_q()
-    # ---------- PHASE1‑2: 30-step descend to handle ----------
+    # ---------- PHASE1‑2: 100-step descend to handle ----------
     gripper_pose = np.array([1.0, 1.0], dtype=np.float32)
-    for _ in range(30):
+    for _ in range(100):
         a = np.zeros(adim)
         # small downward move
-        a[2] = -0.37
-        a[9] = -0.37
+        a[2] = -0.105
+        a[9] = -0.105
         # keep orientation & open gripper
         a[6]  = -1
         a[13] = -1
@@ -270,7 +273,7 @@ def generate_two_arm_trajectory(
 
 if __name__ == "__main__":
     # 1) build env with all three offscreen cameras
-    cams = ["frontview", "birdview", "robot0_eye_in_hand"]
+    cams = list(TWO_ARM_VISION_CAMERAS)
     ctrl = load_composite_controller_config(robot="Panda")
 
     env = TwoArmLift(

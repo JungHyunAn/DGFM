@@ -123,7 +123,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from Robot_simulation.environments.heuristics_door import generate_door_trajectory
 from Robot_simulation.environments.heuristics_wipe import generate_wipe_trajectory
-from Robot_simulation.environments.heuristics_two_arm import generate_two_arm_trajectory
+from Robot_simulation.environments.heuristics_two_arm import TWO_ARM_VISION_CAMERAS, generate_two_arm_trajectory
 from Robot_simulation.environments.heuristics_nut import generate_nut_trajectory
 from Robot_simulation.env_util import make_env
 from Robot_simulation.environments.heuristics_util import (
@@ -169,6 +169,10 @@ KEYFRAME_INTERVALS = {"door"    : [(100, 110, 1), # approaching
                                    (132, 180, 4),  # carrying to square peg
                                    (180, 230, 3)]  # inserting and releasing
                     }
+
+
+def _default_camera_names_for_task(task_name: str):
+    return TWO_ARM_VISION_CAMERAS if task_name == "two_arm" else DEFAULT_VISION_CAMERAS
 
 
 def init_hdf5(
@@ -349,7 +353,7 @@ def worker_generate(
     max_trials: int,
     seed: int,
     vision: bool = False,
-    camera_names=DEFAULT_VISION_CAMERAS,
+    camera_names=None,
     image_height: int = DEFAULT_VISION_HEIGHT,
     image_width: int = DEFAULT_VISION_WIDTH,
     action_representation: str = "joint_space",
@@ -392,6 +396,9 @@ def worker_generate(
     }
     generator = gen_map[task_name]
     action_representation = validate_action_representation(action_representation)
+    if camera_names is None:
+        camera_names = _default_camera_names_for_task(task_name)
+    camera_names = list(camera_names)
     np.random.seed(seed + worker_id)
 
     env = make_env(
@@ -547,6 +554,9 @@ def generate_data_parallel(
     """
 
     action_representation = validate_action_representation(action_representation)
+    if camera_names is None:
+        camera_names = _default_camera_names_for_task(task_name)
+    camera_names = list(camera_names)
     os.makedirs(output_dir, exist_ok=True)
 
     # Sample env for metadata & fps (no offscreen / no camera obs)
@@ -741,7 +751,7 @@ if __name__ == "__main__":
         help="Save external camera images and image paths for vision-conditioned training"
     )
     parser.add_argument(
-        "--camera_names", nargs="+", default=list(DEFAULT_VISION_CAMERAS),
+        "--camera_names", nargs="+", default=None,
         help="Camera views to save when --vision is enabled"
     )
     parser.add_argument("--image_height", type=int, default=DEFAULT_VISION_HEIGHT)
