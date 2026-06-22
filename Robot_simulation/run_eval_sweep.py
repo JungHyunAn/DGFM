@@ -33,6 +33,13 @@ MAX_EPOCHS_BY_TASK = {
     "nut": (),
 }
 
+VAL_PERIODS_BY_TASK = {
+    "door": (80, 40, 20),
+    "wipe": (),
+    "two_arm": (),
+    "nut": (),
+}
+
 CLUSTER_PARTITIONS_BY_TASK = {
     "door": (10, 20, 40),
     "wipe": (),
@@ -58,7 +65,6 @@ SHARED_CONFIG: dict[str, Any] = {
     "learning_rate": 0.0001,
     "weight_decay": 1e-6,
     "batch_size": 500,
-    "val_period": 40,
     "val_trials": 50,
     "stop_criteria": 3,
     "evaluation_samples": 100,
@@ -148,6 +154,7 @@ def build_config(
     method: str,
     num_demos: int,
     max_epochs: int,
+    val_period: int,
     cluster_partition: int,
 ) -> dict[str, Any]:
     config = {
@@ -159,6 +166,7 @@ def build_config(
         "results_path": SHARED_CONFIG["results_path"].format(task_name=task_name, seed=seed),
         "max_epochs": max_epochs,
         "warmup_steps": int(max_epochs * 0.2),
+        "val_period": val_period,
         "seed": seed,
     }
     if method == "DGFMv2":
@@ -169,20 +177,25 @@ def build_config(
 def build_sweep(task_name: str, seed: int) -> list[dict[str, Any]]:
     demo_sizes = DEMO_SIZES_BY_TASK[task_name]
     max_epochs = MAX_EPOCHS_BY_TASK[task_name]
+    val_periods = VAL_PERIODS_BY_TASK[task_name]
     cluster_partitions = CLUSTER_PARTITIONS_BY_TASK[task_name]
     if not demo_sizes or not max_epochs:
         raise ValueError(f"No sweep settings are configured for task_name={task_name!r}.")
-    if len(demo_sizes) != len(max_epochs) or len(demo_sizes) != len(cluster_partitions):
+    if (
+        len(demo_sizes) != len(max_epochs)
+        or len(demo_sizes) != len(val_periods)
+        or len(demo_sizes) != len(cluster_partitions)
+    ):
         raise ValueError(
-            f"Demo-size, epoch, and cluster-partition schedules disagree for "
+            f"Demo-size, epoch, val-period, and cluster-partition schedules disagree for "
             f"task_name={task_name!r}: {len(demo_sizes)}, {len(max_epochs)}, "
-            f"{len(cluster_partitions)}"
+            f"{len(val_periods)}, {len(cluster_partitions)}"
         )
 
     return [
-        build_config(task_name, seed, method, num_demos, epochs, cluster_partition)
-        for num_demos, epochs, cluster_partition in zip(
-            demo_sizes, max_epochs, cluster_partitions, strict=True
+        build_config(task_name, seed, method, num_demos, epochs, val_period, cluster_partition)
+        for num_demos, epochs, val_period, cluster_partition in zip(
+            demo_sizes, max_epochs, val_periods, cluster_partitions, strict=True
         )
         for method in METHODS
     ]

@@ -614,6 +614,7 @@ def train_and_eval_model(
             grp = data_grp[ep]
             q_ep = grp["joint_angles"][:]
             data_trajectories.append(q_ep)
+            # Oracle dynamic/static environment data is included only for state observations.
             if observation_type == "state":
                 environment_state_key = "environment_states" if "environment_states" in grp else "dynamic_states"
                 if environment_state_key in grp:
@@ -662,6 +663,7 @@ def train_and_eval_model(
                     vision_encoder, device, batch_size=vision_batch_size, verbose=True, cache_images=False,
                 )
 
+        # Online vision keeps only the base joint-history condition here; image features are appended per batch.
         window_traj, window_cond = build_state_conditioned_windows(
             data_trajectories,
             data_dynamic,
@@ -676,6 +678,7 @@ def train_and_eval_model(
         )
         vision_window_paths = None
         if observation_type == "vision" and vision_online_training:
+            # Keep path windows aligned with window_cond so the callback can encode matching images on demand.
             vision_window_paths = _build_vision_path_windows(
                 data_image_paths, seq_len, window_stride, observation_horizon,
                 recorded_control_freq, trajectory_control_freq,
@@ -964,6 +967,7 @@ def train_and_eval_model(
             vision_condition = encode_image_path_windows(
                 path_batch, dataset_dir, model.vision_encoder, device
             )
+            # Flow trainers pass base_conditions; this callback returns the full vision-conditioned tensor.
             return torch.cat([base_conditions[:, :state_param_len], vision_condition], dim=1)
 
         flow.vision_condition_fn = vision_condition_fn
@@ -1019,6 +1023,7 @@ def train_and_eval_model(
 
             train_kwargs = dict(
                 target_trajectories=target_trajectories,
+                # For online vision this is the base condition; vision_condition_fn appends image features.
                 conditions=env_params,
                 cluster_size=cluster_size,
                 scale_x=cluster_scale_x,
