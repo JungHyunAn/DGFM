@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -257,7 +258,6 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
 def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    run_eval_path = Path(__file__).resolve().with_name("run_eval.py")
     sweep = build_sweep(args.task_name, args.seed)
     sweep_results_path = Path(sweep[0]["results_path"])
 
@@ -281,11 +281,23 @@ def main() -> None:
             f"epochs={config['max_epochs']} warmup={config['warmup_steps']} "
             f"seed={config['seed']}"
         )
-        subprocess.run(
-            [sys.executable, str(run_eval_path), *config_to_cli_args(config)],
-            cwd=repo_root,
-            check=True,
-        )
+        command = [sys.executable, "-m", "Robot_simulation.run_eval", *config_to_cli_args(config)]
+        try:
+            subprocess.run(command, cwd=repo_root, check=True)
+        except subprocess.CalledProcessError as exc:
+            print(
+                f"[sweep] Run failed with exit code {exc.returncode}: "
+                f"{config['FM_type']} task={config['task_name']} N={config['N']} "
+                f"seed={config['seed']}",
+                file=sys.stderr,
+            )
+            print(
+                "[sweep] Re-run this sweep with --resume after fixing the underlying "
+                "run_eval.py error.",
+                file=sys.stderr,
+            )
+            print(f"[sweep] Command: {shlex.join(command)}", file=sys.stderr)
+            raise SystemExit(exc.returncode) from exc
 
         if run_idx < len(sweep):
             print(f"[sweep] Sleeping {SLEEP_SECONDS_BETWEEN_RUNS} seconds before the next run.")
