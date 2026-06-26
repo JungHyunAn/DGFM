@@ -26,3 +26,4 @@ logs/
 synth_eval.lock
 synth_eval.pid
 .codex
+remote_eval/

@@ -85,17 +85,18 @@ def _build_model(request: EvaluationRequest, device: torch.device):
             num_convs_per_block=request.num_convs_per_block,
             observation_type=request.observation_type,
             condition_embed_dim=request.condition_embed_dim,
-        ).to(device)
-        vision_encoder = _build_vision_encoder(request)
-        if vision_encoder is not None:
-            model.vision_encoder = vision_encoder
+        )
+
+    vision_encoder = _build_vision_encoder(request)
+    if vision_encoder is not None:
+        model.vision_encoder = vision_encoder
 
     model.observation_type = request.observation_type
     model.camera_names = tuple(request.camera_names or DEFAULT_VISION_CAMERAS)
     model.state_condition_dim = request.state_condition_dim
     model.vision_image_height = DEFAULT_VISION_HEIGHT
     model.vision_image_width = DEFAULT_VISION_WIDTH
-    return model
+    return model.to(device)
 
 
 def evaluate_checkpoint(request_path: str, checkpoint_path: str, output_path: str) -> EvaluationResponse:
