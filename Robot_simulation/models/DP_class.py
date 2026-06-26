@@ -220,6 +220,8 @@ class DiffusionPolicy:
         eval_base_seed: int = 123,
         recorded_control_freq: int | float | None = None,
         trajectory_control_freq: int | float | None = None,
+        evaluator=None,
+        eval_metadata: dict | None = None,
     ):
         """Train the diffusion baseline with the same data contract as FM trainers."""
         N = target_trajectories.shape[0]
@@ -297,7 +299,7 @@ class DiffusionPolicy:
                 if do_validation and epoch % val_period == 0:
                     eval_model_obj = self._eval_model()
                     eval_model_obj.eval()
-                    success_rate, avg_reward, validation_rollouts = eval_model(
+                    eval_kwargs = dict(
                         model=eval_model_obj,
                         model_class=None,
                         task_name=self.task_name,
@@ -327,6 +329,20 @@ class DiffusionPolicy:
                         return_rollouts=True,
                         action_representation=getattr(self, "action_representation", "joint_space"),
                     )
+                    if evaluator is None:
+                        success_rate, avg_reward, validation_rollouts = eval_model(**eval_kwargs)
+                    else:
+                        metadata = dict(eval_metadata or {})
+                        metadata.update(
+                            eval_kwargs={k: v for k, v in eval_kwargs.items() if k != "model"},
+                            val_trials=val_trials,
+                            eval_base_seed=eval_base_seed,
+                            normalization_stats=self.normalization_stats,
+                        )
+                        response = evaluator.evaluate(eval_model_obj, epoch, metadata)
+                        success_rate = response.success_rate
+                        avg_reward = response.avg_reward
+                        validation_rollouts = response.validation_rollouts
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": avg_loss}
 
                     if success_rate < best_success_rate:

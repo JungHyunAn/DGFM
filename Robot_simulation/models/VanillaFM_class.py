@@ -455,6 +455,8 @@ class VanillaFM:
         eval_base_seed: int = 123,
         recorded_control_freq: int | float | None = None,
         trajectory_control_freq: int | float | None = None,
+        evaluator=None,
+        eval_metadata: dict | None = None,
     ):
         N = target_trajectories.shape[0]
         best_avg_reward = 0.0
@@ -523,17 +525,17 @@ class VanillaFM:
                 if do_validation and epoch % val_period == 0:
                     eval_model_obj = self._eval_model()
                     eval_model_obj.eval()
-                    success_rate, avg_reward, validation_rollouts = eval_model(
-                        eval_model_obj,
-                        VectorField,
-                        self.task_name,
-                        self.horizon,
-                        self.dof,
-                        self.condition_dim,
-                        self.gripper_idx,
-                        val_params,
-                        env_settings_all,
-                        self.device,
+                    eval_kwargs = dict(
+                        model=eval_model_obj,
+                        model_class=VectorField,
+                        task_name=self.task_name,
+                        seq_len=self.horizon,
+                        dof=self.dof,
+                        param_len=self.condition_dim,
+                        gripper_idx=self.gripper_idx,
+                        val_params=val_params,
+                        env_settings_all=env_settings_all,
+                        device=self.device,
                         trials=val_trials,
                         base_seed=eval_base_seed,
                         max_policy_steps=max_policy_steps,
@@ -545,6 +547,20 @@ class VanillaFM:
                         return_rollouts=True,
                         action_representation=getattr(self, "action_representation", "joint_space"),
                     )
+                    if evaluator is None:
+                        success_rate, avg_reward, validation_rollouts = eval_model(**eval_kwargs)
+                    else:
+                        metadata = dict(eval_metadata or {})
+                        metadata.update(
+                            eval_kwargs={k: v for k, v in eval_kwargs.items() if k != "model"},
+                            val_trials=val_trials,
+                            eval_base_seed=eval_base_seed,
+                            normalization_stats=self.normalization_stats,
+                        )
+                        response = evaluator.evaluate(eval_model_obj, epoch, metadata)
+                        success_rate = response.success_rate
+                        avg_reward = response.avg_reward
+                        validation_rollouts = response.validation_rollouts
                     records[epoch] = {"success_rate": success_rate, "avg_reward": avg_reward, "loss": loss_sum}
                     if success_rate < best_success_rate:
                         tqdm.write(f"Epoch {epoch}: success_rate={success_rate:.3f}, average reward={avg_reward:.3f}, loss={loss_sum:.3f}")

@@ -162,6 +162,7 @@ from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
 from Robot_simulation.models.DP_class import DiffusionPolicy
 from Robot_simulation.models.LatentFM_class import LatentFM, LatentFlowPolicy, LatentVectorField, TrajectoryAutoencoder
 from Robot_simulation.models.MPPCA_class import MPPCA
+from Robot_simulation.evaluators import RemoteEvaluator
 from Robot_simulation.environments.heuristics_util import (
     DEFAULT_VISION_CAMERAS, DEFAULT_VISION_HEIGHT, DEFAULT_VISION_WIDTH,
     _get_environment_params, configure_nut_pegs, validate_action_representation,
@@ -457,6 +458,12 @@ def train_and_eval_model(
     vision_encoder_lr_scale: float = 0.1,
     vision_projection_lr_scale: float = 1.0,
     vision_warmup_freeze_epochs: int = 0,
+    validation_backend: str = "local",
+    remote_eval_config: str | None = None,
+    remote_eval_mode: str = "direct",
+    remote_eval_render_best: bool = False,
+    remote_eval_timeout_sec: int = 3600,
+    remote_eval_poll_interval_sec: float = 5.0,
 ):
     observation_type = validate_observation_type(observation_type)
     if vision_finetune_mode is None:
@@ -509,6 +516,10 @@ def train_and_eval_model(
         raise ValueError(f"Unsupported model type={model_type}. Expected one of {supported_model_types}")
     if model_type in ("MPPCA", "MPPCAv2") and model_path is not None:
         raise ValueError(f"Loading a saved {model_type} sampler from --model_path is not supported yet.")
+    if validation_backend not in ("local", "remote", "none"):
+        raise ValueError(f"Unsupported validation_backend={validation_backend!r}")
+    if remote_eval_mode not in ("direct", "queue"):
+        raise ValueError(f"Unsupported remote_eval_mode={remote_eval_mode!r}")
 
     timestamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime("%Y%m%dT%H%M%S")
 
@@ -959,6 +970,75 @@ def train_and_eval_model(
         observation_owner.vision_image_height = DEFAULT_VISION_HEIGHT
         observation_owner.vision_image_width = DEFAULT_VISION_WIDTH
 
+    eval_metadata = {
+        "stream_id": os.path.basename(exp_dir),
+        "source_run_id": os.path.basename(exp_dir),
+        "task_name": task_name,
+        "model_type": model_type,
+        "val_trials": val_trials,
+        "eval_base_seed": seed + 1,
+        "seq_len": seq_len,
+        "dof": dof,
+        "param_len": param_len,
+        "state_condition_dim": state_param_len,
+        "gripper_idx": gripper_idx,
+        "observation_type": observation_type,
+        "camera_names": list(camera_names or DEFAULT_VISION_CAMERAS),
+        "condition_embed_dim": condition_embed_dim,
+        "vision_finetune": vision_finetune,
+        "vision_finetune_mode": vision_finetune_mode,
+        "vision_train_bn": vision_train_bn,
+        "vision_pool": vision_pool,
+        "vision_spatial_softmax_temperature": vision_spatial_softmax_temperature,
+        "vision_feature_proj_dim": vision_feature_proj_dim,
+        "vision_feature_norm": vision_feature_norm,
+        "vision_aug": vision_aug,
+        "vision_random_shift": vision_random_shift,
+        "vision_color_jitter": vision_color_jitter,
+        "max_policy_steps": max_policy_steps,
+        "executed_horizon": executed_horizon,
+        "observation_horizon": observation_horizon,
+        "recorded_control_freq": recorded_control_freq,
+        "trajectory_control_freq": trajectory_control_freq,
+        "action_representation": action_representation,
+        "normalization_stats": normalization_stats,
+        "use_ema": use_ema,
+        "dp_T_diff": dp_T_diff if model_type == "DP" else None,
+        "dp_schedule_type": dp_schedule_type if model_type == "DP" else None,
+        "dp_ddim_steps": dp_ddim_steps if model_type == "DP" else None,
+        "dp_eta": dp_eta if model_type == "DP" else None,
+        "dp_pred_type": dp_pred_type if model_type == "DP" else None,
+        "dp_clip_sample": dp_clip_sample if model_type == "DP" else None,
+        "dp_clip_sample_range": dp_clip_sample_range if model_type == "DP" else None,
+        "render_video": False,
+        "capture_rollouts": remote_eval_render_best,
+        "num_convs_per_block": num_convs_per_block,
+        "device": str(device),
+        "latent_dim": latent_dim_value,
+        "latent_hidden_dim": latent_hidden_dim if model_type == "LatentFM" else None,
+        "latent_num_layers": latent_num_layers if model_type == "LatentFM" else None,
+        "latent_residual": latent_residual if model_type == "LatentFM" else None,
+    }
+    validation_evaluator = None
+    if validation_backend == "remote":
+        if remote_eval_config is None:
+            raise ValueError("--remote_eval_config is required when --validation_backend=remote")
+        validation_evaluator = RemoteEvaluator(
+            exp_dir=exp_dir,
+            config=_load_json_config(remote_eval_config),
+            mode=remote_eval_mode,
+            timeout_sec=remote_eval_timeout_sec,
+            poll_interval_sec=remote_eval_poll_interval_sec,
+            render_best=remote_eval_render_best,
+        )
+        print(f"[validation] backend=remote mode={remote_eval_mode}")
+    elif validation_backend == "none":
+        print("[validation] backend=none; skipping in-training and fresh RoboSuite evaluation")
+    else:
+        print("[validation] backend=local")
+    effective_val_period = 0 if validation_backend == "none" else val_period
+    effective_eval_fresh = False if validation_backend in ("none", "remote") else eval_fresh
+
     if vision_online_training and flow is not None:
         dataset_dir = os.path.dirname(os.path.abspath(dataset_path))
 
@@ -1058,12 +1138,14 @@ def train_and_eval_model(
                     max_epochs=max_epochs,
                     batch_size=batch_size,
                     interpolation_path=interpolation_path,
-                    val_period=val_period,
+                    val_period=effective_val_period,
                     early_stopping=early_stopping,
                     stop_criteria=stop_criteria,
                     val_trials=val_trials,
                     recorded_control_freq=recorded_control_freq,
                     trajectory_control_freq=trajectory_control_freq,
+                    evaluator=validation_evaluator,
+                    eval_metadata=eval_metadata,
                 )
             else:
                 best_model, last_model, recs, mixture_sampler = flow.train(**train_kwargs)
@@ -1074,7 +1156,7 @@ def train_and_eval_model(
                 n_t=n_t,
                 max_epochs=max_epochs,
                 batch_size=batch_size,
-                val_period=val_period,
+                val_period=effective_val_period,
                 early_stopping=early_stopping,
                 stop_criteria=stop_criteria,
                 val_trials=val_trials,
@@ -1084,6 +1166,8 @@ def train_and_eval_model(
                 eval_base_seed=seed + 1,
                 recorded_control_freq=recorded_control_freq,
                 trajectory_control_freq=trajectory_control_freq,
+                evaluator=validation_evaluator,
+                eval_metadata=eval_metadata,
             )
         training_thread_time_seconds = time.thread_time() - train_time_start
         print(f"Training thread time: {training_thread_time_seconds:.3f}s")
@@ -1164,7 +1248,7 @@ def train_and_eval_model(
     best_validation_epoch = None
 
     # evaluate model
-    if eval_fresh:
+    if effective_eval_fresh:
         print(f"Training finished, evaluating for {evaluation_samples} fresh trials . . .")
         eval_workers = 5 if task_name == "two_arm" else 10
         print(f"[Eval] rollout_workers={eval_workers}")
@@ -1261,28 +1345,38 @@ def train_and_eval_model(
                                                         normalization_stats=normalization_stats,
                                                         action_representation=action_representation)
     else:
-        if model_path is not None:
-            raise ValueError("eval_fresh=False is only available immediately after training, because it uses validation records and saved validation rollouts.")
-        success_rate_best, avg_last_10_validation_success_rate, best_validation_epoch, avg_reward_best = _summarize_validation_records(recs)
-        max_validation_success_rate = success_rate_best
-        print(
-            "Training finished, reporting validation metrics without fresh environments: "
-            f"max_success={max_validation_success_rate:.3f} at epoch {best_validation_epoch}, "
-            f"avg_last_10_success={avg_last_10_validation_success_rate:.3f}"
-        )
-        if validation_rollouts is None:
-            print("[Skipped validation rollout render: no best validation rollouts were captured]")
+        if validation_backend == "none":
+            success_rate_best = float("nan")
+            avg_reward_best = float("nan")
+            print("Training finished without validation or fresh evaluation.")
         else:
-            _render_rollout_grid(
-                task_name,
-                exp_dir,
-                "best_validation",
-                render_width=4,
-                render_num=8,
-                success_info=validation_rollouts.get("success", []),
-                failure_info=validation_rollouts.get("failure", []),
-                action_representation=action_representation,
-            )
+            if model_path is not None:
+                raise ValueError("eval_fresh=False is only available immediately after training, because it uses validation records and saved validation rollouts.")
+            if not recs:
+                success_rate_best = float("nan")
+                avg_reward_best = float("nan")
+                print("Training finished without validation records to summarize.")
+            else:
+                success_rate_best, avg_last_10_validation_success_rate, best_validation_epoch, avg_reward_best = _summarize_validation_records(recs)
+                max_validation_success_rate = success_rate_best
+                print(
+                    "Training finished, reporting validation metrics without fresh environments: "
+                    f"max_success={max_validation_success_rate:.3f} at epoch {best_validation_epoch}, "
+                    f"avg_last_10_success={avg_last_10_validation_success_rate:.3f}"
+                )
+                if validation_rollouts is None:
+                    print("[Skipped validation rollout render: no best validation rollouts were captured]")
+                else:
+                    _render_rollout_grid(
+                        task_name,
+                        exp_dir,
+                        "best_validation",
+                        render_width=4,
+                        render_num=8,
+                        success_info=validation_rollouts.get("success", []),
+                        failure_info=validation_rollouts.get("failure", []),
+                        action_representation=action_representation,
+                    )
     print(f"Success rate : {success_rate_best:.3f}, Average reward : {avg_reward_best:.3f}")
 
 
@@ -1583,6 +1677,12 @@ if __name__ == "__main__":
                         help="Use an exponential moving average of model weights for validation, final evaluation, and checkpoint saving.")
     parser.add_argument("--eval_fresh", action=argparse.BooleanOptionalAction, default=True,
                         help="When true, evaluate on newly generated environments after training. When false, report validation metrics and render best validation rollouts.")
+    parser.add_argument("--validation_backend", choices=["local", "remote", "none"], default="local")
+    parser.add_argument("--remote_eval_config", type=str, default=None)
+    parser.add_argument("--remote_eval_mode", choices=["direct", "queue"], default="direct")
+    parser.add_argument("--remote_eval_render_best", action="store_true")
+    parser.add_argument("--remote_eval_timeout_sec", type=int, default=3600)
+    parser.add_argument("--remote_eval_poll_interval_sec", type=float, default=5.0)
     parser.add_argument("--latent_compression_rate", type=float, default=0.25,
                         help="LatentFM bottleneck fraction of the flattened trajectory dimension.")
     parser.add_argument("--latent_ae_epochs", type=int, default=None,
@@ -1725,4 +1825,10 @@ if __name__ == "__main__":
         latent_num_layers  = args.latent_num_layers,
         latent_residual    = args.latent_residual,
         action_representation = args.action_representation,
+        validation_backend = args.validation_backend,
+        remote_eval_config = args.remote_eval_config,
+        remote_eval_mode = args.remote_eval_mode,
+        remote_eval_render_best = args.remote_eval_render_best,
+        remote_eval_timeout_sec = args.remote_eval_timeout_sec,
+        remote_eval_poll_interval_sec = args.remote_eval_poll_interval_sec,
     )
