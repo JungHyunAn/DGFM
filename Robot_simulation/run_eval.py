@@ -1166,6 +1166,8 @@ def train_and_eval_model(
     # evaluate model
     if eval_fresh:
         print(f"Training finished, evaluating for {evaluation_samples} fresh trials . . .")
+        eval_workers = 5 if task_name == "two_arm" else 10
+        print(f"[Eval] rollout_workers={eval_workers}")
 
         # ====== PARALLEL ENV GENERATION ======
         env_params_list: list[np.ndarray] = [None] * evaluation_samples
@@ -1211,6 +1213,7 @@ def train_and_eval_model(
                 env_settings_all=env_settings_all,
                 device=device,
                 trials=evaluation_samples,
+                num_workers=eval_workers,
                 render_width=4,
                 render_num=8,
                 base_seed=seed+2,
@@ -1244,6 +1247,7 @@ def train_and_eval_model(
                                                         env_settings_all=env_settings_all,
                                                         device=device,
                                                         trials=evaluation_samples,
+                                                        num_workers=eval_workers,
                                                         render_width=4,
                                                         render_num=8,
                                                         base_seed=seed+2,
@@ -1312,6 +1316,7 @@ def train_and_eval_model(
             "latent_num_layers": latent_num_layers if model_type == "LatentFM" else None,
             "latent_residual": latent_residual if model_type == "LatentFM" else None,
             "eval_fresh": eval_fresh,
+            "eval_workers": eval_workers if eval_fresh else None,
             "normalization_stats": _normalization_stats_to_json(normalization_stats),
             "max_policy_steps": max_policy_steps,
             "observation_horizon": observation_horizon,
@@ -1443,6 +1448,7 @@ def train_and_eval_model(
             "success_rate_best": success_rate_best,
             "average_reward_best": avg_reward_best,
             "eval_fresh": eval_fresh,
+            "eval_workers": eval_workers if eval_fresh else None,
             "normalize_data": normalize_data,
             "action_representation": action_representation,
             "observation_type": observation_type,
