@@ -755,8 +755,8 @@ def train_and_eval_model(
     elif task_name == "two_arm":
         gripper_idx = [7, 15]
 
-    # num_convs_per_block = 2 if task_name == "nut" else 1
-    num_convs_per_block = 1 # fix as 1
+    num_convs_per_block = 2 if task_name == "nut" else 1
+    # num_convs_per_block = 1 # fix as 1
 
     latent_dim_value = None
     if model_type == "LatentFM":
