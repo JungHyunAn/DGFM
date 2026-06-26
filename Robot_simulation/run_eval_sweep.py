@@ -145,7 +145,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("task_name", choices=sorted(DEMO_SIZES_BY_TASK))
     parser.add_argument("seed", type=int)
     parser.add_argument("--resume", action="store_true", help="Skip completed runs in the sweep results folder.")
-    return parser.parse_args()
+    parser.add_argument("--validation_backend", choices=["local", "remote", "none"], default=None)
+    parser.add_argument("--remote_eval_config", type=str, default=None)
+    parser.add_argument("--remote_eval_mode", choices=["direct", "queue"], default=None)
+    parser.add_argument("--remote_eval_render_best", action="store_true")
+    parser.add_argument("--remote_eval_timeout_sec", type=int, default=None)
+    parser.add_argument("--remote_eval_poll_interval_sec", type=float, default=None)
+    args = parser.parse_args()
+    if args.validation_backend is None and args.remote_eval_config is not None:
+        args.validation_backend = "remote"
+    if args.validation_backend == "remote" and args.remote_eval_config is None:
+        parser.error("--remote_eval_config is required when --validation_backend=remote")
+    return args
 
 
 def build_config(
@@ -211,7 +222,25 @@ BOOLEAN_OPTIONAL_KEYS = {
     "dp_clip_sample",
     "normalize_data",
     "eval_fresh",
+    "remote_eval_render_best",
 }
+
+
+def apply_validation_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    config = dict(config)
+    if args.validation_backend is not None:
+        config["validation_backend"] = args.validation_backend
+    if args.remote_eval_config is not None:
+        config["remote_eval_config"] = args.remote_eval_config
+    if args.remote_eval_mode is not None:
+        config["remote_eval_mode"] = args.remote_eval_mode
+    if args.remote_eval_render_best:
+        config["remote_eval_render_best"] = True
+    if args.remote_eval_timeout_sec is not None:
+        config["remote_eval_timeout_sec"] = args.remote_eval_timeout_sec
+    if args.remote_eval_poll_interval_sec is not None:
+        config["remote_eval_poll_interval_sec"] = args.remote_eval_poll_interval_sec
+    return config
 
 
 def config_to_cli_args(config: dict[str, Any]) -> list[str]:
@@ -272,11 +301,14 @@ def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
     sweep = build_sweep(args.task_name, args.seed)
+    sweep = [apply_validation_overrides(config, args) for config in sweep]
     sweep_results_path = Path(sweep[0]["results_path"])
 
     print(f"[sweep] Prepared {len(sweep)} runs. Results path: {sweep_results_path}")
     if args.resume:
         print("[sweep] Resume enabled: completed matching runs will be skipped.")
+    if args.validation_backend is not None:
+        print(f"[sweep] validation_backend={args.validation_backend}")
 
     for run_idx, config in enumerate(sweep, start=1):
         completed_path = completed_result_path(config) if args.resume else None
