@@ -1,6 +1,9 @@
 # DGFM (Dimension-Guided Flow Matching) — requirements.txt
 # --- Core compute ---
-torch>=2.3,<2.8          # install the right CUDA/CPU wheel yourself first
+# Install the right CUDA/CPU wheel yourself first. RTX 50-series / Blackwell
+# GPUs require a CUDA 12.8+ or CUDA 13.0 PyTorch wheel; for example:
+#   pip install torch==2.12.1+cu130 --index-url https://download.pytorch.org/whl/cu130
+torch>=2.7
 numpy>=1.26,<3.0
 scipy>=1.11,<2.0
 

@@ -227,6 +227,9 @@ class RemoteEvaluator(BaseEvaluator):
         return response
 
     def _build_request(self, request_id: str, epoch: int, metadata: dict) -> EvaluationRequest:
+        metadata = dict(metadata)
+        if metadata.get("flow_steps") is None and metadata.get("n_t") is not None:
+            metadata["flow_steps"] = metadata["n_t"]
         fields = set(EvaluationRequest.__dataclass_fields__)
         payload = {k: metadata.get(k) for k in fields if k in metadata}
         payload.update(
