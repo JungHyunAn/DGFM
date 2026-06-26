@@ -18,6 +18,14 @@ from typing import Any
 
 
 METHODS = ("UniformFM", "DP", "DGFMv2")
+PREFERRED_DGFM_ROOT = Path("/PublicHDD/ajh916/DGFM")
+FALLBACK_DGFM_ROOT = Path(__file__).resolve().parents[1]
+
+
+def dgfm_path(relative_path: str) -> str:
+    root = PREFERRED_DGFM_ROOT if PREFERRED_DGFM_ROOT.exists() else FALLBACK_DGFM_ROOT
+    return str(root / relative_path)
+
 
 DEMO_SIZES_BY_TASK = {
     "door": (20, 40, 80),
@@ -48,7 +56,7 @@ CLUSTER_PARTITIONS_BY_TASK = {
 }
 
 DATASET_PATH_BY_TASK = {
-    "door": "/PublicHDD/ajh916/DGFM/Robot_simulation/heuristic_dataset/door_joint_space_dataset_1000_vision.hdf5",
+    "door": dgfm_path("Robot_simulation/heuristic_dataset/door_joint_space_dataset_1000_vision.hdf5"),
     "wipe": None,
     "two_arm": None,
     "nut": None,
@@ -59,7 +67,7 @@ SLEEP_SECONDS_BETWEEN_RUNS = 500
 
 SHARED_CONFIG: dict[str, Any] = {
     "use_ema": False,
-    "results_path": "/PublicHDD/ajh916/DGFM/Robot_simulation/eval_results/{task_name}/sweep_{seed}",
+    "results_path": dgfm_path("Robot_simulation/eval_results/{task_name}/sweep_{seed}"),
     "device": "cuda",
     "n_t": 1,
     "learning_rate": 0.0001,
@@ -303,6 +311,7 @@ def main() -> None:
     sweep = build_sweep(args.task_name, args.seed)
     sweep = [apply_validation_overrides(config, args) for config in sweep]
     sweep_results_path = Path(sweep[0]["results_path"])
+    sweep_results_path.mkdir(parents=True, exist_ok=True)
 
     print(f"[sweep] Prepared {len(sweep)} runs. Results path: {sweep_results_path}")
     if args.resume:
