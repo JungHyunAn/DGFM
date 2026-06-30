@@ -30,7 +30,7 @@ def generate_two_arm_trajectory(
 
     Trajectory Phases:
       • PHASE1‑1: 100‑step approach to a random offset around each handle
-      • PHASE1‑2: 100-step descend to handle
+      • PHASE1‑2: 75-step descend to handle
       • PHASE2: 10-step grasping handle
       • PHASE3: (lift_steps)‑step lift (keep level)
 
@@ -175,13 +175,13 @@ def generate_two_arm_trajectory(
 
         env.step(a)
         record_q()
-    # ---------- PHASE1‑2: 100-step descend to handle ----------
+    # ---------- PHASE1‑2: 75-step descend to handle ----------
     gripper_pose = np.array([1.0, 1.0], dtype=np.float32)
-    for _ in range(100):
+    for _ in range(75):
         a = np.zeros(adim)
         # small downward move
-        a[2] = -0.105
-        a[9] = -0.105
+        a[2] = -0.14
+        a[9] = -0.14
         # keep orientation & open gripper
         a[6]  = -1
         a[13] = -1

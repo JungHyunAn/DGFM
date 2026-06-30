@@ -17,6 +17,7 @@ annoy==1.17.3
 # --- Data I/O ---
 h5py>=3.9,<4.0
 pyyaml>=6.0,<7.0
+gdown
 
 # --- Robotics & simulation ---
 # robosuite 1.5 targets the official 'mujoco' package (not mujoco-py).

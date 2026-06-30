@@ -45,6 +45,8 @@ Task-specific notes
 -------------------
 - Wipe: table size / offsets and marker count are set for consistency.
 - Nut: table is slightly lifted to avoid initial penetrations.
+- Two-arm lift: pot placement is restricted to a tighter region than RoboSuite's
+  default sampler.
 """
 
 import imageio
@@ -705,6 +707,17 @@ def make_env(
 
     elif task_name == "two_arm":
         cfg = load_composite_controller_config(robot="Panda")
+        two_arm_sampler = UniformRandomSampler(
+            name="pot_placer",
+            mujoco_objects=None,  # TwoArmLift adds the pot object internally
+            x_range=[-0.015, 0.015],
+            y_range=[-0.015, 0.015],
+            rotation=(np.pi - np.pi / 6, np.pi + np.pi / 6),
+            rotation_axis="z",
+            reference_pos=(0.0, 0.0, 0.8),  # TwoArmLift table offset
+            ensure_object_boundary_in_range=False,
+            ensure_valid_placement=True,
+        )
         if use_joint_control: # for rendering
             for arm_key, bp in cfg["body_parts"].items():
                 grip_spec = bp["gripper"]
@@ -725,6 +738,7 @@ def make_env(
             robots=["Panda", "Panda"],
             controller_configs=cfg,
             env_configuration="parallel",
+            placement_initializer=two_arm_sampler,
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
             use_camera_obs=use_camera_obs,
