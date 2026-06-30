@@ -66,7 +66,7 @@ SLEEP_SECONDS_BETWEEN_RUNS = 500
 
 
 SHARED_CONFIG: dict[str, Any] = {
-    "use_ema": False,
+    "use_ema": True,
     "results_path": dgfm_path("Robot_simulation/eval_results/{task_name}/sweep_{seed}"),
     "device": "cuda",
     "n_t": 1,
