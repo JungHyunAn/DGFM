@@ -35,7 +35,9 @@ from Robot_simulation.models.DGFMv2_class import (
 from Robot_simulation.models.VanillaFM_class import EMAModel, VectorField
 from Robot_simulation.models.vision_encoder import FrozenResNet18Encoder
 
-DEFAULT_CONFIG = Path(__file__).resolve().parent / "real_config" / "peg_in_hole.json"
+DEFAULT_CONFIG = (
+    Path(__file__).resolve().parent / "real_config" / "peg_in_hole_uniformfm_50.json"
+)
 MODEL_TYPES = ("UniformFM", "DGFMv2", "DiffusionPolicy")
 MODEL_TYPE_ALIASES = {"fm": "UniformFM", "diffusion": "DiffusionPolicy", "DP": "DiffusionPolicy"}
 

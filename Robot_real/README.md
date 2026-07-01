@@ -53,30 +53,28 @@ Run training from the repository root.
 
 ```bash
 python -m Robot_real.train_model \
-  --config Robot_real/real_config/peg_in_hole_uniformfm.json
+  --config Robot_real/real_config/peg_in_hole_uniformfm_50.json
 ```
 
 ### DGFMv2
 
 ```bash
 python -m Robot_real.train_model \
-  --config Robot_real/real_config/peg_in_hole_dgfmv2.json
+  --config Robot_real/real_config/peg_in_hole_dgfmv2_50.json
 ```
 
 ### DiffusionPolicy
 
 ```bash
 python -m Robot_real.train_model \
-  --config Robot_real/real_config/peg_in_hole_diffusion.json
+  --config Robot_real/real_config/peg_in_hole_diffusion_50.json
 ```
     
-Common command-line overrides include:
+To train the corresponding 25-demo variant:
 
 ```bash
 python -m Robot_real.train_model \
-  --config Robot_real/real_config/peg_in_hole_uniformfm.json \
-  --dataset-size 25 \
-  --epochs 500 \
+  --config Robot_real/real_config/peg_in_hole_uniformfm_25.json \
   --device cuda
 ```
 

@@ -30,3 +30,4 @@ remote_eval/
 Robot_real/real_dataset/
 Robot_real/__pycache__/
 Robot_real/checkpoints/
+Synthetic_visualize/
