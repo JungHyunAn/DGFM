@@ -69,7 +69,7 @@ python -m Robot_real.train_model \
 python -m Robot_real.train_model \
   --config Robot_real/real_config/peg_in_hole_diffusion.json
 ```
-
+    
 Common command-line overrides include:
 
 ```bash
@@ -83,7 +83,9 @@ python -m Robot_real.train_model \
 `dataset_size` selects demonstrations as uniformly as possible across the
 timestamp-ordered dataset. Validation first uses demonstrations not selected
 for training. If more validation demonstrations are requested, the remainder
-are sampled once from the training demonstrations.
+are selected uniformly from the training demonstrations. The split depends
+only on the total demonstration count, `dataset_size`, and `val_samples`; the
+model type and random seed do not affect it.
 
 Checkpoints are written under `Robot_real/checkpoints`. The saved weights are
 always from the final training epoch:

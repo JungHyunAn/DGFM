@@ -241,15 +241,19 @@ def select_train_validation_demos(
     *,
     validation: bool = True,
     val_samples: int = 5,
-    seed: int = 0,
 ) -> tuple[list[AlignedDemo], list[AlignedDemo], list[int], list[int]]:
-    """Choose uniform training demos, preferring unused demos for validation."""
+    """Choose deterministic uniform train/validation indices from dataset sizes."""
     train_indices = uniform_demo_indices(len(demos), dataset_size)
     if not validation or val_samples <= 0:
         return [demos[i] for i in train_indices], [], train_indices, []
 
-    unused = [i for i in range(len(demos)) if i not in set(train_indices)]
-    val_indices = unused[:val_samples]
+    train_index_set = set(train_indices)
+    unused = [i for i in range(len(demos)) if i not in train_index_set]
+    unused_count = min(val_samples, len(unused))
+    unused_positions = (
+        uniform_demo_indices(len(unused), unused_count) if unused_count else []
+    )
+    val_indices = [unused[position] for position in unused_positions]
     needed = val_samples - len(val_indices)
     if needed:
         if needed > len(train_indices):
@@ -257,8 +261,8 @@ def select_train_validation_demos(
                 f"val_samples={val_samples} cannot be filled from {len(unused)} unused "
                 f"and {len(train_indices)} training demonstrations without replacement"
             )
-        rng = np.random.default_rng(seed)
-        val_indices.extend(int(i) for i in rng.choice(train_indices, needed, replace=False))
+        train_positions = uniform_demo_indices(len(train_indices), needed)
+        val_indices.extend(train_indices[position] for position in train_positions)
     return (
         [demos[i] for i in train_indices],
         [demos[i] for i in val_indices],

@@ -567,7 +567,10 @@ def train(config: dict[str, Any]) -> Path:
         config.get("dataset_size"),
         validation=config["validation"],
         val_samples=config["val_samples"],
-        seed=config["seed"],
+    )
+    print(
+        f"Dataset split: train_indices={train_indices} val_indices={val_indices} "
+        f"val_demos={[demo.name for demo in val_demos]}"
     )
     stats = compute_joint_stats(train_demos)
     train_dataset = ActionChunkDataset(

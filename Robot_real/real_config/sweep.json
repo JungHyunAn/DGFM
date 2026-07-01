@@ -6,7 +6,7 @@
   "camera_dir": null,
   "trajectory_dir": null,
   "checkpoint_path": "Robot_real/checkpoints/sweep_uniformfm.pt",
-  "dataset_size": 40,
+  "dataset_size": 50,
   "use_gripper": false,
   "horizon": 16,
   "image_size": 224,
