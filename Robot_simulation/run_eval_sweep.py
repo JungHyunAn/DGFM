@@ -30,35 +30,42 @@ def dgfm_path(relative_path: str) -> str:
 DEMO_SIZES_BY_TASK = {
     "door": (20, 40, 80),
     "wipe": (),
-    "two_arm": (),
+    "two_arm": (40, 80, 160),
     "nut": (),
 }
 
 MAX_EPOCHS_BY_TASK = {
     "door": (4000, 2000, 1000),
     "wipe": (),
-    "two_arm": (),
+    "two_arm": (2000, 1000, 500),
     "nut": (),
 }
 
 VAL_PERIODS_BY_TASK = {
     "door": (80, 40, 20),
     "wipe": (),
-    "two_arm": (),
+    "two_arm": (40, 20, 10),
     "nut": (),
 }
 
 CLUSTER_PARTITIONS_BY_TASK = {
     "door": (10, 20, 40),
     "wipe": (),
-    "two_arm": (),
+    "two_arm": (10, 20, 40),
     "nut": (),
 }
 
 DATASET_PATH_BY_TASK = {
     "door": dgfm_path("Robot_simulation/heuristic_dataset/door_joint_space_dataset_1000_vision.hdf5"),
     "wipe": None,
-    "two_arm": None,
+    "two_arm": dgfm_path("Robot_simulation/heuristic_dataset/two_arm_joint_space_dataset_1000_vision.hdf5"),
+    "nut": None,
+}
+
+CAMERA_NAMES_BY_TASK = {
+    "door": ["frontview", "robot0_eye_in_hand"],
+    "wipe": None,
+    "two_arm": ["frontview", "robot0_eye_in_hand", "robot1_eye_in_hand"],
     "nut": None,
 }
 
@@ -84,10 +91,6 @@ SHARED_CONFIG: dict[str, Any] = {
     "max_policy_steps": 40,
     "observation_horizon": 1,
     "observation_type": "vision",
-    "camera_names": [
-        "frontview",
-        "robot0_eye_in_hand",
-    ],
     "vision_batch_size": 128,
     "condition_embed_dim": 256,
     "vision_finetune": True,
@@ -183,6 +186,7 @@ def build_config(
         "task_name": task_name,
         "dataset_path": DATASET_PATH_BY_TASK[task_name],
         "results_path": SHARED_CONFIG["results_path"].format(task_name=task_name, seed=seed),
+        "camera_names": CAMERA_NAMES_BY_TASK[task_name],
         "max_epochs": max_epochs,
         "warmup_steps": int(max_epochs * 0.2),
         "val_period": val_period,

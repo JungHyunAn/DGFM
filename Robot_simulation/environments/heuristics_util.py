@@ -68,7 +68,7 @@ from robosuite.environments.manipulation.wipe import Wipe
 from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
-from robosuite.utils.placement_samplers import UniformRandomSampler
+from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
 from robosuite.utils.transform_utils import mat2quat, quat_inverse, quat_multiply, quat_slerp
 
 PANDA_GRIPPER_OPEN_QPOS = 0.04
@@ -755,6 +755,33 @@ def make_env(
             env.sim.forward()
     elif task_name == "nut":
         cfg = load_composite_controller_config(robot="Panda")
+        nut_sampler = SequentialCompositeSampler(name="ObjectSampler")
+        nut_sampler.append_sampler(
+            sampler=UniformRandomSampler(
+                name="SquareNutSampler",
+                x_range=[-0.115, -0.11],
+                y_range=[0.11, 0.16],
+                rotation=(np.pi - np.pi / 6, np.pi + np.pi / 6),
+                rotation_axis="z",
+                ensure_object_boundary_in_range=False,
+                ensure_valid_placement=True,
+                reference_pos=(0.0, 0.0, 0.82),
+                z_offset=0.02,
+            )
+        )
+        nut_sampler.append_sampler(
+            sampler=UniformRandomSampler(
+                name="RoundNutSampler",
+                x_range=[-0.115, -0.11],
+                y_range=[-0.225, -0.11],
+                rotation=None,
+                rotation_axis="z",
+                ensure_object_boundary_in_range=False,
+                ensure_valid_placement=True,
+                reference_pos=(0.0, 0.0, 0.82),
+                z_offset=0.02,
+            )
+        )
         if use_joint_control: # for rendering
             arm_key = next(iter(cfg["body_parts"]))
             orig = cfg["body_parts"][arm_key]
@@ -778,6 +805,7 @@ def make_env(
             single_object_mode=2,
             nut_type="square",
             controller_configs=cfg,
+            placement_initializer=nut_sampler,
             has_renderer=has_renderer,
             has_offscreen_renderer=has_offscreen_renderer,
             use_camera_obs=use_camera_obs,
@@ -789,12 +817,12 @@ def make_env(
         )
         delta_z = 0.1       
         env.table_offset = [0, 0, 0.82 + delta_z]
-        env.placement_initializer = None
         env.reset()
         if environment_setting is None:
             configure_nut_pegs(env, delta_x=-0.05, delta_z=delta_z)
         else:
             restore_environment(env, environment_setting)
+            env.placement_initializer = None
             env.sim.forward()
     else:
         raise ValueError(f"Unsupported task type={task_name}.")
