@@ -5,6 +5,8 @@ import numpy as np
 from robosuite.environments.manipulation.nut_assembly import NutAssembly
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_multiply, quat_inverse
+from robosuite.utils.placement_samplers import SequentialCompositeSampler, UniformRandomSampler
+
 from Robot_simulation.environments.heuristics_util import (
     DEFAULT_VISION_CAMERAS, capture_camera_views, configure_nut_pegs,
     get_environment_state, step_towards,
@@ -240,25 +242,53 @@ def generate_nut_trajectory(
 if __name__ == "__main__":
     # 1) build env with all three offscreen cameras
     cams = ["frontview", "birdview", "robot0_eye_in_hand"]
-    ctrl = load_composite_controller_config(robot="Panda")
+    cfg = load_composite_controller_config(robot="Panda")
+    nut_sampler = SequentialCompositeSampler(name="ObjectSampler")
+    nut_sampler.append_sampler(
+        sampler=UniformRandomSampler(
+            name="SquareNutSampler",
+            x_range=[-0.115, -0.11],
+            y_range=[0.11, 0.16],
+            rotation=(np.pi - np.pi / 6, np.pi + np.pi / 6),
+            rotation_axis="z",
+            ensure_object_boundary_in_range=False,
+            ensure_valid_placement=True,
+            reference_pos=(0.0, 0.0, 0.82),
+            z_offset=0.12,
+        )
+    )
+    nut_sampler.append_sampler(
+        sampler=UniformRandomSampler(
+            name="RoundNutSampler",
+            x_range=[-0.115, -0.11],
+            y_range=[-0.225, -0.11],
+            rotation=None,
+            rotation_axis="z",
+            ensure_object_boundary_in_range=False,
+            ensure_valid_placement=True,
+            reference_pos=(0.0, 0.0, 0.82),
+            z_offset=0.12,
+        )
+    )
 
     env = NutAssembly(
         robots="Panda",
         single_object_mode=2,
         nut_type="square",
-        controller_configs=ctrl,
+        controller_configs=cfg,
+        placement_initializer=nut_sampler,
         has_renderer=False,
         has_offscreen_renderer=True,
         camera_names=cams,
         camera_heights=[480]*3,
         camera_widths =[640]*3,
         camera_depths =[False]*3,
-        render_camera=None,   # not used when offscreen
+        render_camera=None,
         control_freq=20,
     )
-    delta_z = 0.1
-    env.table_offset[2] += delta_z
-    env.reset()    
+    delta_z = 0.1       
+    env.table_offset = [0, 0, 0.82 + delta_z]
+    env.reset()
     
     result = generate_nut_trajectory(
         env,
