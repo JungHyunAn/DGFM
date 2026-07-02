@@ -433,7 +433,7 @@ def worker_generate(
             q_policy = compose_task_space_trajectory(task_name, eef_traj, gripper_pose=gripper_pose)
         else:
             q_policy = normalize_policy_trajectory(task_name, q_traj, gripper_pose=gripper_pose)
-        print(trials, success)
+        # print(trials, success)
         if success:
             successes.append({
                 "joint_angles": q_policy,

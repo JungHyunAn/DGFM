@@ -766,7 +766,7 @@ def make_env(
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
                 reference_pos=(0.0, 0.0, 0.82),
-                z_offset=0.02,
+                z_offset=0.12,
             )
         )
         nut_sampler.append_sampler(
@@ -779,7 +779,7 @@ def make_env(
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
                 reference_pos=(0.0, 0.0, 0.82),
-                z_offset=0.02,
+                z_offset=0.12,
             )
         )
         if use_joint_control: # for rendering
