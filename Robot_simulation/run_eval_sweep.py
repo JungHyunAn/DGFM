@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -340,8 +341,11 @@ def main() -> None:
             f"seed={config['seed']}"
         )
         command = [sys.executable, "-m", "Robot_simulation.run_eval", *config_to_cli_args(config)]
+        env = os.environ.copy()
+        if args.task_name == "two_arm":
+            env["VISION_EVAL_WORKERS"] = "5"
         try:
-            subprocess.run(command, cwd=repo_root, check=True)
+            subprocess.run(command, cwd=repo_root, check=True, env=env)
         except subprocess.CalledProcessError as exc:
             print(
                 f"[sweep] Run failed with exit code {exc.returncode}: "
