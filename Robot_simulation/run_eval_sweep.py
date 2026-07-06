@@ -32,42 +32,42 @@ DEMO_SIZES_BY_TASK = {
     "door": (20, 40, 80),
     "wipe": (),
     "two_arm": (40, 80, 160),
-    "nut": (),
+    "nut": (40, 80, 160),
 }
 
 MAX_EPOCHS_BY_TASK = {
     "door": (4000, 2000, 1000),
     "wipe": (),
     "two_arm": (2000, 1000, 500),
-    "nut": (),
+    "nut": (2000, 1000, 500),
 }
 
 VAL_PERIODS_BY_TASK = {
     "door": (80, 40, 20),
     "wipe": (),
     "two_arm": (40, 20, 10),
-    "nut": (),
+    "nut": (40, 20, 10),
 }
 
 CLUSTER_PARTITIONS_BY_TASK = {
     "door": (10, 20, 40),
     "wipe": (),
     "two_arm": (10, 20, 40),
-    "nut": (),
+    "nut": (10, 20, 40),
 }
 
 DATASET_PATH_BY_TASK = {
     "door": dgfm_path("Robot_simulation/heuristic_dataset/door_joint_space_dataset_1000_vision.hdf5"),
     "wipe": None,
     "two_arm": dgfm_path("Robot_simulation/heuristic_dataset/two_arm_joint_space_dataset_1000_vision.hdf5"),
-    "nut": None,
+    "nut": dgfm_path("Robot_simulation/heuristic_dataset/nut_joint_space_dataset_1000_vision.hdf5"),
 }
 
 CAMERA_NAMES_BY_TASK = {
     "door": ["frontview", "robot0_eye_in_hand"],
     "wipe": None,
     "two_arm": ["frontview", "robot0_eye_in_hand", "robot1_eye_in_hand"],
-    "nut": None,
+    "nut": ["frontview", "robot0_eye_in_hand"],
 }
 
 SLEEP_SECONDS_BETWEEN_RUNS = 500
