@@ -227,10 +227,10 @@ def predict_action_chunk(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("checkpoint", type=Path)
-    parser.add_argument("--front-image", type=Path, required=True)
-    parser.add_argument("--wrist-image", type=Path, required=True)
-    parser.add_argument("--joint-angles", type=float, nargs="+", required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--front-image", type=Path)
+    parser.add_argument("--wrist-image", type=Path)
+    parser.add_argument("--joint-angles", type=float, nargs="+")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sampler-steps", type=int)
     parser.add_argument("--seed", type=int)
@@ -246,9 +246,20 @@ def main() -> None:
         sampler_steps=args.sampler_steps,
         seed=args.seed,
     )
+    zero_image = torch.zeros(
+        (policy.image_size, policy.image_size, 3),
+        dtype=torch.uint8,
+    )
+    images = (
+        args.front_image if args.front_image is not None else zero_image,
+        args.wrist_image if args.wrist_image is not None else zero_image,
+    )
+    joint_angles = (
+        args.joint_angles if args.joint_angles is not None else torch.zeros(policy.dof)
+    )
     action_chunk = policy.predict_action_chunk(
-        (args.front_image, args.wrist_image),
-        args.joint_angles,
+        images,
+        joint_angles,
     )
     result = {
         "joint_names": list(policy.joint_names),

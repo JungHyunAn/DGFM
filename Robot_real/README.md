@@ -149,67 +149,22 @@ Images can be NumPy arrays, PyTorch tensors, or file paths. Array and tensor
 inputs are assumed to already use RGB channel order. Image paths are loaded and
 converted from OpenCV BGR to RGB automatically.
 
-## Receding-horizon control-loop pattern
-
-The training data is 10 Hz. A typical controller predicts 16 targets, executes
-only the first few, then captures a fresh observation and replans:
-
-```python
-import cv2
-import time
-
-from Robot_real.rollout_model import RealRobotPolicy
-
-
-CONTROL_HZ = 10.0
-EXECUTED_HORIZON = 8
-
-policy = RealRobotPolicy(
-    "Robot_real/checkpoints/peg_in_hole_uniformfm.pt",
-    device="cuda",
-)
-
-while not task_finished():
-    front_bgr = front_camera.read()
-    wrist_bgr = wrist_camera.read()
-    current_joints = robot.get_joint_positions()
-
-    action_chunk = policy(
-        (
-            cv2.cvtColor(front_bgr, cv2.COLOR_BGR2RGB),
-            cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB),
-        ),
-        current_joints,
-    )
-
-    for target_joints in action_chunk[:EXECUTED_HORIZON]:
-        # Apply hardware-specific position, velocity, acceleration, collision,
-        # and workspace limits before sending any command.
-        safe_target = enforce_robot_safety_limits(target_joints)
-        robot.command_joint_positions(safe_target)
-        time.sleep(1.0 / CONTROL_HZ)
-
-        if emergency_stop_requested():
-            robot.stop()
-            raise RuntimeError("Emergency stop requested")
-```
-
-The robot SDK calls above are placeholders. Replace them with the API for the
-actual robot and cameras. Production control should use the robot controller's
-timed command interface rather than relying on `time.sleep` for precise timing.
-
-Before commanding hardware, verify joint ordering, units, limits, control
-frequency, camera ordering, and emergency-stop behavior in a non-actuating or
-simulation test. Start with a small executed horizon and conservative motion
-limits.
-
 ## Command-line inference
+
+For a smoke run without camera images or joint readings, only pass the checkpoint.
+Missing images are replaced with zero tensors and missing joints are replaced
+with a zero vector sized from the checkpoint metadata:
+
+```bash
+python -m Robot_real.rollout_model \
+  --checkpoint Robot_real/checkpoints/peg_in_hole_uniformfm_50.pt
+```
 
 For a saved pair of images:
 
 ```bash
 python -m Robot_real.rollout_model \
-  Robot_real/checkpoints/peg_in_hole_uniformfm.pt \
+  --checkpoint Robot_real/checkpoints/peg_in_hole_uniformfm.pt \
   --front-image front.png \
   --wrist-image wrist.png \
   --joint-angles q1 q2 q3 q4 q5 q6 q7
