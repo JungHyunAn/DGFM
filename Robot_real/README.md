@@ -47,7 +47,9 @@ the per-joint `min`, `max`, and `range` needed for inference.
 
 ## Train a model
 
-Run training from the repository root.
+Run training from the repository root. Configs are provided for `peg_in_hole`, `sweep`,
+and `pick_and_place`; swap the task prefix in the config filename to train a
+different real dataset.
 
 ### UniformFM
 
@@ -70,6 +72,13 @@ python -m Robot_real.train_model \
   --config Robot_real/real_config/peg_in_hole_diffusion_50.json
 ```
     
+To train pick-and-place, use the matching task config:
+
+```bash
+python -m Robot_real.train_model \
+  --config Robot_real/real_config/pick_and_place_uniformfm_50.json
+```
+
 To train the corresponding 25-demo variant:
 
 ```bash

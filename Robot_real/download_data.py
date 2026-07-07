@@ -19,6 +19,8 @@ DATASETS = {
     "peg_in_hole_trajectory": "1aHehI6P7tjiDkTdqMkKj3KyYvKo9Tpse",
     "sweep_camera": "1bjXfy5txVUPq9vyuppslVRAiKbymANiE",
     "sweep_trajectory": "1KHhyPZhlswp_TLRq3hiKGpHJenCgHmUW",
+    "pick_and_place_camera": "1Xa5j_zUzNpjB4kzX36gm-g4EHsY5SM2w",
+    "pick_and_place_trajectory": "1vDbzkEw-X720sglMz3HcZHISi1G5f_jJ",
 }
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "real_dataset"
