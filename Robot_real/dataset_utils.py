@@ -116,9 +116,23 @@ def _read_joint_trajectory(
     trajectory_rollout: Path,
     use_gripper: bool,
 ) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
-    trajectory_csv = trajectory_rollout / "teleop_action_joint.csv"
-    if not trajectory_csv.is_file():
-        raise FileNotFoundError(f"Missing joint trajectory: {trajectory_csv}")
+    trajectory_candidates = (
+        ("teleop_action_joint.csv", "joint_positions"),
+        ("right_arm_joints.csv", "positions"),
+    )
+    trajectory_csv: Path | None = None
+    position_column: str | None = None
+    for filename, column in trajectory_candidates:
+        candidate = trajectory_rollout / filename
+        if candidate.is_file():
+            trajectory_csv = candidate
+            position_column = column
+            break
+    if trajectory_csv is None or position_column is None:
+        expected = ", ".join(filename for filename, _ in trajectory_candidates)
+        raise FileNotFoundError(
+            f"Missing joint trajectory in {trajectory_rollout}; expected one of: {expected}"
+        )
 
     timestamps: list[float] = []
     positions: list[list[float]] = []
@@ -126,7 +140,7 @@ def _read_joint_trajectory(
     with trajectory_csv.open(newline="") as stream:
         for row in csv.DictReader(stream):
             names = tuple(item.strip() for item in row["joint_names"].split(","))
-            values = [float(item) for item in row["joint_positions"].split(",")]
+            values = [float(item) for item in row[position_column].split(",")]
             if len(names) != len(values):
                 raise ValueError(f"Joint name/value count differs in {trajectory_csv}")
             if recorded_names is None:

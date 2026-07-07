@@ -27,7 +27,8 @@ Datasets are expected under `Robot_real/real_dataset`:
     realsense/realsense_2/    # wrist view
 
 {task}_trajectory/<rollout timestamp>/
-    teleop_action_joint.csv
+    teleop_action_joint.csv    # legacy/sweep/peg-in-hole format
+    right_arm_joints.csv      # pick-and-place format; positions column
 ```
 
 Camera rollouts and trajectory rollouts are paired in timestamp-folder order.
