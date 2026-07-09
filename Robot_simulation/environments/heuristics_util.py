@@ -759,7 +759,7 @@ def make_env(
         nut_sampler.append_sampler(
             sampler=UniformRandomSampler(
                 name="SquareNutSampler",
-                x_range=[-0.12, -0.11],
+                x_range=[-0.13, -0.11],
                 y_range=[0.11, 0.16],
                 rotation=(np.pi - np.pi / 6, np.pi + np.pi / 6),
                 rotation_axis="z",
