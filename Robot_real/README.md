@@ -33,9 +33,11 @@ Datasets are expected under `Robot_real/real_dataset`:
 ```
 
 Camera rollouts and trajectory rollouts are paired in timestamp-folder order.
-Each 10 Hz camera timestamp is matched to the closest joint sample. Camera
-frames outside the joint recording's time span are discarded, and matching
-fails if the nearest joint sample is more than 50 ms away.
+Each 10 Hz camera timestamp is matched to the closest arm-joint sample. Camera
+frames outside the trajectory recording's time span are discarded, and matching
+fails if the nearest arm-joint sample is more than 50 ms away. The pick-and-place
+gripper position is linearly interpolated at the camera timestamps because its
+CSV can have a different sampling phase.
 
 Each training example contains:
 
@@ -55,9 +57,9 @@ joint state and every timestep of the target action chunk:
 - With `use_gripper: true`, pick-and-place still gets its seven arm positions
   from `right_arm_joints.csv`, then appends one `gripper_position`. This value is
   the mean of `finger_joint1_position` and `finger_joint2_position` from
-  `right_arm_gripper.csv`. The arm and gripper streams are independently aligned
-  to each camera timestamp, so `joint_state` has shape `(8,)` and each action
-  chunk has shape `(16, 8)`.
+  `right_arm_gripper.csv`. Arm positions are matched to the nearest samples and
+  the gripper position is linearly interpolated at each camera timestamp, so
+  `joint_state` has shape `(8,)` and each action chunk has shape `(16, 8)`.
 
 For the legacy sweep and peg-in-hole trajectory format, `use_gripper: true`
 retains all coordinates recorded in `teleop_action_joint.csv`, while `false`

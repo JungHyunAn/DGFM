@@ -224,7 +224,7 @@ def load_aligned_demo(
     use_gripper: bool = False,
     max_alignment_error_s: float = 0.05,
 ) -> AlignedDemo:
-    """Trim to temporal overlap and align 10 Hz images to nearest joint samples."""
+    """Align 10 Hz images to arm samples and interpolated gripper positions."""
     camera_times, image_paths = _read_camera_frames(camera_rollout)
     use_pick_and_place_gripper = task == "pick_and_place" and use_gripper
     joint_times, joint_names, joint_positions = _read_joint_trajectory(
@@ -262,18 +262,20 @@ def load_aligned_demo(
     errors = np.abs(joint_times[joint_nearest] - camera_times)
     aligned_positions = joint_positions[joint_nearest]
     if gripper_times is not None and gripper_positions is not None:
-        gripper_nearest = _nearest_indices(gripper_times, camera_times)
-        gripper_errors = np.abs(gripper_times[gripper_nearest] - camera_times)
-        errors = np.maximum(errors, gripper_errors)
+        aligned_gripper = np.interp(
+            camera_times,
+            gripper_times,
+            gripper_positions,
+        ).astype(np.float32)
         aligned_positions = np.concatenate(
-            [aligned_positions, gripper_positions[gripper_nearest, None]],
+            [aligned_positions, aligned_gripper[:, None]],
             axis=1,
         )
         joint_names = (*joint_names, PICK_AND_PLACE_GRIPPER_NAME)
     if float(errors.max()) > max_alignment_error_s:
         raise ValueError(
             f"Timestamp mismatch in {camera_rollout.name}/{trajectory_rollout.name}: "
-            f"maximum nearest-sample error is {errors.max():.6f}s "
+            f"maximum arm-joint nearest-sample error is {errors.max():.6f}s "
             f"(limit {max_alignment_error_s:.6f}s)"
         )
 
