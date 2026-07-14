@@ -28,7 +28,8 @@ Datasets are expected under `Robot_real/real_dataset`:
 
 {task}_trajectory/<rollout timestamp>/
     teleop_action_joint.csv    # legacy/sweep/peg-in-hole format
-    right_arm_joints.csv      # pick-and-place format; positions column
+    right_arm_joints.csv       # pick-and-place arm positions
+    right_arm_gripper.csv      # pick-and-place finger positions
 ```
 
 Camera rollouts and trajectory rollouts are paired in timestamp-folder order.
@@ -41,6 +42,31 @@ Each training example contains:
 - Current front and wrist RGB images, resized to `224 x 224`.
 - Current joint angles.
 - The next 16 absolute joint-position targets at the camera rate (10 Hz).
+
+### Gripper selection
+
+The `use_gripper` setting controls which coordinates become part of the current
+joint state and every timestep of the target action chunk:
+
+- With `use_gripper: false`, gripper/finger coordinates are excluded. For
+  pick-and-place, only the seven positions in `right_arm_joints.csv` are loaded,
+  so `joint_state` has shape `(7,)` and each action chunk has shape `(16, 7)`.
+  `right_arm_gripper.csv` is not required or read.
+- With `use_gripper: true`, pick-and-place still gets its seven arm positions
+  from `right_arm_joints.csv`, then appends one `gripper_position`. This value is
+  the mean of `finger_joint1_position` and `finger_joint2_position` from
+  `right_arm_gripper.csv`. The arm and gripper streams are independently aligned
+  to each camera timestamp, so `joint_state` has shape `(8,)` and each action
+  chunk has shape `(16, 8)`.
+
+For the legacy sweep and peg-in-hole trajectory format, `use_gripper: true`
+retains all coordinates recorded in `teleop_action_joint.csv`, while `false`
+removes coordinates whose joint name contains `finger`.
+
+The selected coordinates are used consistently for normalization, model input,
+training targets, checkpoint metadata, and rollout output. At inference time,
+the current joint vector must match `policy.joint_names` exactly in both length
+and order.
 
 Joint angles are normalized independently to `[-1, 1]` using the minimum and
 maximum values from the selected training demonstrations. The checkpoint stores
@@ -152,8 +178,9 @@ assert action_chunk.shape == (16, policy.dof)
 
 The returned values are denormalized absolute joint positions, not deltas. For
 the default non-gripper model, the expected joint vector and output dimension
-are seven. A checkpoint trained with `use_gripper: true` expects all recorded
-arm and finger joints. `policy.joint_names` gives the required order.
+are seven. A pick-and-place checkpoint trained with `use_gripper: true` expects
+the seven arm joints followed by the averaged `gripper_position`, for eight
+values total. `policy.joint_names` gives the required order.
 
 Images can be NumPy arrays, PyTorch tensors, or file paths. Array and tensor
 inputs are assumed to already use RGB channel order. Image paths are loaded and
