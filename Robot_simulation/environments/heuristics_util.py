@@ -596,9 +596,9 @@ def make_env(
         door_sampler = UniformRandomSampler(
             name="door_placer",
             mujoco_objects=None,          # Door() will add the door object internally
-            x_range=[-0.05, 0.05],         # push along table x
+            x_range=[-0.075, 0.075],         # push along table x
             y_range=[-0.3, -0.1],
-            rotation=(-np.pi/2 - 0.25, -np.pi/2),
+            rotation=(-np.pi/2 - np.pi/8, -np.pi/2),
             rotation_axis="z",
             reference_pos=(-0.2, -0.35, 0.8),  # same as env.table_offset
             ensure_object_boundary_in_range=False,

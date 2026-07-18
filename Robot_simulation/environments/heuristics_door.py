@@ -233,9 +233,9 @@ if __name__ == "__main__":
     door_sampler = UniformRandomSampler(
         name="door_placer",
         mujoco_objects="door_placer",
-        x_range=[-0.05, 0.05],         # push along table x
+        x_range=[-0.1, 0.1],         # push along table x
         y_range=[-0.3, -0.1],
-        rotation=(-np.pi/2 - 0.25, -np.pi/2),
+        rotation=(-np.pi/2 - np.pi/6, -np.pi/2),
         rotation_axis="z",
         reference_pos=(-0.2, -0.35, 0.8),  # same as env.table_offset
         ensure_object_boundary_in_range=False,
