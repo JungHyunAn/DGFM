@@ -17,6 +17,8 @@ from tqdm import tqdm
 TASK_NAMES = ("peg_in_hole", "sweep", "pick_and_place")
 CAMERA_NAMES = ("frontview", "wristview")
 DEFAULT_DATASET_ROOT = Path(__file__).resolve().parent / "real_dataset"
+PICK_AND_PLACE_ARM_DOF = 7
+PICK_AND_PLACE_GRIPPER_NAME = "gripper_position"
 
 
 @dataclass(frozen=True)
@@ -115,10 +117,16 @@ def _read_camera_frames(camera_rollout: Path) -> tuple[np.ndarray, np.ndarray]:
 def _read_joint_trajectory(
     trajectory_rollout: Path,
     use_gripper: bool,
+    *,
+    task: str | None = None,
 ) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
     trajectory_candidates = (
-        ("teleop_action_joint.csv", "joint_positions"),
-        ("right_arm_joints.csv", "positions"),
+        (("right_arm_joints.csv", "positions"),)
+        if task == "pick_and_place"
+        else (
+            ("teleop_action_joint.csv", "joint_positions"),
+            ("right_arm_joints.csv", "positions"),
+        )
     )
     trajectory_csv: Path | None = None
     position_column: str | None = None
@@ -162,6 +170,44 @@ def _read_joint_trajectory(
     return timestamps_array[order], selected_names, positions_array[order]
 
 
+def _read_pick_and_place_gripper(
+    trajectory_rollout: Path,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Read the mean finger position used as the pick-and-place gripper target."""
+    gripper_csv = trajectory_rollout / "right_arm_gripper.csv"
+    if not gripper_csv.is_file():
+        raise FileNotFoundError(f"Missing gripper trajectory: {gripper_csv}")
+
+    required_columns = (
+        "time",
+        "finger_joint1_position",
+        "finger_joint2_position",
+    )
+    timestamps: list[float] = []
+    positions: list[float] = []
+    with gripper_csv.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        missing_columns = [
+            column for column in required_columns if column not in (reader.fieldnames or ())
+        ]
+        if missing_columns:
+            raise ValueError(
+                f"Missing column(s) in {gripper_csv}: {', '.join(missing_columns)}"
+            )
+        for row in reader:
+            finger_1 = float(row["finger_joint1_position"])
+            finger_2 = float(row["finger_joint2_position"])
+            timestamps.append(float(row["time"]))
+            positions.append(0.5 * (finger_1 + finger_2))
+
+    if not timestamps:
+        raise ValueError(f"No gripper samples found in {gripper_csv}")
+    timestamps_array = np.asarray(timestamps, dtype=np.float64)
+    positions_array = np.asarray(positions, dtype=np.float32)
+    order = np.argsort(timestamps_array)
+    return timestamps_array[order], positions_array[order]
+
+
 def _nearest_indices(reference: np.ndarray, query: np.ndarray) -> np.ndarray:
     right = np.searchsorted(reference, query, side="left")
     right = np.clip(right, 0, len(reference) - 1)
@@ -174,16 +220,37 @@ def load_aligned_demo(
     camera_rollout: Path,
     trajectory_rollout: Path,
     *,
+    task: str | None = None,
     use_gripper: bool = False,
     max_alignment_error_s: float = 0.05,
 ) -> AlignedDemo:
-    """Trim to temporal overlap and align 10 Hz images to nearest joint samples."""
+    """Align 10 Hz images to arm samples and interpolated gripper positions."""
     camera_times, image_paths = _read_camera_frames(camera_rollout)
+    use_pick_and_place_gripper = task == "pick_and_place" and use_gripper
     joint_times, joint_names, joint_positions = _read_joint_trajectory(
-        trajectory_rollout, use_gripper
+        trajectory_rollout,
+        use_gripper=use_gripper and not use_pick_and_place_gripper,
+        task=task,
     )
 
+    gripper_times: np.ndarray | None = None
+    gripper_positions: np.ndarray | None = None
+    if use_pick_and_place_gripper:
+        if len(joint_names) != PICK_AND_PLACE_ARM_DOF:
+            raise ValueError(
+                f"Expected {PICK_AND_PLACE_ARM_DOF} pick-and-place arm joints in "
+                f"{trajectory_rollout}, got {len(joint_names)}: {joint_names}"
+            )
+        gripper_times, gripper_positions = _read_pick_and_place_gripper(
+            trajectory_rollout
+        )
+
     overlap = (camera_times >= joint_times[0]) & (camera_times <= joint_times[-1])
+    if gripper_times is not None:
+        overlap &= (
+            (camera_times >= gripper_times[0])
+            & (camera_times <= gripper_times[-1])
+        )
     camera_times = camera_times[overlap]
     image_paths = image_paths[overlap]
     if len(camera_times) == 0:
@@ -191,12 +258,24 @@ def load_aligned_demo(
             f"No temporal overlap between {camera_rollout.name} and {trajectory_rollout.name}"
         )
 
-    nearest = _nearest_indices(joint_times, camera_times)
-    errors = np.abs(joint_times[nearest] - camera_times)
+    joint_nearest = _nearest_indices(joint_times, camera_times)
+    errors = np.abs(joint_times[joint_nearest] - camera_times)
+    aligned_positions = joint_positions[joint_nearest]
+    if gripper_times is not None and gripper_positions is not None:
+        aligned_gripper = np.interp(
+            camera_times,
+            gripper_times,
+            gripper_positions,
+        ).astype(np.float32)
+        aligned_positions = np.concatenate(
+            [aligned_positions, aligned_gripper[:, None]],
+            axis=1,
+        )
+        joint_names = (*joint_names, PICK_AND_PLACE_GRIPPER_NAME)
     if float(errors.max()) > max_alignment_error_s:
         raise ValueError(
             f"Timestamp mismatch in {camera_rollout.name}/{trajectory_rollout.name}: "
-            f"maximum nearest-sample error is {errors.max():.6f}s "
+            f"maximum arm-joint nearest-sample error is {errors.max():.6f}s "
             f"(limit {max_alignment_error_s:.6f}s)"
         )
 
@@ -206,7 +285,7 @@ def load_aligned_demo(
         trajectory_rollout=trajectory_rollout,
         timestamps_s=camera_times,
         joint_names=joint_names,
-        joints=joint_positions[nearest],
+        joints=aligned_positions,
         image_paths=image_paths,
         alignment_error_s=errors,
     )
@@ -227,6 +306,7 @@ def load_aligned_demos(
         load_aligned_demo(
             camera,
             trajectory,
+            task=task,
             use_gripper=use_gripper,
             max_alignment_error_s=max_alignment_error_s,
         )
