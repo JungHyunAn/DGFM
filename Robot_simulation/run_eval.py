@@ -387,6 +387,7 @@ def train_and_eval_model(
     beta_a: float = 1.5,
     beta_b: float = 1.0,
     interpolation_path: str = "piecewise-linear-midpoint",
+    residual_lambda: float = 0.2,
     max_epochs: int = 1000,
     batch_size: int = 200,
     warmup_steps: int = 200,
@@ -796,6 +797,7 @@ def train_and_eval_model(
         f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
+        f"residual_lambda={residual_lambda} | "
         f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
         f"dp_clip_sample={dp_clip_sample} | dp_clip_sample_range={dp_clip_sample_range} | "
@@ -1142,6 +1144,7 @@ def train_and_eval_model(
                     max_epochs=max_epochs,
                     batch_size=batch_size,
                     interpolation_path=interpolation_path,
+                    residual_lambda=residual_lambda,
                     val_period=effective_val_period,
                     early_stopping=early_stopping,
                     stop_criteria=stop_criteria,
@@ -1444,6 +1447,7 @@ def train_and_eval_model(
             "beta_a":          beta_a,
             "beta_b":          beta_b,
             "interpolation_path": interpolation_path if model_type in ("DGFM", "DGFMv2") else None,
+            "residual_lambda": residual_lambda if model_type in ("DGFM", "DGFMv2") else None,
             "mf":              None,
             "learning_rate":   learning_rate,
             "weight_decay":    weight_decay,
@@ -1609,6 +1613,7 @@ if __name__ == "__main__":
     parser.add_argument("--beta_a",         type=float, default=1.5)
     parser.add_argument("--beta_b",         type=float, default=1.0)
     parser.add_argument("--interpolation_path", type=str, default="piecewise-linear-midpoint")
+    parser.add_argument("--residual_lambda", type=float, default=0.2)
     parser.add_argument("--max_epochs",     type=int,   default=1000)
     parser.add_argument("--batch_size",     type=int,   default=200)
     parser.add_argument("--warmup_steps",    type=int,   default=200)
@@ -1758,6 +1763,7 @@ if __name__ == "__main__":
         beta_a             = args.beta_a,
         beta_b             = args.beta_b,
         interpolation_path = args.interpolation_path,
+        residual_lambda    = args.residual_lambda,
         max_epochs         = args.max_epochs,
         batch_size         = args.batch_size,
         warmup_steps       = args.warmup_steps,

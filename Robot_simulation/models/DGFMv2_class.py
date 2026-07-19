@@ -214,6 +214,7 @@ class DGFMv2(DGFM):
         cluster_sizes,
         n_t,
         interpolation_path,
+        residual_lambda=0.2,
         dgfm_truncated=True,
         dgfm_trunc_low=-1.5,
         dgfm_trunc_high=1.5,
@@ -240,7 +241,9 @@ class DGFMv2(DGFM):
         cr = c.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, c.shape[-1])
         source_idx = idx.unsqueeze(1).expand(-1, n_t).reshape(-1)
 
-        a, b, cc, a_dot, b_dot, c_dot = self._path_weights(t, interpolation_path)
+        a, b, cc, a_dot, b_dot, c_dot = self._path_weights(
+            t, interpolation_path, residual_lambda=residual_lambda
+        )
         xt = a.view(-1, 1, 1) * zr + b.view(-1, 1, 1) * yr + cc.view(-1, 1, 1) * xr
         vt = (
             a_dot.view(-1, 1, 1) * zr
@@ -261,6 +264,7 @@ class DGFMv2(DGFM):
         max_epochs: int,
         batch_size: int,
         interpolation_path: str = "piecewise-linear-midpoint",
+        residual_lambda: float = 0.2,
         val_period: int = 5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
@@ -381,6 +385,7 @@ class DGFMv2(DGFM):
                     cluster_sizes=cluster_sizes,
                     n_t=n_t,
                     interpolation_path=interpolation_path,
+                    residual_lambda=residual_lambda,
                     dgfm_truncated=dgfm_truncated,
                     dgfm_trunc_low=dgfm_trunc_low,
                     dgfm_trunc_high=dgfm_trunc_high,

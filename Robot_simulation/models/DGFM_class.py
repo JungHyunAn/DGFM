@@ -643,7 +643,7 @@ class DGFM(VanillaFM):
 
     path_weight_atol = 1e-5
 
-    def _path_weights(self, t, interpolation_path):
+    def _path_weights(self, t, interpolation_path, residual_lambda=0.2):
         if interpolation_path == "piecewise-linear-midpoint":
             midpoint = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
             left = t < midpoint
@@ -720,7 +720,7 @@ class DGFM(VanillaFM):
             # at the midpoint by adding a small direct x0 -> x1 component.
 
             tau = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
-            lam = torch.as_tensor(0.2, dtype=t.dtype, device=t.device)  # try 0.2 first
+            lam = torch.as_tensor(residual_lambda, dtype=t.dtype, device=t.device)
 
             left = t <= tau
             right = ~left
@@ -831,6 +831,7 @@ class DGFM(VanillaFM):
         cluster_sizes,
         n_t,
         interpolation_path,
+        residual_lambda=0.2,
         dgfm_truncated=True,
         dgfm_trunc_low=-1.5,
         dgfm_trunc_high=1.5,
@@ -857,7 +858,9 @@ class DGFM(VanillaFM):
         zr = z.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
         cr = c.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, self.condition_dim)
 
-        a, b, cc, a_dot, b_dot, c_dot = self._path_weights(t, interpolation_path)
+        a, b, cc, a_dot, b_dot, c_dot = self._path_weights(
+            t, interpolation_path, residual_lambda=residual_lambda
+        )
         xt = a.view(-1, 1, 1) * zr + b.view(-1, 1, 1) * yr + cc.view(-1, 1, 1) * xr
         vt = (
             a_dot.view(-1, 1, 1) * zr
@@ -879,6 +882,7 @@ class DGFM(VanillaFM):
         max_epochs: int,
         batch_size: int,
         interpolation_path: str = "piecewise-linear-midpoint",
+        residual_lambda: float = 0.2,
         val_period: int = 5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
@@ -980,6 +984,7 @@ class DGFM(VanillaFM):
                     cluster_sizes=cluster_sizes,
                     n_t=n_t,
                     interpolation_path=interpolation_path,
+                    residual_lambda=residual_lambda,
                     dgfm_truncated=dgfm_truncated,
                     dgfm_trunc_low=dgfm_trunc_low,
                     dgfm_trunc_high=dgfm_trunc_high,
@@ -1089,4 +1094,3 @@ class DGFM(VanillaFM):
         if not success_rate_recs:
             best_model = self._copy_eval_model()
         return best_model, self.model, success_rate_recs, mixture_sampler
-

@@ -145,6 +145,7 @@ METHOD_CONFIGS: dict[str, dict[str, Any]] = {
         "dgfm_trunc_high": 1.5,
         "time_sampling": "uniform",
         "interpolation_path": "residual-cosine-midpoint",
+        "residual_lambda": 0.2,
     },
 }
 
@@ -156,6 +157,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("task_name", choices=sorted(DEMO_SIZES_BY_TASK))
     parser.add_argument("seed", type=int)
+    parser.add_argument(
+        "--methods",
+        nargs="+",
+        choices=METHODS,
+        default=METHODS,
+        help="Methods to run. Defaults to all methods.",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip completed runs in the sweep results folder.")
     parser.add_argument("--validation_backend", choices=["local", "remote", "none"], default=None)
     parser.add_argument("--remote_eval_config", type=str, default=None)
@@ -198,7 +206,11 @@ def build_config(
     return config
 
 
-def build_sweep(task_name: str, seed: int) -> list[dict[str, Any]]:
+def build_sweep(
+    task_name: str,
+    seed: int,
+    methods: list[str] | tuple[str, ...] = METHODS,
+) -> list[dict[str, Any]]:
     demo_sizes = DEMO_SIZES_BY_TASK[task_name]
     max_epochs = MAX_EPOCHS_BY_TASK[task_name]
     val_periods = VAL_PERIODS_BY_TASK[task_name]
@@ -221,7 +233,7 @@ def build_sweep(task_name: str, seed: int) -> list[dict[str, Any]]:
         for num_demos, epochs, val_period, cluster_partition in zip(
             demo_sizes, max_epochs, val_periods, cluster_partitions, strict=True
         )
-        for method in METHODS
+        for method in methods
     ]
 
 
@@ -304,8 +316,11 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
             continue
         if result.get("warmup steps") != config["warmup_steps"]:
             continue
-        if config["FM_type"] == "DGFMv2" and result.get("cluster_partition") != config["cluster_partition"]:
-            continue
+        if config["FM_type"] == "DGFMv2":
+            if result.get("cluster_partition") != config["cluster_partition"]:
+                continue
+            if result.get("residual_lambda", 0.2) != config["residual_lambda"]:
+                continue
         return result_path
     return None
 
@@ -313,7 +328,7 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
 def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    sweep = build_sweep(args.task_name, args.seed)
+    sweep = build_sweep(args.task_name, args.seed, args.methods)
     sweep = [apply_validation_overrides(config, args) for config in sweep]
     sweep_results_path = Path(sweep[0]["results_path"])
     sweep_results_path.mkdir(parents=True, exist_ok=True)
