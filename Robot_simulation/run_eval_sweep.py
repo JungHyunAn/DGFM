@@ -164,6 +164,7 @@ def parse_args() -> argparse.Namespace:
         default=METHODS,
         help="Methods to run. Defaults to all methods.",
     )
+    parser.add_argument("--residual_lambda", type=float, default=0.2)
     parser.add_argument("--resume", action="store_true", help="Skip completed runs in the sweep results folder.")
     parser.add_argument("--validation_backend", choices=["local", "remote", "none"], default=None)
     parser.add_argument("--remote_eval_config", type=str, default=None)
@@ -187,6 +188,7 @@ def build_config(
     max_epochs: int,
     val_period: int,
     cluster_partition: int,
+    residual_lambda: float = 0.2,
 ) -> dict[str, Any]:
     config = {
         **SHARED_CONFIG,
@@ -203,6 +205,7 @@ def build_config(
     }
     if method == "DGFMv2":
         config["cluster_partition"] = cluster_partition
+        config["residual_lambda"] = residual_lambda
     return config
 
 
@@ -210,6 +213,7 @@ def build_sweep(
     task_name: str,
     seed: int,
     methods: list[str] | tuple[str, ...] = METHODS,
+    residual_lambda: float = 0.2,
 ) -> list[dict[str, Any]]:
     demo_sizes = DEMO_SIZES_BY_TASK[task_name]
     max_epochs = MAX_EPOCHS_BY_TASK[task_name]
@@ -229,7 +233,16 @@ def build_sweep(
         )
 
     return [
-        build_config(task_name, seed, method, num_demos, epochs, val_period, cluster_partition)
+        build_config(
+            task_name,
+            seed,
+            method,
+            num_demos,
+            epochs,
+            val_period,
+            cluster_partition,
+            residual_lambda,
+        )
         for num_demos, epochs, val_period, cluster_partition in zip(
             demo_sizes, max_epochs, val_periods, cluster_partitions, strict=True
         )
@@ -328,7 +341,12 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
 def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
-    sweep = build_sweep(args.task_name, args.seed, args.methods)
+    sweep = build_sweep(
+        args.task_name,
+        args.seed,
+        args.methods,
+        residual_lambda=args.residual_lambda,
+    )
     sweep = [apply_validation_overrides(config, args) for config in sweep]
     sweep_results_path = Path(sweep[0]["results_path"])
     sweep_results_path.mkdir(parents=True, exist_ok=True)
