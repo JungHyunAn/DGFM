@@ -32,6 +32,8 @@ BASE_CONFIG = {
     "noise_std": 1e-4,
     "truncation": 1.5,
     "int_inject": 0.5,
+    "interpolation_path": "residual-cosine-midpoint",
+    "residual_lambda": 0.4,
     "early_stopping": False,
 }
 
@@ -59,15 +61,14 @@ def build_sweep(seed: int, results_root: Path) -> list[dict]:
             "sample_size": sample_size,
             "cluster_num": cluster_num,
             "target_distribution": distribution,
-            "trial_idx": trial_idx,
-            "seed": seed + trial_idx,
+            "seed": seed,
+            "trials": TRIALS,
             "sweep_seed": seed,
             "aggregate_file": results_root
             / f"{TARGET_DISTRIBUTION_NAMES[distribution]}.json",
         }
         for distribution in TARGET_DISTRIBUTIONS
         for sample_size, cluster_num in zip(SAMPLE_SIZES, CLUSTER_NUMS, strict=True)
-        for trial_idx in range(TRIALS)
     ]
 
 
@@ -89,13 +90,17 @@ def is_complete(config: dict) -> bool:
     except (OSError, json.JSONDecodeError):
         return False
     sample_result = result.get("sample_sizes", {}).get(str(config["sample_size"]), {})
-    trial_result = sample_result.get("trials", {}).get(str(config["trial_idx"]), {})
+    trials = sample_result.get("trials", {})
     return (
         result.get("seed") == config["sweep_seed"]
         and all(result.get("config", {}).get(key) == value for key, value in BASE_CONFIG.items())
         and sample_result.get("cluster_num") == config["cluster_num"]
-        and trial_result.get("seed") == config["seed"]
-        and set(trial_result.get("results", {})) == {"UniformFM", "DGFMv2"}
+        and all(
+            trials.get(str(trial_idx), {}).get("seed") == config["seed"] + trial_idx
+            and set(trials.get(str(trial_idx), {}).get("results", {}))
+            == {"UniformFM", "DGFMv2"}
+            for trial_idx in range(config["trials"])
+        )
     )
 
 
@@ -115,7 +120,7 @@ def main() -> None:
             print(
                 f"[sweep] ({run_idx}/{len(sweep)}) skipping distribution="
                 f"{config['target_distribution']} N={config['sample_size']} "
-                f"trial={config['trial_idx']}"
+                f"trials={config['trials']}"
             )
             continue
 
@@ -132,7 +137,7 @@ def main() -> None:
         print(
             f"[sweep] ({run_idx}/{len(sweep)}) distribution="
             f"{config['target_distribution']} N={config['sample_size']} "
-            f"clusters={config['cluster_num']} trial={config['trial_idx']} "
+            f"clusters={config['cluster_num']} trials={config['trials']} "
             f"seed={config['seed']}"
         )
         try:

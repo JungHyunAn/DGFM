@@ -7,7 +7,8 @@ This directory contains synthetic experiments for evaluating Dimension-Guided Fl
 The implementations now live in `Synthetic_data.models`:
 
 - **UniformFM** - standard flow matching; pass `time_sampling="shifted"` for shifted-time sampling.
-- **DGFMv2** - condition-free DGFM with full-dimensional cluster intermediates.
+- **DGFMv2** - condition-free DGFM with full-dimensional cluster intermediates
+  and a residual-cosine interpolation path.
 - **OT_CFM** - minibatch optimal-transport conditional flow matching.
 
 The evaluation entry point compares UniformFM and DGFMv2.
@@ -34,6 +35,9 @@ Run the fixed sweep with seed 1000 using:
 ```bash
 python -m Synthetic_data.run_eval_sweep 1000
 ```
+
+Each sample-size/distribution configuration runs its five trials concurrently
+through a process pool in `run_eval`, capped at five workers.
 
 Pass `--resume` to skip completed matching runs. A sweep writes three aggregate
 files directly under `Synthetic_data/eval_results/sweep_<seed>/`:

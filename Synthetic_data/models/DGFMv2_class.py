@@ -225,6 +225,8 @@ class MixtureSamplerV2:
 class DGFMv2(VanillaFM):
     """Smoothly transport noise through a target-associated cluster sample."""
 
+    path_weight_atol = 1e-5
+
     def _sample_covering_clusters(
         self,
         indices: torch.Tensor,
@@ -238,27 +240,82 @@ class DGFMv2(VanillaFM):
             selected.append(np.random.choice(covering, p=probabilities))
         return torch.as_tensor(selected, device=self.device, dtype=torch.long)
 
-    @staticmethod
-    def _path_weights(t: torch.Tensor, injection_time: float):
-        """C1 cosine interpolation noise -> intermediate -> data."""
-        tau = torch.as_tensor(injection_time, device=t.device, dtype=t.dtype)
-        left = t <= tau
-        pi = torch.as_tensor(torch.pi, device=t.device, dtype=t.dtype)
-        left_phase = torch.clamp(t / tau, 0.0, 1.0)
-        right_phase = torch.clamp((t - tau) / (1.0 - tau), 0.0, 1.0)
-        left_s = 0.5 * (1.0 - torch.cos(pi * left_phase))
-        right_s = 0.5 * (1.0 - torch.cos(pi * right_phase))
-        left_dot = 0.5 * pi * torch.sin(pi * left_phase) / tau
-        right_dot = 0.5 * pi * torch.sin(pi * right_phase) / (1.0 - tau)
+    def _path_weights(
+        self,
+        t,
+        interpolation_path,
+        residual_lambda=0.2,
+    ):
+        if interpolation_path != "residual-cosine-midpoint":
+            raise ValueError(
+                f"Unsupported DGFM interpolation path '{interpolation_path}'."
+            )
 
-        zero = torch.zeros_like(t)
-        noise = torch.where(left, 1.0 - left_s, zero)
-        intermediate = torch.where(left, left_s, 1.0 - right_s)
-        target = torch.where(left, zero, right_s)
-        noise_dot = torch.where(left, -left_dot, zero)
-        intermediate_dot = torch.where(left, left_dot, -right_dot)
-        target_dot = torch.where(left, zero, right_dot)
-        return noise, intermediate, target, noise_dot, intermediate_dot, target_dot
+        tau = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
+        lam = torch.as_tensor(residual_lambda, dtype=t.dtype, device=t.device)
+        left = t <= tau
+        right = ~left
+
+        pi = torch.as_tensor(torch.pi, device=t.device, dtype=t.dtype)
+
+        r_left = torch.clamp(t / tau, 0.0, 1.0)
+        r_right = torch.clamp((t - tau) / (1.0 - tau), 0.0, 1.0)
+
+        s_left = 0.5 * (1.0 - torch.cos(pi * r_left))
+        s_right = 0.5 * (1.0 - torch.cos(pi * r_right))
+
+        sdot_left = 0.5 * pi * torch.sin(pi * r_left) / tau
+        sdot_right = 0.5 * pi * torch.sin(pi * r_right) / (1.0 - tau)
+
+        a_left_D = 1.0 - s_left
+        b_left_D = s_left
+        c_left_D = torch.zeros_like(t)
+
+        a_dot_left_D = -sdot_left
+        b_dot_left_D = sdot_left
+        c_dot_left_D = torch.zeros_like(t)
+
+        a_right_D = torch.zeros_like(t)
+        b_right_D = 1.0 - s_right
+        c_right_D = s_right
+
+        a_dot_right_D = torch.zeros_like(t)
+        b_dot_right_D = -sdot_right
+        c_dot_right_D = sdot_right
+
+        a_D = torch.where(left, a_left_D, a_right_D)
+        b_D = torch.where(left, b_left_D, b_right_D)
+        c_D = torch.where(left, c_left_D, c_right_D)
+
+        a_dot_D = torch.where(left, a_dot_left_D, a_dot_right_D)
+        b_dot_D = torch.where(left, b_dot_left_D, b_dot_right_D)
+        c_dot_D = torch.where(left, c_dot_left_D, c_dot_right_D)
+
+        a_FM = 1.0 - t
+        b_FM = torch.zeros_like(t)
+        c_FM = t
+
+        a_dot_FM = -torch.ones_like(t)
+        b_dot_FM = torch.zeros_like(t)
+        c_dot_FM = torch.ones_like(t)
+
+        a = (1.0 - lam) * a_D + lam * a_FM
+        b = (1.0 - lam) * b_D + lam * b_FM
+        c = (1.0 - lam) * c_D + lam * c_FM
+
+        a_dot = (1.0 - lam) * a_dot_D + lam * a_dot_FM
+        b_dot = (1.0 - lam) * b_dot_D + lam * b_dot_FM
+        c_dot = (1.0 - lam) * c_dot_D + lam * c_dot_FM
+
+        self._check_path_partition(a, b, c)
+        return a, b, c, a_dot, b_dot, c_dot
+
+    def _check_path_partition(self, a, b, c):
+        err = torch.max(torch.abs(a + b + c - 1.0)).item()
+        if err > self.path_weight_atol:
+            raise ValueError(
+                f"DGFM path weights must sum to 1; max |a+b+c-1|={err:.3e}"
+            )
 
     def _build_dgfm_interpolants(
         self,
@@ -267,7 +324,8 @@ class DGFMv2(VanillaFM):
         sampler: MixtureSamplerV2,
         cluster_sizes: np.ndarray,
         n_t: int,
-        injection_time: float,
+        interpolation_path: str,
+        residual_lambda: float,
     ):
         target = train_points[permutation]
         noise = torch.randn_like(target)
@@ -280,9 +338,17 @@ class DGFMv2(VanillaFM):
         target = target.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, dimension)
         noise = noise.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, dimension)
         intermediate = intermediate.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, dimension)
-        weights = self._path_weights(t, injection_time)
-        xt = weights[0][:, None] * noise + weights[1][:, None] * intermediate + weights[2][:, None] * target
-        velocity = weights[3][:, None] * noise + weights[4][:, None] * intermediate + weights[5][:, None] * target
+        a, b, c, a_dot, b_dot, c_dot = self._path_weights(
+            t,
+            interpolation_path,
+            residual_lambda=residual_lambda,
+        )
+        xt = a[:, None] * noise + b[:, None] * intermediate + c[:, None] * target
+        velocity = (
+            a_dot[:, None] * noise
+            + b_dot[:, None] * intermediate
+            + c_dot[:, None] * target
+        )
         shuffle = torch.randperm(len(xt), device=self.device)
         return xt[shuffle], t[shuffle], velocity[shuffle]
 
@@ -295,6 +361,8 @@ class DGFMv2(VanillaFM):
         max_epochs: int,
         batch_size: int,
         injection_time: float = 0.5,
+        interpolation_path: str = "residual-cosine-midpoint",
+        residual_lambda: float = 0.4,
         truncation: float = 1.5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
@@ -308,8 +376,12 @@ class DGFMv2(VanillaFM):
         pca_n_jobs: int = -1,
         progress: bool = True,
     ):
-        if not 0.0 < injection_time < 1.0:
-            raise ValueError("injection_time must lie strictly between zero and one")
+        if injection_time != 0.5:
+            raise ValueError(
+                "residual-cosine-midpoint requires injection_time=0.5"
+            )
+        if not 0.0 <= residual_lambda <= 1.0:
+            raise ValueError("residual_lambda must lie between zero and one")
         if truncation <= 0:
             raise ValueError("truncation must be positive")
         if not 0.0 < cluster_outlier_q < 1.0:
@@ -365,7 +437,8 @@ class DGFMv2(VanillaFM):
                 sampler,
                 cluster_sizes,
                 n_t,
-                injection_time,
+                interpolation_path,
+                residual_lambda,
             )
             loss_sum = 0.0
             batch_count = 0

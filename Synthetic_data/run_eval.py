@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import math
+import multiprocessing
 import random
 import time
 from datetime import datetime
@@ -51,6 +53,8 @@ AGGREGATE_CONFIG_KEYS = (
     "noise_std",
     "truncation",
     "int_inject",
+    "interpolation_path",
+    "residual_lambda",
     "early_stopping",
 )
 
@@ -139,10 +143,13 @@ def run_one_trial(
     truncation: float,
     cluster_num: int,
     injection_time: float,
+    interpolation_path: str,
+    residual_lambda: float,
     early_stopping: bool,
     test_size: int,
     device,
     progress: bool = True,
+    pca_n_jobs: int = -1,
 ) -> dict:
     """Train the two supported evaluation methods for one seeded dataset."""
     torch.manual_seed(seed)
@@ -194,8 +201,11 @@ def run_one_trial(
         max_epochs=max_epochs,
         batch_size=effective_batch_size,
         injection_time=injection_time,
+        interpolation_path=interpolation_path,
+        residual_lambda=residual_lambda,
         truncation=truncation,
         early_stopping=early_stopping,
+        pca_n_jobs=pca_n_jobs,
         progress=progress,
     )
     dgfm_time = time.perf_counter() - started
@@ -228,6 +238,8 @@ def run_one_trial(
         "cluster_num": cluster_num,
         "cluster_size": cluster_size,
         "int_inject": injection_time,
+        "interpolation_path": interpolation_path,
+        "residual_lambda": residual_lambda,
         "early_stopping": early_stopping,
         "results": results,
     }
@@ -327,10 +339,23 @@ def update_distribution_results(
     temporary_path.replace(output_path)
 
 
+def _run_trial_worker(kwargs: dict) -> dict:
+    """Process-pool entry point for one independently seeded trial."""
+    kwargs = dict(kwargs)
+    kwargs["device"] = torch.device(kwargs["device"])
+    return run_one_trial(**kwargs)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample_size", type=int, required=True)
     parser.add_argument("--trial_idx", type=int, default=0)
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=1,
+        help="Number of concurrent trials to run (1-5).",
+    )
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument(
         "--target_distribution",
@@ -350,6 +375,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--truncation", type=float, default=1.5)
     parser.add_argument("--cluster_num", type=int, required=True)
     parser.add_argument("--int_inject", type=float, default=0.5)
+    parser.add_argument(
+        "--interpolation_path",
+        choices=("residual-cosine-midpoint",),
+        default="residual-cosine-midpoint",
+    )
+    parser.add_argument("--residual_lambda", type=float, default=0.4)
     parser.add_argument("--early_stopping", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--test_size", type=int, default=2000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -367,38 +398,70 @@ def main() -> None:
             "sample_size, total_steps, batch_size, batch_num, and cluster_num must be positive"
         )
 
-    result = run_one_trial(
-        sample_size=args.sample_size,
-        seed=args.seed,
-        trial_idx=args.trial_idx,
-        distribution_name=DISTRIBUTIONS[args.target_distribution],
-        ambient_dim=args.ambient_dim,
-        latent_dim=args.latent_dim,
-        total_steps=args.total_steps,
-        batch_size=args.batch_size,
-        batch_num=args.batch_num,
-        total_n_t=args.total_n_t,
-        global_n_t=args.global_n_t,
-        local_n_t=args.local_n_t,
-        noise_std=args.noise_std,
-        truncation=args.truncation,
-        cluster_num=args.cluster_num,
-        injection_time=args.int_inject,
-        early_stopping=args.early_stopping,
-        test_size=args.test_size,
-        device=torch.device(args.device),
-        progress=not args.no_progress,
-    )
+    if not 1 <= args.trials <= 5:
+        raise ValueError("--trials must be between 1 and 5")
+
+    common_kwargs = {
+        "sample_size": args.sample_size,
+        "distribution_name": DISTRIBUTIONS[args.target_distribution],
+        "ambient_dim": args.ambient_dim,
+        "latent_dim": args.latent_dim,
+        "total_steps": args.total_steps,
+        "batch_size": args.batch_size,
+        "batch_num": args.batch_num,
+        "total_n_t": args.total_n_t,
+        "global_n_t": args.global_n_t,
+        "local_n_t": args.local_n_t,
+        "noise_std": args.noise_std,
+        "truncation": args.truncation,
+        "cluster_num": args.cluster_num,
+        "injection_time": args.int_inject,
+        "interpolation_path": args.interpolation_path,
+        "residual_lambda": args.residual_lambda,
+        "early_stopping": args.early_stopping,
+        "test_size": args.test_size,
+        "device": args.device,
+        "progress": not args.no_progress and args.trials == 1,
+        "pca_n_jobs": -1 if args.trials == 1 else 1,
+    }
+    trial_kwargs = [
+        {
+            **common_kwargs,
+            "seed": args.seed + offset,
+            "trial_idx": args.trial_idx + offset,
+        }
+        for offset in range(args.trials)
+    ]
+
+    if args.trials == 1:
+        results = [_run_trial_worker(trial_kwargs[0])]
+    else:
+        print(f"Running {args.trials} trials with {min(5, args.trials)} workers")
+        context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=min(5, args.trials),
+            mp_context=context,
+        ) as executor:
+            futures = [executor.submit(_run_trial_worker, kwargs) for kwargs in trial_kwargs]
+            results = [future.result() for future in concurrent.futures.as_completed(futures)]
+        results.sort(key=lambda result: result["trial_idx"])
+
     if args.aggregate_file is not None:
         if args.sweep_seed is None:
             raise ValueError("--sweep_seed is required with --aggregate_file")
         output_path = args.aggregate_file
-        update_distribution_results(output_path, result, sweep_seed=args.sweep_seed)
+        for result in results:
+            update_distribution_results(output_path, result, sweep_seed=args.sweep_seed)
     else:
         args.results_path.mkdir(parents=True, exist_ok=True)
-        output_path = args.results_path / "results.json"
-        with output_path.open("w") as output:
-            json.dump(result, output, indent=2)
+        if args.trials == 1:
+            output_path = args.results_path / "results.json"
+            with output_path.open("w") as output:
+                json.dump(results[0], output, indent=2)
+        else:
+            output_path = args.results_path / f"{common_kwargs['distribution_name']}.json"
+            for result in results:
+                update_distribution_results(output_path, result, sweep_seed=args.seed)
     print(f"Results written to {output_path}")
 
 
