@@ -1,54 +1,46 @@
 # Synthetic Data Experiments
 
-This directory contains synthetic experiments used to evaluate **Dimension-Guided Flow Matching (DGFM)** on controlled low-dimensional manifolds embedded in higher-dimensional spaces. These experiments are designed to isolate geometric and statistical properties of the learned flows and to provide clear, reproducible comparisons against baseline methods.
+This directory contains synthetic experiments for evaluating Dimension-Guided Flow Matching (DGFM) on controlled low-dimensional manifolds embedded in higher-dimensional spaces.
 
 ## Supported methods
 
-The following flow-matching variants are implemented:
+The implementations now live in `Synthetic_data.models`:
 
-- **UniformFM** – standard flow matching with an isotropic prior  
-- **ShiftedFM** – flow matching with a shifted (biased) prior  
-- **DGFM** – dimension-guided flow matching
+- **UniformFM** - standard flow matching; pass `time_sampling="shifted"` for shifted-time sampling.
+- **DGFMv2** - condition-free DGFM with full-dimensional cluster intermediates.
+- **OT_CFM** - minibatch optimal-transport conditional flow matching.
+
+The evaluation entry point compares UniformFM and DGFMv2.
 
 ## Supported distributions
 
-Experiments can be conducted on the following synthetic target distributions:
-
-- **Quadratic unimodal**
-- **Quadratic multimodal**
-- **Linear branched**
-- **Swiss roll**
+The evaluation code supports Normal, three quadratic variants, Linear Branched, SwissRoll, TwoMoon, and PinWheel distributions.
 
 ## Running evaluation
 
-All scripts should be executed from the **project root** directory.
-
-To evaluate a selected method on a given synthetic distribution, run:
+Run scripts from the project root. One configuration can be evaluated with:
 
 ```bash
-python -m Synthetic_data.run_eval
+python -m Synthetic_data.run_eval \
+  --sample_size 320 \
+  --cluster_num 8 \
+  --target_distribution 6
 ```
 
-Evaluation outputs, including quantitative metrics and intermediate results, are saved to:
+Distribution keys 6, 7, and 8 select SwissRoll, TwoMoon, and PinWheel.
+
+Run the fixed sweep with seed 1000 using:
 
 ```bash
-Synthetic_data/eval_results/
+python -m Synthetic_data.run_eval_sweep 1000
 ```
+
+Pass `--resume` to skip completed matching runs. Results are written below `Synthetic_data/eval_results/`.
 
 ## Visualizing results
 
-After completing the evaluation, generate plots and summary figures by running:
+After evaluation, generate plots with:
 
 ```bash
 python -m Synthetic_data.visualize_results
 ```
-
-The resulting graphs and visualizations are saved to:
-
-```bash
-Synthetic_data/eval_graphs/
-```
-
-Please refer to the script headers or inline configuration options to specify the desired method and target distribution.
-
-These synthetic experiments serve as a controlled testbed for validating DGFM’s geometric inductive bias and dimensional guidance before transitioning to robot simulation benchmarks.
