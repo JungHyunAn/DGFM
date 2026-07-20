@@ -2,6 +2,7 @@ Synthetic_data/eval_results/
 Synthetic_data/eval_graphs/
 Synthetic_data/__pycache__/
 Synthetic_data/analysis_results/
+Synthetic_data/models/__pycache__/
 .vscode/
 Robot_simulation/__pycache__/
 Robot_simulation/environments/__pycache__/
