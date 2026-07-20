@@ -39,6 +39,21 @@ DISTRIBUTIONS = {
     "8": "PinWheel",
 }
 
+AGGREGATE_CONFIG_KEYS = (
+    "ambient_dim",
+    "latent_dim",
+    "total_steps",
+    "batch_size",
+    "batch_num",
+    "total_n_t",
+    "global_n_t",
+    "local_n_t",
+    "noise_std",
+    "truncation",
+    "int_inject",
+    "early_stopping",
+)
+
 
 def get_cosine_schedule_with_warmup(
     optimizer,
@@ -218,6 +233,100 @@ def run_one_trial(
     }
 
 
+def _summarize_trials(trials: dict[str, dict]) -> dict[str, dict]:
+    """Aggregate final evaluation metrics across completed trials."""
+    summaries = {}
+    for method in ("UniformFM", "DGFMv2"):
+        method_results = [
+            trial["results"][method]
+            for trial in trials.values()
+            if method in trial.get("results", {})
+        ]
+        if not method_results:
+            continue
+        w2 = np.asarray(
+            [result["eval_wasserstein2"] for result in method_results], dtype=float
+        )
+        geometric = np.asarray(
+            [result["eval_geometric_alignment"] for result in method_results],
+            dtype=float,
+        )
+        summaries[method] = {
+            "trial_count": len(method_results),
+            "eval_wasserstein2_mean": float(w2.mean()),
+            "eval_wasserstein2_std": float(w2.std()),
+            "eval_geometric_alignment_mean": float(geometric.mean()),
+            "eval_geometric_alignment_std": float(geometric.std()),
+        }
+    return summaries
+
+
+def update_distribution_results(
+    output_path: Path,
+    result: dict,
+    *,
+    sweep_seed: int,
+) -> None:
+    """Upsert one trial into a distribution-level sweep result file."""
+    result_config = {key: result[key] for key in AGGREGATE_CONFIG_KEYS}
+    if output_path.exists():
+        with output_path.open() as source:
+            aggregate = json.load(source)
+        if aggregate.get("distribution") != result["distribution"]:
+            raise ValueError(
+                f"Cannot write {result['distribution']} results into {output_path}: "
+                f"file contains {aggregate.get('distribution')!r}"
+            )
+        if aggregate.get("seed") != sweep_seed:
+            raise ValueError(
+                f"Cannot mix sweep seeds in {output_path}: "
+                f"{aggregate.get('seed')} != {sweep_seed}"
+            )
+        if aggregate.get("config") != result_config:
+            raise ValueError(
+                f"Cannot mix experiment configurations in {output_path}"
+            )
+    else:
+        aggregate = {
+            "seed": sweep_seed,
+            "distribution": result["distribution"],
+            "config": result_config,
+            "sample_sizes": {},
+        }
+
+    sample_key = str(result["sample_size"])
+    sample_result = aggregate["sample_sizes"].setdefault(
+        sample_key,
+        {
+            "cluster_num": result["cluster_num"],
+            "cluster_size": result["cluster_size"],
+            "trials": {},
+            "average": {},
+        },
+    )
+    if sample_result["cluster_num"] != result["cluster_num"]:
+        raise ValueError(
+            f"Cannot mix cluster_num values for sample size {sample_key}: "
+            f"{sample_result['cluster_num']} != {result['cluster_num']}"
+        )
+
+    sample_result["trials"][str(result["trial_idx"])] = {
+        "seed": result["seed"],
+        "trial_idx": result["trial_idx"],
+        "effective_batch_size": result["effective_batch_size"],
+        "max_epochs": result["max_epochs"],
+        "results": result["results"],
+    }
+    sample_result["average"] = _summarize_trials(sample_result["trials"])
+    aggregate["datetime_updated"] = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    with temporary_path.open("w") as output:
+        json.dump(aggregate, output, indent=2)
+    temporary_path.replace(output_path)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sample_size", type=int, required=True)
@@ -245,6 +354,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test_size", type=int, default=2000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--results_path", type=Path, default=Path("Synthetic_data/eval_results"))
+    parser.add_argument("--aggregate_file", type=Path, default=None)
+    parser.add_argument("--sweep_seed", type=int, default=None)
     parser.add_argument("--no_progress", action="store_true")
     return parser.parse_args()
 
@@ -278,10 +389,16 @@ def main() -> None:
         device=torch.device(args.device),
         progress=not args.no_progress,
     )
-    args.results_path.mkdir(parents=True, exist_ok=True)
-    output_path = args.results_path / "results.json"
-    with output_path.open("w") as output:
-        json.dump(result, output, indent=2)
+    if args.aggregate_file is not None:
+        if args.sweep_seed is None:
+            raise ValueError("--sweep_seed is required with --aggregate_file")
+        output_path = args.aggregate_file
+        update_distribution_results(output_path, result, sweep_seed=args.sweep_seed)
+    else:
+        args.results_path.mkdir(parents=True, exist_ok=True)
+        output_path = args.results_path / "results.json"
+        with output_path.open("w") as output:
+            json.dump(result, output, indent=2)
     print(f"Results written to {output_path}")
 
 

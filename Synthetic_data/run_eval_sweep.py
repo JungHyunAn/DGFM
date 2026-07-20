@@ -13,6 +13,11 @@ from pathlib import Path
 SAMPLE_SIZES = (320, 640, 1280, 2560, 5120)
 CLUSTER_NUMS = (8, 16, 32, 64, 128)
 TARGET_DISTRIBUTIONS = ("6", "7", "8")
+TARGET_DISTRIBUTION_NAMES = {
+    "6": "SwissRoll",
+    "7": "TwoMoon",
+    "8": "PinWheel",
+}
 TRIALS = 5
 
 BASE_CONFIG = {
@@ -56,10 +61,9 @@ def build_sweep(seed: int, results_root: Path) -> list[dict]:
             "target_distribution": distribution,
             "trial_idx": trial_idx,
             "seed": seed + trial_idx,
-            "results_path": results_root
-            / f"distribution_{distribution}"
-            / f"sample_size_{sample_size}"
-            / f"trial_{trial_idx}",
+            "sweep_seed": seed,
+            "aggregate_file": results_root
+            / f"{TARGET_DISTRIBUTION_NAMES[distribution]}.json",
         }
         for distribution in TARGET_DISTRIBUTIONS
         for sample_size, cluster_num in zip(SAMPLE_SIZES, CLUSTER_NUMS, strict=True)
@@ -78,18 +82,20 @@ def config_to_cli(config: dict) -> list[str]:
 
 
 def is_complete(config: dict) -> bool:
-    output_path = Path(config["results_path"]) / "results.json"
+    output_path = Path(config["aggregate_file"])
     try:
         with output_path.open() as source:
             result = json.load(source)
     except (OSError, json.JSONDecodeError):
         return False
+    sample_result = result.get("sample_sizes", {}).get(str(config["sample_size"]), {})
+    trial_result = sample_result.get("trials", {}).get(str(config["trial_idx"]), {})
     return (
-        result.get("seed") == config["seed"]
-        and result.get("trial_idx") == config["trial_idx"]
-        and result.get("sample_size") == config["sample_size"]
-        and result.get("cluster_num") == config["cluster_num"]
-        and set(result.get("results", {})) == {"UniformFM", "DGFMv2"}
+        result.get("seed") == config["sweep_seed"]
+        and all(result.get("config", {}).get(key) == value for key, value in BASE_CONFIG.items())
+        and sample_result.get("cluster_num") == config["cluster_num"]
+        and trial_result.get("seed") == config["seed"]
+        and set(trial_result.get("results", {})) == {"UniformFM", "DGFMv2"}
     )
 
 

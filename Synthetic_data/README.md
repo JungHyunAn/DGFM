@@ -35,7 +35,10 @@ Run the fixed sweep with seed 1000 using:
 python -m Synthetic_data.run_eval_sweep 1000
 ```
 
-Pass `--resume` to skip completed matching runs. Results are written below `Synthetic_data/eval_results/`.
+Pass `--resume` to skip completed matching runs. A sweep writes three aggregate
+files directly under `Synthetic_data/eval_results/sweep_<seed>/`:
+`SwissRoll.json`, `TwoMoon.json`, and `PinWheel.json`. Each file contains all
+per-trial results and per-sample-size metric averages for its distribution.
 
 ## Visualizing results
 
