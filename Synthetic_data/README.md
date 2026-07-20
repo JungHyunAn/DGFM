@@ -40,9 +40,10 @@ Each sample-size/distribution configuration runs its five trials concurrently
 through a process pool in `run_eval`, capped at five workers.
 
 Pass `--resume` to skip completed matching runs. A sweep writes three aggregate
-files directly under `Synthetic_data/eval_results/sweep_<seed>/`:
-`SwissRoll.json`, `TwoMoon.json`, and `PinWheel.json`. Each file contains all
-per-trial results and per-sample-size metric averages for its distribution.
+timestamped files directly under `Synthetic_data/eval_results/sweep_<seed>/`,
+for example `SwissRoll_<timestamp>.json`, `TwoMoon_<timestamp>.json`, and
+`PinWheel_<timestamp>.json`. Each file contains all per-trial results and
+per-sample-size metric averages for its distribution.
 
 ## Visualizing results
 

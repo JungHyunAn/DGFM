@@ -7,6 +7,7 @@ import json
 import shlex
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
@@ -42,6 +43,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("seed", type=int, nargs="?", default=1000)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--timestamp",
+        default=None,
+        help="Reuse a specific sweep timestamp, primarily with --resume.",
+    )
     parser.add_argument("--device", default=None)
     parser.add_argument(
         "--results_path",
@@ -52,9 +58,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_sweep(seed: int, results_root: Path) -> list[dict]:
+def build_sweep(
+    seed: int,
+    results_root: Path,
+    timestamp: str | None = None,
+) -> list[dict]:
     if len(SAMPLE_SIZES) != len(CLUSTER_NUMS):
         raise ValueError("SAMPLE_SIZES and CLUSTER_NUMS must have matching lengths")
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
     return [
         {
             **BASE_CONFIG,
@@ -65,7 +77,7 @@ def build_sweep(seed: int, results_root: Path) -> list[dict]:
             "trials": TRIALS,
             "sweep_seed": seed,
             "aggregate_file": results_root
-            / f"{TARGET_DISTRIBUTION_NAMES[distribution]}.json",
+            / f"{TARGET_DISTRIBUTION_NAMES[distribution]}_{timestamp}.json",
         }
         for distribution in TARGET_DISTRIBUTIONS
         for sample_size, cluster_num in zip(SAMPLE_SIZES, CLUSTER_NUMS, strict=True)
@@ -112,8 +124,19 @@ def main() -> None:
     )
     if not results_root.is_absolute():
         results_root = repo_root / results_root
-    sweep = build_sweep(args.seed, results_root)
-    print(f"[sweep] Prepared {len(sweep)} runs under {results_root}")
+    timestamp = args.timestamp
+    if timestamp is None and args.resume:
+        prior_files = sorted(results_root.glob("SwissRoll_*.json"))
+        if prior_files:
+            timestamp = prior_files[-1].stem.removeprefix("SwissRoll_")
+    if timestamp is None:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+
+    sweep = build_sweep(args.seed, results_root, timestamp)
+    print(
+        f"[sweep] Prepared {len(sweep)} runs under {results_root} "
+        f"(timestamp={timestamp})"
+    )
 
     for run_idx, config in enumerate(sweep, start=1):
         if args.resume and is_complete(config):
