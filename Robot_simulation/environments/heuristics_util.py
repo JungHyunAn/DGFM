@@ -761,7 +761,7 @@ def make_env(
                 name="SquareNutSampler",
                 x_range=[-0.12, -0.11],
                 y_range=[0.11, 0.14],
-                rotation=(np.pi - np.pi / 6, np.pi + np.pi / 6),
+                rotation=(np.pi/2 - np.pi / 6, np.pi/2 + np.pi / 6),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
