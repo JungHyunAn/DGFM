@@ -121,7 +121,10 @@ def _read_joint_trajectory(
     task: str | None = None,
 ) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
     trajectory_candidates = (
-        (("right_arm_joints.csv", "positions"),)
+        (
+            ("right_arm_joints.csv", "positions"),
+            ("teleop_action_joint.csv", "joint_positions"),
+        )
         if task == "pick_and_place"
         else (
             ("teleop_action_joint.csv", "joint_positions"),
@@ -226,7 +229,11 @@ def load_aligned_demo(
 ) -> AlignedDemo:
     """Align 10 Hz images to arm samples and interpolated gripper positions."""
     camera_times, image_paths = _read_camera_frames(camera_rollout)
-    use_pick_and_place_gripper = task == "pick_and_place" and use_gripper
+    use_pick_and_place_gripper = (
+        task == "pick_and_place"
+        and use_gripper
+        and (trajectory_rollout / "right_arm_joints.csv").is_file()
+    )
     joint_times, joint_names, joint_positions = _read_joint_trajectory(
         trajectory_rollout,
         use_gripper=use_gripper and not use_pick_and_place_gripper,

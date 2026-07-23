@@ -21,6 +21,8 @@ DATASETS = {
     "sweep_trajectory": "1KHhyPZhlswp_TLRq3hiKGpHJenCgHmUW",
     "pick_and_place_camera": "1Xa5j_zUzNpjB4kzX36gm-g4EHsY5SM2w",
     "pick_and_place_trajectory": "1vDbzkEw-X720sglMz3HcZHISi1G5f_jJ",
+    "pick_and_place_smokerun_camera": "1JoPVaorlFknDl2HIosaoPtR1xB_FBMjO",
+    "pick_and_place_smokerun_trajectory": "1ZK4unMlYInNZ0oy9qzMKxMvBAl2NnZEN",
 }
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "real_dataset"
