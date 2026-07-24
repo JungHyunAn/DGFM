@@ -175,7 +175,7 @@ action_chunk = policy.predict_action_chunk(
     joint_angles=current_joints,
 )
 
-assert action_chunk.shape == (16, policy.dof)
+assert action_chunk.shape == (policy.horizon, policy.dof)
 ```
 
 The returned values are denormalized absolute joint positions, not deltas. For
@@ -183,6 +183,12 @@ the default non-gripper model, the expected joint vector and output dimension
 are seven. A pick-and-place checkpoint trained with `use_gripper: true` expects
 the seven arm joints followed by the averaged `gripper_position`, for eight
 values total. `policy.joint_names` gives the required order.
+
+For compatibility with checkpoints trained from `teleop_action_joint.csv`
+with two trailing Franka finger coordinates, rollout exposes the same
+eight-value interface. The input `gripper_position` is duplicated internally
+for the checkpoint's two finger inputs, and the two generated finger targets
+are averaged back into one `gripper_position`.
 
 Images can be NumPy arrays, PyTorch tensors, or file paths. Array and tensor
 inputs are assumed to already use RGB channel order. Image paths are loaded and
@@ -192,7 +198,7 @@ converted from OpenCV BGR to RGB automatically.
 
 For a smoke run without camera images or joint readings, only pass the checkpoint.
 Missing images are replaced with zero tensors and missing joints are replaced
-with a zero vector sized from the checkpoint metadata:
+with a zero vector sized for the policy rollout interface:
 
 ```bash
 python -m Robot_real.rollout_model \

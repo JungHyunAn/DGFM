@@ -20,6 +20,8 @@ from Robot_real.train_model import (
 )
 
 ImageInput = str | Path | np.ndarray | torch.Tensor
+GRIPPER_POSITION_NAME = "gripper_position"
+FINGER_JOINT_PAIR = ("fr3_finger_joint1", "fr3_finger_joint2")
 
 
 def _prepare_rgb_image(image: ImageInput, image_size: int) -> np.ndarray:
@@ -55,8 +57,7 @@ class RealRobotPolicy:
     """Checkpoint-backed policy for repeated real-robot inference.
 
     The checkpoint is loaded once. ``predict_action_chunk`` expects the current
-    images in ``(frontview, wristview)`` order and the current joint vector in
-    the same order recorded during training.
+    images in ``(frontview, wristview)`` order and the current joint vector in the order exposed by ``policy.joint_names``.
     """
 
     def __init__(
@@ -75,7 +76,20 @@ class RealRobotPolicy:
             weights_only=False,
         )
         self.metadata = checkpoint["metadata"]
-        self.dof = int(self.metadata["dof"])
+        self.model_dof = int(self.metadata["dof"])
+        checkpoint_joint_names = tuple(self.metadata["joint_names"])
+        self._collapse_finger_pair = (
+            self.model_dof >= 2
+            and checkpoint_joint_names[-2:] == FINGER_JOINT_PAIR
+        )
+        self.dof = (
+            self.model_dof - 1 if self._collapse_finger_pair else self.model_dof
+        )
+        self._joint_names = (
+            (*checkpoint_joint_names[:-2], GRIPPER_POSITION_NAME)
+            if self._collapse_finger_pair
+            else checkpoint_joint_names
+        )
         self.horizon = int(self.metadata["horizon"])
         self.image_size = int(self.metadata["image_size"])
         self.sampler_steps = int(
@@ -91,7 +105,7 @@ class RealRobotPolicy:
 
         self.model, self.encoder = build_models(
             horizon=self.horizon,
-            dof=self.dof,
+            dof=self.model_dof,
             feature_proj_dim=int(self.metadata["feature_proj_dim"]),
             condition_embed_dim=int(self.metadata["condition_embed_dim"]),
             num_convs_per_block=int(self.metadata["num_convs_per_block"]),
@@ -121,7 +135,7 @@ class RealRobotPolicy:
 
     @property
     def joint_names(self) -> tuple[str, ...]:
-        return tuple(self.metadata["joint_names"])
+        return self._joint_names
 
     @torch.no_grad()
     def predict_action_chunk(
@@ -151,6 +165,8 @@ class RealRobotPolicy:
                 f"Checkpoint expects {self.dof} joints {self.joint_names}, "
                 f"but received {joints.numel()} values"
             )
+        if self._collapse_finger_pair:
+            joints = torch.cat((joints[:-1], joints[-1:].repeat(2)))
         if "min" in self.normalization:
             normalized_joints = torch.clamp(
                 (2.0 / self.normalization["range"])
@@ -174,7 +190,7 @@ class RealRobotPolicy:
             condition,
             model_type=str(self.metadata["model_type"]),
             horizon=self.horizon,
-            dof=self.dof,
+            dof=self.model_dof,
             sampler_steps=self.sampler_steps,
             diffusion_steps=int(self.metadata["diffusion_steps"]),
             diffusion_schedule=str(self.metadata["diffusion_schedule"]),
@@ -195,6 +211,14 @@ class RealRobotPolicy:
             action_chunk = (
                 normalized_chunk * self.normalization["std"][None, :]
                 + self.normalization["mean"][None, :]
+            )
+        if self._collapse_finger_pair:
+            action_chunk = torch.cat(
+                (
+                    action_chunk[:, :-2],
+                    action_chunk[:, -2:].mean(dim=-1, keepdim=True),
+                ),
+                dim=-1,
             )
         return action_chunk.cpu().numpy()
 
