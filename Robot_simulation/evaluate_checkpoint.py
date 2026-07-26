@@ -114,7 +114,7 @@ def evaluate_checkpoint(request_path: str, checkpoint_path: str, output_path: st
         model.load_state_dict(state)
         model.eval()
 
-        env_settings_all, val_params = _generate_val_env(request.task_name, request.val_trials)
+        env_settings_all, val_params = _generate_val_env(request.task_name, request.val_trials, request.eval_base_seed)
         render_dir = output.parent if request.render_video else " "
         video_name = f"{request.stream_id}_{request.request_id}"
         sampler_type = "diffusion" if request.model_type == "DP" else "flow"

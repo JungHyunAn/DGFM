@@ -104,9 +104,12 @@ Gotchas / tips
 
 import os
 import time
+import json
+import random
 import h5py
 import imageio.v2 as imageio
 import numpy as np
+import torch
 import math
 import argparse
 import logging
@@ -119,7 +122,7 @@ for h in list(robosuite_logger.handlers):
 
 from typing import List, Optional, Dict, Any, Tuple
 from tqdm import tqdm
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from Robot_simulation.environments.heuristics_door import generate_door_trajectory
 from Robot_simulation.environments.heuristics_wipe import generate_wipe_trajectory
@@ -137,6 +140,11 @@ from Robot_simulation.environments.heuristics_util import (
     DEFAULT_VISION_WIDTH,
 )
 from Robot_simulation import DEFAULT_DATASET_DIR
+from Robot_simulation.reproducibility import (
+    TASK_ENVIRONMENT_RANGES, episode_seed, episode_seed_plan, git_commit,
+)
+
+DEFAULT_CLEAN_DATASET_DIR = f"{DEFAULT_DATASET_DIR}_clean_v1"
 
 DOWNSAMPLE_RATIOS  = {"door"    : 2,
                       "wipe"    : -1,
@@ -280,6 +288,9 @@ def save_episode(
     environment_states: Optional[np.ndarray] = None,
     image_paths: Optional[Dict[str, List[str]]] = None,
     action_representation: str = "joint_space",
+    episode_id: int | None = None,
+    episode_random_seed: int | None = None,
+    dataset_base_seed: int | None = None,
 ):
     """
     Write one successful episode into the HDF5 file.
@@ -321,6 +332,12 @@ def save_episode(
     grp.attrs["action_representation"] = action_representation
     grp.attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
     grp.attrs["dof"] = joint_angles.shape[1]
+    resolved_episode_id = ep_idx if episode_id is None else int(episode_id)
+    grp.attrs["episode_id"] = resolved_episode_id
+    if episode_random_seed is not None:
+        grp.attrs["episode_seed"] = int(episode_random_seed)
+    if dataset_base_seed is not None:
+        grp.attrs["dataset_base_seed"] = int(dataset_base_seed)
     grp.create_dataset("initial_pose", data=initial_pose, compression="gzip")
     if environment_states is None:
         environment_states = np.zeros((joint_angles.shape[0], 0), dtype=np.float32)
@@ -347,59 +364,32 @@ def save_episode(
 
 
 def worker_generate(
-    worker_id: int,
+    episode_id: int,
     task_name: str,
-    chunk_size: int,
     max_trials: int,
-    seed: int,
+    dataset_base_seed: int,
     vision: bool = False,
     camera_names=None,
     image_height: int = DEFAULT_VISION_HEIGHT,
     image_width: int = DEFAULT_VISION_WIDTH,
     action_representation: str = "joint_space",
-) -> List[Dict[str, Any]]:
-    """
-    Worker process entrypoint for multiprocessing.
-
-    It repeatedly calls the appropriate heuristic generator until it collects
-    `chunk_size` successful trajectories or hits `max_trials`.
-
-    Args:
-        worker_id: Integer id of this worker (used to offset RNG seed).
-        task_name: One of {"door","wipe","two_arm","nut"}.
-        chunk_size: Target number of successful episodes to return.
-        max_trials: Hard cap on attempts.
-        seed: Base RNG seed; worker_id is added to make streams independent.
-
-    Returns:
-        A dict containing the worker attempt count and successful trajectory
-        entries:
-            {
-              "trials": int,
-              "successes": [
-                {
-                  "joint_angles": (K, dof),
-                  "key_inds":     (K,),
-                  "initial_pose": (dof,),
-                  "environment_setting": dict of arrays
-                },
-                ...
-              ]
-            }
-    """
-
+) -> Dict[str, Any]:
+    """Generate exactly one globally identified episode from its own RNG stream."""
     gen_map = {
         "door": generate_door_trajectory,
         "wipe": generate_wipe_trajectory,
         "two_arm": generate_two_arm_trajectory,
-        "nut": generate_nut_trajectory
+        "nut": generate_nut_trajectory,
     }
     generator = gen_map[task_name]
     action_representation = validate_action_representation(action_representation)
-    if camera_names is None:
-        camera_names = _default_camera_names_for_task(task_name)
-    camera_names = list(camera_names)
-    np.random.seed(seed + worker_id)
+    camera_names = list(camera_names or _default_camera_names_for_task(task_name))
+    resolved_seed = episode_seed(dataset_base_seed, episode_id)
+    random.seed(resolved_seed)
+    np.random.seed(resolved_seed)
+    torch.manual_seed(resolved_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(resolved_seed)
 
     env = make_env(
         task_name,
@@ -409,47 +399,50 @@ def worker_generate(
         camera_heights=[image_height] * len(camera_names),
         camera_widths=[image_width] * len(camera_names),
     )
-    successes = []
-    trials = 0
+    seed_fn = getattr(env, "seed", None)
+    if callable(seed_fn):
+        seed_fn(resolved_seed)
 
-    while len(successes) < chunk_size and trials < max_trials:
-        trials += 1
-        # generator now returns (actions, success, frames, initial_qpos)
-        result = generator(
-            env, render=vision, save_video=False, camera_names=camera_names,
-            image_height=image_height, image_width=image_width,
-        )
-        q_traj, success, frames, init_qpos, environment_setting, env_param, environment_states = result[:7]
-        gripper_pose = None
-        eef_traj = None
-        if task_name == "wipe":
-            eef_traj = result[7] if len(result) > 7 else None
-        else:
-            gripper_pose = result[7] if len(result) > 7 else None
-            eef_traj = result[8] if len(result) > 8 else None
-        if action_representation == "task_space":
-            if eef_traj is None:
-                raise ValueError(f"{task_name} heuristic did not return an EEF pose trace")
-            q_policy = compose_task_space_trajectory(task_name, eef_traj, gripper_pose=gripper_pose)
-        else:
-            q_policy = normalize_policy_trajectory(task_name, q_traj, gripper_pose=gripper_pose)
-        # print(trials, success)
-        if success:
-            successes.append({
+    try:
+        for trial in range(1, max_trials + 1):
+            result = generator(
+                env, render=vision, save_video=False, camera_names=camera_names,
+                image_height=image_height, image_width=image_width,
+            )
+            q_traj, success, frames, init_qpos, environment_setting, env_param, environment_states = result[:7]
+            if not success:
+                continue
+            gripper_pose = None
+            eef_traj = None
+            if task_name == "wipe":
+                eef_traj = result[7] if len(result) > 7 else None
+            else:
+                gripper_pose = result[7] if len(result) > 7 else None
+                eef_traj = result[8] if len(result) > 8 else None
+            if action_representation == "task_space":
+                if eef_traj is None:
+                    raise ValueError(f"{task_name} heuristic did not return an EEF pose trace")
+                q_policy = compose_task_space_trajectory(task_name, eef_traj, gripper_pose=gripper_pose)
+            else:
+                q_policy = normalize_policy_trajectory(task_name, q_traj, gripper_pose=gripper_pose)
+            return {
+                "episode_id": int(episode_id),
+                "episode_seed": resolved_seed,
+                "trials": trial,
                 "joint_angles": q_policy,
-                "key_inds":      np.arange(len(q_policy), dtype=np.int64),
-                "initial_pose":  q_policy[0],
-                "environment_setting":  environment_setting,
+                "key_inds": np.arange(len(q_policy), dtype=np.int64),
+                "initial_pose": q_policy[0],
+                "environment_setting": environment_setting,
                 "environment_parameters": env_param,
                 "environment_states": environment_states,
                 "camera_frames": frames if vision else None,
-            })
-
-    env.close()
-    return {
-        "trials": trials,
-        "successes": successes,
-    }
+            }
+    finally:
+        env.close()
+    raise RuntimeError(
+        f"Episode {episode_id} (seed={resolved_seed}) had no successful trajectory "
+        f"within {max_trials} deterministic attempts"
+    )
 
 
 def wait_first(futures):
@@ -502,7 +495,7 @@ def generate_data_parallel(
     n: int,
     task_name: str,
     render: bool = False,
-    output_dir: str = DEFAULT_DATASET_DIR,
+    output_dir: str = DEFAULT_CLEAN_DATASET_DIR,
     hdf5_name: Optional[str] = None,
     num_workers: int = 4,
     chunk_size: int = 2,
@@ -571,6 +564,11 @@ def generate_data_parallel(
     if hdf5_name is None:
         hdf5_name = f"{task_name}_{action_representation}_dataset_{n}{'_vision' if vision else ''}.hdf5"
     h5_path = os.path.join(output_dir, hdf5_name)
+    if os.path.exists(h5_path):
+        raise FileExistsError(
+            f"Refusing to overwrite existing dataset: {h5_path}. "
+            "Choose a new --hdf5_name or clean version directory."
+        )
     hf = init_hdf5(
         h5_path,
         task_name,
@@ -580,8 +578,29 @@ def generate_data_parallel(
         image_height=image_height, image_width=image_width,
     )
     sample_env.close()
+    generation_config = {
+        "version": "clean_v1",
+        "requested_episodes": int(n),
+        "dataset_base_seed": int(base_seed),
+        "task_name": task_name,
+        "vision": bool(vision),
+        "camera_names": camera_names,
+        "image_height": int(image_height),
+        "image_width": int(image_width),
+        "jpeg_quality": int(jpeg_quality),
+        "action_representation": action_representation,
+        "max_trials_per_episode": int(max_trials_per_worker),
+    }
+    hf.attrs["dataset_base_seed"] = int(base_seed)
+    hf.attrs["experiment_version"] = "clean_v1"
+    hf["meta"].attrs["dataset_base_seed"] = int(base_seed)
+    hf["meta"].attrs["experiment_version"] = "clean_v1"
+    hf["meta"].attrs["environment_ranges_json"] = json.dumps(TASK_ENVIRONMENT_RANGES[task_name], sort_keys=True)
+    hf["meta"].attrs["generation_config_json"] = json.dumps(generation_config, sort_keys=True)
+    commit = git_commit(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    if commit is not None:
+        hf["meta"].attrs["git_commit"] = commit
 
-    episode_idx = 0
     success_count = 0
     heuristic_trials = 0
     heuristic_successes = 0
@@ -590,16 +609,19 @@ def generate_data_parallel(
     if verbose:
         print(f"[generate_data_parallel] Target={n} | Task={task_name} | Workers={num_workers}")
 
+    planned_episode_seeds = episode_seed_plan(base_seed, range(n))
+    if len(planned_episode_seeds) != len(set(planned_episode_seeds)):
+        raise RuntimeError(
+            "Episode seed collision detected; choose a different dataset base seed"
+        )
+    written_episode_ids: set[int] = set()
     with ProcessPoolExecutor(max_workers=num_workers) as pool, \
          tqdm(total=n, desc="Successful Trajectories", unit="traj") as pbar:
-
-        # Launch initial workers
-        futures = [
+        futures = {
             pool.submit(
                 worker_generate,
-                wid,
+                episode_id,
                 task_name,
-                chunk_size,
                 max_trials_per_worker,
                 base_seed,
                 vision,
@@ -607,75 +629,61 @@ def generate_data_parallel(
                 image_height,
                 image_width,
                 action_representation,
+            ): episode_id
+            for episode_id in range(n)
+        }
+        for future in as_completed(futures):
+            entry = future.result()
+            resolved_episode_id = int(entry["episode_id"])
+            if resolved_episode_id in written_episode_ids:
+                raise RuntimeError(f"Duplicate episode write index: {resolved_episode_id}")
+            if resolved_episode_id != futures[future]:
+                raise RuntimeError(
+                    f"Worker returned episode_id={resolved_episode_id} for requested id={futures[future]}"
+                )
+            heuristic_trials += int(entry["trials"])
+            heuristic_successes += 1
+            if success_count == 0:
+                hf["meta"].attrs["policy_dof"] = entry["joint_angles"].shape[1]
+                hf["meta"].attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
+                hf["meta"].attrs["action_representation"] = action_representation
+            image_paths = None
+            if vision:
+                frames = entry["camera_frames"]
+                expected_len = len(entry["joint_angles"])
+                bad = {name: len(values) for name, values in frames.items() if len(values) != expected_len}
+                if bad:
+                    raise ValueError(
+                        f"Episode {resolved_episode_id} image/trajectory length mismatch: "
+                        f"expected {expected_len}, got {bad}"
+                    )
+                image_paths = _write_episode_images(
+                    h5_path, resolved_episode_id, frames, jpeg_quality
+                )
+            save_episode(
+                hf,
+                resolved_episode_id,
+                entry["joint_angles"],
+                entry["key_inds"],
+                True,
+                entry["initial_pose"],
+                entry["environment_setting"],
+                entry["environment_parameters"],
+                entry["environment_states"],
+                image_paths,
+                action_representation=action_representation,
+                episode_id=resolved_episode_id,
+                episode_random_seed=entry["episode_seed"],
+                dataset_base_seed=base_seed,
             )
-            for wid in range(num_workers)
-        ]
+            written_episode_ids.add(resolved_episode_id)
+            success_count += 1
+            pbar.update(1)
+            pbar.set_postfix({"episode": success_count})
 
-        # Collect until n successes
-        while success_count < n and futures:
-            done, futures = wait_first(futures)
-            for fut in done:
-                worker_result = fut.result()
-                batch = worker_result["successes"]
-                heuristic_trials += worker_result["trials"]
-                heuristic_successes += len(batch)
-                for entry in batch:
-                    if success_count >= n:
-                        break
-                    if success_count == 0:
-                        hf["meta"].attrs["policy_dof"] = entry["joint_angles"].shape[1]
-                        hf["meta"].attrs["gripper_format"] = "normalized_pose_0_closed_1_open"
-                        hf["meta"].attrs["action_representation"] = action_representation
-                    image_paths = None
-                    if vision:
-                        frames = entry["camera_frames"]
-                        expected_len = len(entry["joint_angles"])
-                        bad = {name: len(values) for name, values in frames.items() if len(values) != expected_len}
-                        if bad:
-                            raise ValueError(
-                                f"Episode {episode_idx} image/trajectory length mismatch: "
-                                f"expected {expected_len}, got {bad}"
-                            )
-                        image_paths = _write_episode_images(
-                            h5_path, episode_idx, frames, jpeg_quality
-                        )
-                    # Save actions + initial_pose
-                    save_episode(
-                        hf,
-                        episode_idx,
-                        entry["joint_angles"],
-                        entry["key_inds"],
-                        True,
-                        entry["initial_pose"],
-                        entry["environment_setting"],
-                        entry["environment_parameters"],
-                        entry["environment_states"],
-                        image_paths,
-                        action_representation=action_representation,
-                    )
-
-                    pbar.update(1)
-                    pbar.set_postfix({"episode": episode_idx+1})
-                    episode_idx += 1
-                    success_count += 1
-                # Resubmit worker if more needed
-                if success_count < n:
-                    wid = np.random.randint(0, num_workers)
-                    futures.append(
-                        pool.submit(
-                            worker_generate,
-                            wid,
-                            task_name,
-                            chunk_size,
-                            max_trials_per_worker,
-                            base_seed,
-                            vision,
-                            camera_names,
-                            image_height,
-                            image_width,
-                            action_representation,
-                        )
-                    )
+    if written_episode_ids != set(range(n)):
+        missing = sorted(set(range(n)) - written_episode_ids)
+        raise RuntimeError(f"Missing episode IDs after generation: {missing}")
 
     hf.attrs["num_episodes"] = success_count
     hf.close()
@@ -758,17 +766,22 @@ if __name__ == "__main__":
     parser.add_argument("--image_width", type=int, default=DEFAULT_VISION_WIDTH)
     parser.add_argument("--jpeg_quality", type=int, default=80)
     parser.add_argument(
-        "--output_dir", type=str, default=DEFAULT_DATASET_DIR,
+        "--output_dir", type=str, default=DEFAULT_CLEAN_DATASET_DIR,
         help="Directory to save generated HDF5 datasets"
     )
+    parser.add_argument("--hdf5_name", type=str, default=None,
+                        help="Optional output filename; existing files are never overwritten")
     parser.add_argument(
         "--num_workers", type=int, default=5,
         help="Number of parallel worker processes"
     )
     parser.add_argument(
         "--chunk_size", type=int, default=3,
-        help="Number of successes each worker returns per batch"
+        help="Deprecated compatibility option; episode randomness never depends on chunks"
     )
+    parser.add_argument("--max_trials_per_episode", type=int, default=200)
+    parser.add_argument("--base_seed", type=int, default=12345,
+                        help="Dataset-level seed; episode seeds derive from this and episode_id")
     parser.add_argument(
         "--verbose", action="store_true",
         help="Print progress and debug information"
@@ -786,8 +799,11 @@ if __name__ == "__main__":
         task_name=args.task_name,
         render=args.render,
         output_dir=args.output_dir,
+        hdf5_name=args.hdf5_name,
         num_workers=args.num_workers,
         chunk_size=args.chunk_size,
+        max_trials_per_worker=args.max_trials_per_episode,
+        base_seed=args.base_seed,
         verbose=args.verbose,
         vision=args.vision,
         camera_names=args.camera_names,
