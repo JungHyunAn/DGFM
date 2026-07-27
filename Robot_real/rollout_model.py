@@ -76,21 +76,44 @@ class RealRobotPolicy:
             weights_only=False,
         )
         self.metadata = checkpoint["metadata"]
-        self.model_dof = int(self.metadata["dof"])
-        checkpoint_joint_names = tuple(self.metadata["joint_names"])
+        self.model_dof = int(self.metadata.get("action_dof", self.metadata["dof"]))
+        self.model_state_dof = int(self.metadata.get("state_dof", self.model_dof))
+        checkpoint_action_names = tuple(
+            self.metadata.get("action_joint_names", self.metadata["joint_names"])
+        )
+        checkpoint_state_names = tuple(
+            self.metadata.get("state_joint_names", self.metadata["joint_names"])
+        )
         self._collapse_finger_pair = (
             self.model_dof >= 2
-            and checkpoint_joint_names[-2:] == FINGER_JOINT_PAIR
+            and self.model_state_dof >= 2
+            and checkpoint_action_names[-2:] == FINGER_JOINT_PAIR
+            and checkpoint_state_names[-2:] == FINGER_JOINT_PAIR
         )
-        self.dof = (
-            self.model_dof - 1 if self._collapse_finger_pair else self.model_dof
-        )
-        self._joint_names = (
-            (*checkpoint_joint_names[:-2], GRIPPER_POSITION_NAME)
+        self._action_joint_names = (
+            (*checkpoint_action_names[:-2], GRIPPER_POSITION_NAME)
             if self._collapse_finger_pair
-            else checkpoint_joint_names
+            else checkpoint_action_names
         )
+        self._state_joint_names = (
+            (*checkpoint_state_names[:-2], GRIPPER_POSITION_NAME)
+            if self._collapse_finger_pair
+            else checkpoint_state_names
+        )
+        self.dof = len(self._state_joint_names)
+        self.action_dof = len(self._action_joint_names)
+        if self.dof != self.action_dof:
+            raise ValueError(
+                "RealRobotPolicy currently requires equal external state/action dimensions, "
+                f"got state={self.dof}, action={self.action_dof}"
+            )
         self.horizon = int(self.metadata["horizon"])
+        self.observation_horizon = int(
+            self.metadata.get("observation_horizon", 1)
+        )
+        self.observation_dt_sec = float(
+            self.metadata.get("observation_dt_sec", 0.1)
+        )
         self.image_size = int(self.metadata["image_size"])
         self.sampler_steps = int(
             sampler_steps
@@ -106,6 +129,8 @@ class RealRobotPolicy:
         self.model, self.encoder = build_models(
             horizon=self.horizon,
             dof=self.model_dof,
+            state_dof=self.model_state_dof,
+            observation_horizon=self.observation_horizon,
             feature_proj_dim=int(self.metadata["feature_proj_dim"]),
             condition_embed_dim=int(self.metadata["condition_embed_dim"]),
             num_convs_per_block=int(self.metadata["num_convs_per_block"]),
@@ -127,57 +152,111 @@ class RealRobotPolicy:
         self.model.eval()
         self.encoder.eval()
 
-        normalization = self.metadata["normalization"]
-        self.normalization = {
+        state_normalization = self.metadata.get(
+            "state_normalization", self.metadata["normalization"]
+        )
+        action_normalization = self.metadata.get(
+            "action_normalization", self.metadata["normalization"]
+        )
+        self.state_normalization = {
             key: torch.as_tensor(value, dtype=torch.float32, device=self.device)
-            for key, value in normalization.items()
+            for key, value in state_normalization.items()
         }
+        self.action_normalization = {
+            key: torch.as_tensor(value, dtype=torch.float32, device=self.device)
+            for key, value in action_normalization.items()
+        }
+        # Backward-compatible alias used by the ROS bridge for action thresholds.
+        self.normalization = self.action_normalization
 
     @property
     def joint_names(self) -> tuple[str, ...]:
-        return self._joint_names
+        return self._state_joint_names
+
+    @property
+    def action_joint_names(self) -> tuple[str, ...]:
+        return self._action_joint_names
 
     @torch.no_grad()
     def predict_action_chunk(
         self,
-        images: Sequence[ImageInput],
+        images: Sequence[ImageInput] | Sequence[Sequence[ImageInput]],
         joint_angles: Sequence[float] | np.ndarray | torch.Tensor,
     ) -> np.ndarray:
         """Return a denormalized action chunk shaped ``(horizon, dof)``."""
-        if len(images) != 2:
-            raise ValueError(
-                "Expected two current images in (frontview, wristview) order, "
-                f"got {len(images)}"
+        if torch.is_tensor(joint_angles):
+            joint_array = joint_angles.detach().cpu().numpy()
+        else:
+            joint_array = np.asarray(joint_angles)
+        if joint_array.ndim == 1:
+            joint_array = np.repeat(
+                joint_array[None, :], self.observation_horizon, axis=0
             )
+            image_history = [images] * self.observation_horizon
+        elif joint_array.ndim == 2:
+            if joint_array.shape[0] != self.observation_horizon:
+                raise ValueError(
+                    f"Checkpoint expects {self.observation_horizon} state frames, "
+                    f"got {joint_array.shape[0]}"
+                )
+            image_history = list(images)
+        else:
+            raise ValueError(
+                f"Expected one state or state history, got shape {joint_array.shape}"
+            )
+        if len(image_history) != self.observation_horizon:
+            raise ValueError(
+                f"Checkpoint expects {self.observation_horizon} image frames, "
+                f"got {len(image_history)}"
+            )
+        for frame_images in image_history:
+            if len(frame_images) != 2:
+                raise ValueError(
+                    "Each image frame must contain (frontview, wristview), "
+                    f"got {len(frame_images)} views"
+                )
         image_array = np.stack(
-            [_prepare_rgb_image(image, self.image_size) for image in images],
+            [
+                np.stack(
+                    [
+                        _prepare_rgb_image(image, self.image_size)
+                        for image in frame_images
+                    ],
+                    axis=0,
+                )
+                for frame_images in image_history
+            ],
             axis=0,
         )
         image_batch = torch.from_numpy(image_array).unsqueeze(0)
 
         joints = torch.as_tensor(
-            joint_angles,
+            joint_array,
             dtype=torch.float32,
             device=self.device,
-        ).reshape(-1)
-        if joints.numel() != self.dof:
+        )
+        if joints.shape != (self.observation_horizon, self.dof):
             raise ValueError(
-                f"Checkpoint expects {self.dof} joints {self.joint_names}, "
-                f"but received {joints.numel()} values"
+                f"Checkpoint expects state history "
+                f"({self.observation_horizon}, {self.dof}) for {self.joint_names}, "
+                f"but received {tuple(joints.shape)}"
             )
         if self._collapse_finger_pair:
-            joints = torch.cat((joints[:-1], joints[-1:].repeat(2)))
-        if "min" in self.normalization:
+            joints = torch.cat(
+                (joints[:, :-1], joints[:, -1:].repeat(1, 2)), dim=-1
+            )
+        if "min" in self.state_normalization:
             normalized_joints = torch.clamp(
-                (2.0 / self.normalization["range"])
-                * (joints - self.normalization["min"])
+                (2.0 / self.state_normalization["range"])
+                * (joints - self.state_normalization["min"])
                 - 1.0,
                 -1.0,
                 1.0,
             ).unsqueeze(0)
         else:
             normalized_joints = (
-                (joints - self.normalization["mean"]) / self.normalization["std"]
+                (joints - self.state_normalization["mean"])
+                / self.state_normalization["std"]
             ).unsqueeze(0)
         condition = make_condition(
             self.encoder,
@@ -200,17 +279,17 @@ class RealRobotPolicy:
             clip_sample_range=float(self.metadata["clip_sample_range"]),
             generator=self.generator,
         )[0]
-        if "min" in self.normalization:
+        if "min" in self.action_normalization:
             action_chunk = (
                 (normalized_chunk + 1.0)
                 * 0.5
-                * self.normalization["range"][None, :]
-                + self.normalization["min"][None, :]
+                * self.action_normalization["range"][None, :]
+                + self.action_normalization["min"][None, :]
             )
         else:
             action_chunk = (
-                normalized_chunk * self.normalization["std"][None, :]
-                + self.normalization["mean"][None, :]
+                normalized_chunk * self.action_normalization["std"][None, :]
+                + self.action_normalization["mean"][None, :]
             )
         if self._collapse_finger_pair:
             action_chunk = torch.cat(
@@ -286,7 +365,8 @@ def main() -> None:
         joint_angles,
     )
     result = {
-        "joint_names": list(policy.joint_names),
+        "state_joint_names": list(policy.joint_names),
+        "action_joint_names": list(policy.action_joint_names),
         "shape": list(action_chunk.shape),
         "action_chunk": action_chunk.tolist(),
     }

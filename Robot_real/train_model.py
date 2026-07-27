@@ -18,6 +18,8 @@ from tqdm import tqdm
 from Robot_real.dataset_utils import (
     CAMERA_NAMES,
     DEFAULT_DATASET_ROOT,
+    TELEOP_ACTION_GRIPPER_COLUMN,
+    TELEOP_STATE_GRIPPER_COLUMN,
     ActionChunkDataset,
     compute_joint_stats,
     demo_subset_dataset,
@@ -69,6 +71,8 @@ def build_models(
     *,
     horizon: int,
     dof: int,
+    state_dof: int | None = None,
+    observation_horizon: int = 1,
     feature_proj_dim: int,
     condition_embed_dim: int,
     num_convs_per_block: int,
@@ -83,6 +87,8 @@ def build_models(
     vision_random_shift: int = 4,
     vision_color_jitter: float = 0.1,
 ) -> tuple[VectorField, FrozenResNet18Encoder]:
+    if observation_horizon <= 0:
+        raise ValueError("observation_horizon must be positive")
     encoder = FrozenResNet18Encoder(
         camera_names=CAMERA_NAMES,
         pretrained=pretrained_vision,
@@ -96,7 +102,9 @@ def build_models(
         random_shift=vision_random_shift,
         color_jitter=vision_color_jitter,
     ).to(device)
-    condition_dim = dof + encoder.output_dim
+    condition_dim = observation_horizon * (
+        (dof if state_dof is None else state_dof) + encoder.output_dim
+    )
     model = VectorField(
         seq_len=horizon,
         dof=dof,
@@ -116,14 +124,34 @@ def make_condition(
     device: torch.device,
     vision_batch_size: int | None = None,
 ) -> torch.Tensor:
-    images = images.to(device, non_blocking=True)
-    if vision_batch_size and images.shape[0] > vision_batch_size:
+    if images.ndim == 5:
+        images = images.unsqueeze(1)
+    if joint_state.ndim == 2:
+        joint_state = joint_state.unsqueeze(1)
+    if images.ndim != 6 or joint_state.ndim != 3:
+        raise ValueError(
+            "Expected images (B, O, V, H, W, C) and states (B, O, D), "
+            f"got {tuple(images.shape)} and {tuple(joint_state.shape)}"
+        )
+    if images.shape[:2] != joint_state.shape[:2]:
+        raise ValueError(
+            f"Image/state history shape mismatch: {images.shape[:2]} "
+            f"vs {joint_state.shape[:2]}"
+        )
+    batch_size, observation_horizon = images.shape[:2]
+    flat_images = images.reshape(
+        batch_size * observation_horizon, *images.shape[2:]
+    )
+    flat_images = flat_images.to(device, non_blocking=True)
+    if vision_batch_size and flat_images.shape[0] > vision_batch_size:
         image_features = torch.cat(
-            [encoder(chunk) for chunk in images.split(vision_batch_size)], dim=0
+            [encoder(chunk) for chunk in flat_images.split(vision_batch_size)], dim=0
         )
     else:
-        image_features = encoder(images)
-    return torch.cat([joint_state.to(device, non_blocking=True), image_features], dim=-1)
+        image_features = encoder(flat_images)
+    state_history = joint_state.to(device, non_blocking=True).reshape(batch_size, -1)
+    image_history = image_features.reshape(batch_size, -1)
+    return torch.cat([state_history, image_history], dim=-1)
 
 
 def cosine_schedule_with_warmup(
@@ -250,16 +278,20 @@ def _training_loss(
 
 def _collect_dgfmv2_arrays(
     dataset: ActionChunkDataset,
-    stats: dict[str, np.ndarray],
+    state_stats: dict[str, np.ndarray],
+    action_stats: dict[str, np.ndarray],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Collect normalized chunks/state conditions without decoding images."""
     actions = []
     states = []
     for demo_index, start in dataset.samples:
         demo = dataset.demos[demo_index]
-        states.append(normalize_joint_angles(demo.joints[start], stats))
-        chunk = demo.joints[start + 1 : start + 1 + dataset.horizon]
-        actions.append(normalize_joint_angles(chunk, stats))
+        state_history = demo.states[dataset.observation_indices(start)]
+        states.append(
+            normalize_joint_angles(state_history, state_stats).reshape(-1)
+        )
+        chunk = demo.actions[start : start + dataset.horizon]
+        actions.append(normalize_joint_angles(chunk, action_stats))
     return (
         torch.from_numpy(np.asarray(actions, dtype=np.float32)),
         torch.from_numpy(np.asarray(states, dtype=np.float32)),
@@ -268,7 +300,8 @@ def _collect_dgfmv2_arrays(
 
 def _fit_dgfmv2(
     dataset: ActionChunkDataset,
-    stats: dict[str, np.ndarray],
+    state_stats: dict[str, np.ndarray],
+    action_stats: dict[str, np.ndarray],
     model: VectorField,
     optimizer: torch.optim.Optimizer,
     scheduler,
@@ -276,7 +309,7 @@ def _fit_dgfmv2(
     device: torch.device,
 ):
     """Fit the simulation DGFMv2 X-only cluster/PCA intermediate distribution."""
-    actions, states = _collect_dgfmv2_arrays(dataset, stats)
+    actions, states = _collect_dgfmv2_arrays(dataset, state_stats, action_stats)
     flat_actions = actions.numpy().reshape(len(actions), -1)
     state_conditions = states.numpy()
     cluster_size = config.get("cluster_size")
@@ -400,14 +433,17 @@ def validate_offline(
     model: VectorField,
     encoder: FrozenResNet18Encoder,
     demos,
-    stats: dict[str, np.ndarray],
+    state_stats: dict[str, np.ndarray],
+    action_stats: dict[str, np.ndarray],
     config: dict[str, Any],
     device: torch.device,
 ) -> tuple[float, dict[str, float]]:
     """Compare generated chunks with held-out demonstration chunks in joint units."""
     model.eval()
     encoder.eval()
-    joint_dim = len(stats["min"] if "min" in stats else stats["mean"])
+    action_dim = len(
+        action_stats["min"] if "min" in action_stats else action_stats["mean"]
+    )
     per_demo: dict[str, float] = {}
 
     for demo_index, demo in enumerate(demos):
@@ -415,7 +451,9 @@ def validate_offline(
             demo,
             horizon=config["horizon"],
             image_size=config["image_size"],
-            normalization_stats=stats,
+            state_normalization_stats=state_stats,
+            action_normalization_stats=action_stats,
+            observation_horizon=int(config.get("observation_horizon", 1)),
             max_steps=config.get("validation_steps_per_demo", 100),
             cache_images=config.get("cache_images", False),
             cache_workers=config.get("cache_workers", 8),
@@ -444,7 +482,7 @@ def validate_offline(
                 conditions,
                 model_type=config["model_type"],
                 horizon=config["horizon"],
-                dof=joint_dim,
+                dof=action_dim,
                 sampler_steps=config["sampler_steps"],
                 diffusion_steps=config["diffusion_steps"],
                 diffusion_schedule=config["diffusion_schedule"],
@@ -456,8 +494,8 @@ def validate_offline(
             )
             targets = batch["actions"].to(device)
             error = (
-                _denormalize_joint_tensor(predictions, stats)
-                - _denormalize_joint_tensor(targets, stats)
+                _denormalize_joint_tensor(predictions, action_stats)
+                - _denormalize_joint_tensor(targets, action_stats)
             ) ** 2
             squared_error += float(error.sum())
             element_count += error.numel()
@@ -469,10 +507,12 @@ def _checkpoint_payload(
     model_state: dict[str, torch.Tensor],
     encoder_state: dict[str, torch.Tensor],
     config: dict[str, Any],
-    stats: dict[str, np.ndarray],
+    state_stats: dict[str, np.ndarray],
+    action_stats: dict[str, np.ndarray],
     train_indices: list[int],
     val_indices: list[int],
-    joint_names: tuple[str, ...],
+    state_joint_names: tuple[str, ...],
+    action_joint_names: tuple[str, ...],
     condition_dim: int,
     epoch: int,
     validation_mse: float | None,
@@ -481,6 +521,8 @@ def _checkpoint_payload(
         "task",
         "model_type",
         "horizon",
+        "observation_horizon",
+        "observation_dt_sec",
         "image_size",
         "use_gripper",
         "feature_proj_dim",
@@ -532,14 +574,32 @@ def _checkpoint_payload(
     )
     metadata = {key: config.get(key) for key in metadata_keys}
     metadata.update(
-        dof=len(joint_names),
+        dof=len(action_joint_names),
+        state_dof=len(state_joint_names),
+        action_dof=len(action_joint_names),
         condition_dim=condition_dim,
         camera_names=list(CAMERA_NAMES),
-        joint_names=list(joint_names),
+        joint_names=list(action_joint_names),
+        state_joint_names=list(state_joint_names),
+        action_joint_names=list(action_joint_names),
         train_indices=train_indices,
         val_indices=val_indices,
-        normalization={key: value.tolist() for key, value in stats.items()},
-        normalization_type=("min_max_-1_1" if "min" in stats else "z_score"),
+        normalization={key: value.tolist() for key, value in action_stats.items()},
+        state_normalization={
+            key: value.tolist() for key, value in state_stats.items()
+        },
+        action_normalization={
+            key: value.tolist() for key, value in action_stats.items()
+        },
+        normalization_type=(
+            "min_max_-1_1" if "min" in action_stats else "z_score"
+        ),
+        gripper_state_source=(
+            TELEOP_STATE_GRIPPER_COLUMN if config.get("use_gripper") else None
+        ),
+        gripper_action_source=(
+            TELEOP_ACTION_GRIPPER_COLUMN if config.get("use_gripper") else None
+        ),
     )
     return {
         "model_state_dict": model_state,
@@ -574,12 +634,15 @@ def train(config: dict[str, Any]) -> Path:
         f"Dataset split: train_indices={train_indices} val_indices={val_indices} "
         f"val_demos={[demo.name for demo in val_demos]}"
     )
-    stats = compute_joint_stats(train_demos)
+    state_stats = compute_joint_stats(train_demos, source="state")
+    action_stats = compute_joint_stats(train_demos, source="action")
     train_dataset = ActionChunkDataset(
         train_demos,
         horizon=config["horizon"],
         image_size=config["image_size"],
-        normalization_stats=stats,
+        state_normalization_stats=state_stats,
+        action_normalization_stats=action_stats,
+        observation_horizon=int(config.get("observation_horizon", 1)),
         cache_images=config.get("cache_images", False),
         cache_workers=config.get("cache_workers", 8),
     )
@@ -599,10 +662,13 @@ def train(config: dict[str, Any]) -> Path:
         ),
     )
 
-    dof = len(train_demos[0].joint_names)
+    state_dof = len(train_demos[0].state_joint_names)
+    action_dof = len(train_demos[0].action_joint_names)
     model, encoder = build_models(
         horizon=config["horizon"],
-        dof=dof,
+        dof=action_dof,
+        state_dof=state_dof,
+        observation_horizon=int(config.get("observation_horizon", 1)),
         feature_proj_dim=config["feature_proj_dim"],
         condition_embed_dim=config["condition_embed_dim"],
         num_convs_per_block=config["num_convs_per_block"],
@@ -661,7 +727,14 @@ def train(config: dict[str, Any]) -> Path:
             dgfm_cluster_count,
             dgfm_cluster_size,
         ) = _fit_dgfmv2(
-            train_dataset, stats, model, optimizer, scheduler, config, device
+            train_dataset,
+            state_stats,
+            action_stats,
+            model,
+            optimizer,
+            scheduler,
+            config,
+            device,
         )
 
     ema = EMAModel(model) if config["use_ema"] else None
@@ -672,7 +745,8 @@ def train(config: dict[str, Any]) -> Path:
         f"Task={config['task']} model={config['model_type']} device={device} "
         f"demos={len(train_demos)}/{len(demos)} val_demos={len(val_demos)} "
         f"training_action_chunks={len(train_dataset)} "
-        f"action_chunk_shape=({config['horizon']}, {dof})"
+        f"state_history_shape=({train_dataset.observation_horizon}, {state_dof}) "
+        f"action_chunk_shape=({config['horizon']}, {action_dof})"
     )
     epoch_progress = tqdm(
         range(1, config["epochs"] + 1),
@@ -735,7 +809,13 @@ def train(config: dict[str, Any]) -> Path:
         if should_validate:
             evaluation_model = ema.averaged_model if ema is not None else model
             val_mse, per_demo = validate_offline(
-                evaluation_model, encoder, val_demos, stats, config, device
+                evaluation_model,
+                encoder,
+                val_demos,
+                state_stats,
+                action_stats,
+                config,
+                device,
             )
             record.update(validation_mse=val_mse, validation_by_demo=per_demo)
             last_validation_mse = val_mse
@@ -767,10 +847,12 @@ def train(config: dict[str, Any]) -> Path:
         final_model_state,
         final_encoder_state,
         config,
-        stats,
+        state_stats,
+        action_stats,
         train_indices,
         val_indices,
-        train_demos[0].joint_names,
+        train_demos[0].state_joint_names,
+        train_demos[0].action_joint_names,
         model.param_len,
         config["epochs"],
         last_validation_mse,

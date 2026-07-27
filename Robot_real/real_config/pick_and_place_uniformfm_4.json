@@ -9,6 +9,8 @@
   "dataset_size": 4,
   "use_gripper": true,
   "horizon": 32,
+  "observation_horizon": 2,
+  "observation_dt_sec": 0.1,
   "image_size": 224,
   "max_alignment_error_s": 0.05,
   "validation": true,

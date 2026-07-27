@@ -19,6 +19,8 @@ CAMERA_NAMES = ("frontview", "wristview")
 DEFAULT_DATASET_ROOT = Path(__file__).resolve().parent / "real_dataset"
 PICK_AND_PLACE_ARM_DOF = 7
 PICK_AND_PLACE_GRIPPER_NAME = "gripper_position"
+TELEOP_STATE_GRIPPER_COLUMN = "gripper_width"
+TELEOP_ACTION_GRIPPER_COLUMN = "gripper_target_width"
 
 
 @dataclass(frozen=True)
@@ -35,14 +37,26 @@ class AlignedDemo:
     camera_rollout: Path
     trajectory_rollout: Path
     timestamps_s: np.ndarray
-    joint_names: tuple[str, ...]
-    joints: np.ndarray
+    state_joint_names: tuple[str, ...]
+    action_joint_names: tuple[str, ...]
+    states: np.ndarray
+    actions: np.ndarray
     image_paths: np.ndarray
     alignment_error_s: np.ndarray
     image_cache: dict[int, torch.Tensor] = field(default_factory=dict, repr=False)
 
     def __len__(self) -> int:
         return len(self.timestamps_s)
+
+    @property
+    def joint_names(self) -> tuple[str, ...]:
+        """Backward-compatible action coordinate names."""
+        return self.action_joint_names
+
+    @property
+    def joints(self) -> np.ndarray:
+        """Backward-compatible state trajectory accessor."""
+        return self.states
 
 
 def default_dataset_paths(
@@ -173,6 +187,98 @@ def _read_joint_trajectory(
     return timestamps_array[order], selected_names, positions_array[order]
 
 
+def _read_teleop_joint_trajectory(
+    path: Path,
+    *,
+    gripper_column: str,
+    use_gripper: bool,
+) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
+    """Read seven arm coordinates plus one continuous gripper scalar."""
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing teleop trajectory: {path}")
+
+    timestamps: list[float] = []
+    arm_positions: list[list[float]] = []
+    gripper_values: list[float] = []
+    arm_names: tuple[str, ...] | None = None
+    with path.open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        required = {"time", "joint_names", "joint_positions"}
+        if use_gripper:
+            required.add(gripper_column)
+        missing = sorted(required.difference(reader.fieldnames or ()))
+        if missing:
+            raise ValueError(f"Missing column(s) in {path}: {', '.join(missing)}")
+
+        for row in reader:
+            names = tuple(item.strip() for item in row["joint_names"].split(","))
+            values = [float(item) for item in row["joint_positions"].split(",")]
+            if len(names) != len(values):
+                raise ValueError(f"Joint name/value count differs in {path}")
+            arm_indices = [i for i, name in enumerate(names) if "finger" not in name.lower()]
+            row_arm_names = tuple(names[i] for i in arm_indices)
+            if len(row_arm_names) != PICK_AND_PLACE_ARM_DOF:
+                raise ValueError(
+                    f"Expected {PICK_AND_PLACE_ARM_DOF} arm joints in {path}, "
+                    f"got {row_arm_names}"
+                )
+            if arm_names is None:
+                arm_names = row_arm_names
+            elif row_arm_names != arm_names:
+                raise ValueError(f"Arm joint order changes within {path}")
+            timestamps.append(float(row["time"]))
+            arm_positions.append([values[i] for i in arm_indices])
+            if use_gripper:
+                gripper_values.append(float(row[gripper_column]))
+
+    if not timestamps or arm_names is None:
+        raise ValueError(f"No joint samples found in {path}")
+    timestamps_array = np.asarray(timestamps, dtype=np.float64)
+    positions_array = np.asarray(arm_positions, dtype=np.float32)
+    names_out = arm_names
+    if use_gripper:
+        positions_array = np.concatenate(
+            [
+                positions_array,
+                np.asarray(gripper_values, dtype=np.float32)[:, None],
+            ],
+            axis=1,
+        )
+        names_out = (*arm_names, PICK_AND_PLACE_GRIPPER_NAME)
+    order = np.argsort(timestamps_array)
+    return timestamps_array[order], names_out, positions_array[order]
+
+
+def _read_teleop_state_action(
+    trajectory_rollout: Path,
+    *,
+    use_gripper: bool,
+) -> tuple[
+    np.ndarray,
+    tuple[str, ...],
+    np.ndarray,
+    np.ndarray,
+    tuple[str, ...],
+    np.ndarray,
+]:
+    state_times, state_names, states = _read_teleop_joint_trajectory(
+        trajectory_rollout / "teleop_state_joint.csv",
+        gripper_column=TELEOP_STATE_GRIPPER_COLUMN,
+        use_gripper=use_gripper,
+    )
+    action_times, action_names, actions = _read_teleop_joint_trajectory(
+        trajectory_rollout / "teleop_action_joint.csv",
+        gripper_column=TELEOP_ACTION_GRIPPER_COLUMN,
+        use_gripper=use_gripper,
+    )
+    if state_names != action_names:
+        raise ValueError(
+            f"State/action coordinate order differs in {trajectory_rollout}: "
+            f"{state_names} vs {action_names}"
+        )
+    return state_times, state_names, states, action_times, action_names, actions
+
+
 def _read_pick_and_place_gripper(
     trajectory_rollout: Path,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -229,6 +335,59 @@ def load_aligned_demo(
 ) -> AlignedDemo:
     """Align 10 Hz images to arm samples and interpolated gripper positions."""
     camera_times, image_paths = _read_camera_frames(camera_rollout)
+    has_teleop_state_action = (
+        (trajectory_rollout / "teleop_state_joint.csv").is_file()
+        and (trajectory_rollout / "teleop_action_joint.csv").is_file()
+    )
+    if has_teleop_state_action:
+        (
+            state_times,
+            state_names,
+            state_positions,
+            action_times,
+            action_names,
+            action_positions,
+        ) = _read_teleop_state_action(
+            trajectory_rollout,
+            use_gripper=use_gripper,
+        )
+        overlap = (
+            (camera_times >= state_times[0])
+            & (camera_times <= state_times[-1])
+            & (camera_times >= action_times[0])
+            & (camera_times <= action_times[-1])
+        )
+        camera_times = camera_times[overlap]
+        image_paths = image_paths[overlap]
+        if len(camera_times) == 0:
+            raise ValueError(
+                f"No temporal overlap between {camera_rollout.name} and "
+                f"{trajectory_rollout.name}"
+            )
+        state_nearest = _nearest_indices(state_times, camera_times)
+        action_nearest = _nearest_indices(action_times, camera_times)
+        state_errors = np.abs(state_times[state_nearest] - camera_times)
+        action_errors = np.abs(action_times[action_nearest] - camera_times)
+        errors = np.maximum(state_errors, action_errors)
+        if float(errors.max()) > max_alignment_error_s:
+            raise ValueError(
+                f"Timestamp mismatch in {camera_rollout.name}/{trajectory_rollout.name}: "
+                f"maximum state/action error is {errors.max():.6f}s "
+                f"(limit {max_alignment_error_s:.6f}s)"
+            )
+        return AlignedDemo(
+            name=camera_rollout.name,
+            camera_rollout=camera_rollout,
+            trajectory_rollout=trajectory_rollout,
+            timestamps_s=camera_times,
+            state_joint_names=state_names,
+            action_joint_names=action_names,
+            states=state_positions[state_nearest],
+            actions=action_positions[action_nearest],
+            image_paths=image_paths,
+            alignment_error_s=errors,
+        )
+
     use_pick_and_place_gripper = (
         task == "pick_and_place"
         and use_gripper
@@ -291,8 +450,10 @@ def load_aligned_demo(
         camera_rollout=camera_rollout,
         trajectory_rollout=trajectory_rollout,
         timestamps_s=camera_times,
-        joint_names=joint_names,
-        joints=aligned_positions,
+        state_joint_names=joint_names,
+        action_joint_names=joint_names,
+        states=aligned_positions,
+        actions=aligned_positions.copy(),
         image_paths=image_paths,
         alignment_error_s=errors,
     )
@@ -319,9 +480,10 @@ def load_aligned_demos(
         )
         for camera, trajectory in pairs
     ]
-    joint_orders = {demo.joint_names for demo in demos}
-    if len(joint_orders) != 1:
-        raise ValueError("Joint names/order differ across demonstrations")
+    state_orders = {demo.state_joint_names for demo in demos}
+    action_orders = {demo.action_joint_names for demo in demos}
+    if len(state_orders) != 1 or len(action_orders) != 1:
+        raise ValueError("State/action joint names or order differ across demonstrations")
     return demos
 
 
@@ -372,11 +534,22 @@ def select_train_validation_demos(
     )
 
 
-def compute_joint_stats(demos: Sequence[AlignedDemo]) -> dict[str, np.ndarray]:
-    """Fit the same per-joint [-1, 1] statistics used by simulation training."""
+def compute_joint_stats(
+    demos: Sequence[AlignedDemo],
+    *,
+    source: str = "state",
+) -> dict[str, np.ndarray]:
+    """Fit per-coordinate [-1, 1] statistics for states or actions."""
     if not demos:
         raise ValueError("At least one demonstration is required for normalization")
-    joints = np.concatenate([demo.joints for demo in demos], axis=0).astype(np.float32)
+    if source not in {"state", "action"}:
+        raise ValueError(f"source must be state or action, got {source!r}")
+    trajectories = (
+        [demo.states for demo in demos]
+        if source == "state"
+        else [demo.actions for demo in demos]
+    )
+    joints = np.concatenate(trajectories, axis=0).astype(np.float32)
     joint_min = joints.min(axis=0).astype(np.float32)
     joint_max = joints.max(axis=0).astype(np.float32)
     joint_range = (joint_max - joint_min).astype(np.float32)
@@ -455,7 +628,7 @@ def cache_demo_images(
 
 
 class ActionChunkDataset(Dataset):
-    """Current observation paired with the next fixed-horizon joint targets."""
+    """Observation history paired with targets at the current/future timestamps."""
 
     def __init__(
         self,
@@ -464,41 +637,74 @@ class ActionChunkDataset(Dataset):
         horizon: int = 16,
         image_size: int = 224,
         normalization_stats: dict[str, np.ndarray] | None = None,
+        state_normalization_stats: dict[str, np.ndarray] | None = None,
+        action_normalization_stats: dict[str, np.ndarray] | None = None,
+        observation_horizon: int = 1,
         cache_images: bool = False,
         cache_workers: int = 8,
     ):
         if horizon <= 0:
             raise ValueError("horizon must be positive")
+        if observation_horizon <= 0:
+            raise ValueError("observation_horizon must be positive")
         self.demos = list(demos)
         self.horizon = int(horizon)
+        self.observation_horizon = int(observation_horizon)
         self.image_size = int(image_size)
-        self.normalization_stats = normalization_stats
+        self.state_normalization_stats = (
+            state_normalization_stats
+            if state_normalization_stats is not None
+            else normalization_stats
+        )
+        self.action_normalization_stats = (
+            action_normalization_stats
+            if action_normalization_stats is not None
+            else normalization_stats
+        )
         if cache_images:
             cache_demo_images(self.demos, self.image_size, workers=cache_workers)
         self.samples: list[tuple[int, int]] = []
         for demo_index, demo in enumerate(self.demos):
             self.samples.extend(
-                (demo_index, start) for start in range(max(0, len(demo) - self.horizon))
+                (demo_index, start)
+                for start in range(max(0, len(demo) - self.horizon + 1))
             )
         if not self.samples:
-            raise ValueError(f"No demonstrations contain more than {horizon} aligned frames")
+            raise ValueError(f"No demonstrations contain at least {horizon} aligned frames")
 
     def __len__(self) -> int:
         return len(self.samples)
 
+    def observation_indices(self, start: int) -> np.ndarray:
+        first = start - self.observation_horizon + 1
+        return np.maximum(0, np.arange(first, start + 1, dtype=np.int64))
+
     def __getitem__(self, index: int) -> dict[str, object]:
         demo_index, start = self.samples[index]
         demo = self.demos[demo_index]
-        state = demo.joints[start].copy()
-        actions = demo.joints[start + 1 : start + 1 + self.horizon].copy()
-        if self.normalization_stats is not None:
-            state = normalize_joint_angles(state, self.normalization_stats)
-            actions = normalize_joint_angles(actions, self.normalization_stats)
+        observation_indices = self.observation_indices(start)
+        state = demo.states[observation_indices].copy()
+        actions = demo.actions[start : start + self.horizon].copy()
+        if self.state_normalization_stats is not None:
+            state = normalize_joint_angles(state, self.state_normalization_stats)
+        if self.action_normalization_stats is not None:
+            actions = normalize_joint_angles(actions, self.action_normalization_stats)
         cached_images = demo.image_cache.get(self.image_size)
         images = (
-            cached_images[start]
+            cached_images[observation_indices]
             if cached_images is not None
-            else torch.from_numpy(_load_resized_image_pair(demo.image_paths[start], self.image_size))
+            else torch.from_numpy(
+                np.stack(
+                    [
+                        _load_resized_image_pair(
+                            demo.image_paths[observation_index],
+                            self.image_size,
+                        )
+                        for observation_index in observation_indices
+                    ],
+                    axis=0,
+                )
+            )
         )
         return {
             "sample_index": index,
@@ -516,7 +722,9 @@ def demo_subset_dataset(
     *,
     horizon: int,
     image_size: int,
-    normalization_stats: dict[str, np.ndarray],
+    state_normalization_stats: dict[str, np.ndarray],
+    action_normalization_stats: dict[str, np.ndarray],
+    observation_horizon: int = 1,
     max_steps: int | None = None,
     cache_images: bool = False,
     cache_workers: int = 8,
@@ -525,7 +733,9 @@ def demo_subset_dataset(
         [demo],
         horizon=horizon,
         image_size=image_size,
-        normalization_stats=normalization_stats,
+        state_normalization_stats=state_normalization_stats,
+        action_normalization_stats=action_normalization_stats,
+        observation_horizon=observation_horizon,
         cache_images=cache_images,
         cache_workers=cache_workers,
     )
