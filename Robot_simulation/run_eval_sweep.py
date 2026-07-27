@@ -20,7 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from Robot_simulation.reproducibility import (
-    TASK_EVAL_BASE_SEEDS, dataset_fingerprint, selected_episode_indices, stable_hash,
+    DP_EVAL_POLICY_SEED_SCHEME, TASK_EVAL_BASE_SEEDS, dataset_fingerprint,
+    selected_episode_indices, stable_hash,
 )
 
 
@@ -68,7 +69,7 @@ CLUSTER_PARTITIONS_BY_TASK = {
 DATASET_PATH_BY_TASK = {
     "door": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/door_joint_space_dataset_1000_vision.hdf5"),
     "wipe": None,
-    "two_arm": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/two_arm_joint_space_dataset_1000_vision.hdf5"),
+    "two_arm": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/two_arm_joint_space_dataset_1000_vision_strict_v1.hdf5"),
     "nut": dgfm_path("Robot_simulation/heuristic_dataset/nut_joint_space_dataset_1000_vision.hdf5"),
 }
 
@@ -324,6 +325,43 @@ def config_to_cli_args(config: dict[str, Any]) -> list[str]:
     return args
 
 
+def method_metadata_compatible(result: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Apply only metadata requirements relevant to the selected method/task."""
+    method = config["FM_type"]
+    task_name = config["task_name"]
+
+    if config.get("use_ema"):
+        if result.get("use_ema") is not True:
+            return False
+        ema_applied = result.get("ema_applied")
+        if ema_applied is False:
+            return False
+        # Legacy clean_v1 UniformFM is provably EMA-backed by its existing
+        # implementation and use_ema signature, so the new field is optional.
+        if ema_applied is None and method != "UniformFM":
+            return False
+
+    if method == "DP":
+        if result.get("dp_eta") != 1.0:
+            return False
+        if result.get("eval_policy_rng_isolated") is not True:
+            return False
+        if result.get("eval_policy_seed_scheme") != DP_EVAL_POLICY_SEED_SCHEME:
+            return False
+
+    if method == "DGFMv2":
+        if result.get("ema_applied") is not True:
+            return False
+        if result.get("pca_covariance_mode") != "full_rank_regularized":
+            return False
+        if result.get("pca_rank_truncation") is not False:
+            return False
+
+    if task_name == "two_arm" and result.get("success_criterion") != "two_arm_lift_strict_v1":
+        return False
+    return True
+
+
 def completed_result_path(config: dict[str, Any]) -> Path | None:
     results_path = Path(config["results_path"])
     if not results_path.exists():
@@ -339,6 +377,8 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
         if not isinstance(result, dict):
             continue
         if result.get("experiment_version") != EXPERIMENT_VERSION:
+            continue
+        if not method_metadata_compatible(result, config):
             continue
         if result.get("sweep_config_sha256") != config.get("sweep_config_sha256"):
             continue

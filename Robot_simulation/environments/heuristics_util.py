@@ -1091,19 +1091,24 @@ def _current_robot_q(env, task_name: str, action_representation: str = "joint_sp
     )
 
 
+def is_two_arm_lift_success(env) -> bool:
+    """Strict shared Two-arm lift criterion used by generation and evaluation."""
+    if not env._check_success():
+        return False
+    z0 = float(env._handle0_xpos[2])
+    z1 = float(env._handle1_xpos[2])
+    return abs(z1 - z0) < 0.05
+
+
 def _state_policy_success(env, task_name: str) -> bool:
     """Apply task-specific success checks for state-conditioned rollouts.
 
     Most tasks defer to robosuite success; two-arm lift adds a handle-height
     consistency check so partial or uneven grasps are not counted as success.
     """
-    if not env._check_success():
-        return False
     if task_name == "two_arm":
-        z0 = env._handle0_xpos[2]
-        z1 = env._handle1_xpos[2]
-        return abs(z1 - z0) < 0.05
-    return True
+        return is_two_arm_lift_success(env)
+    return bool(env._check_success())
 
 
 def _to_action_from_q(q, task_name, action_representation: str = "joint_space", env=None):

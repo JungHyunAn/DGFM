@@ -12,7 +12,10 @@ import torch
 from scipy.interpolate import CubicSpline
 
 from Robot_simulation.models.vision_encoder import encode_camera_history
-from Robot_simulation.reproducibility import validation_suite_spec
+from Robot_simulation.reproducibility import (
+    evaluation_policy_seed_plan,
+    validation_suite_spec,
+)
 
 from Robot_simulation.environments.heuristics_util import (
     _clip_policy_gripper_dims,
@@ -380,7 +383,7 @@ def _state_policy_env_worker(
             for q in q_low:
                 _, _, done, _ = env.step(_to_action_from_q(q, task_name, action_representation, env))
                 executed.append(q.copy())
-                if done or env._check_success():
+                if done or _state_policy_success(env, task_name):
                     break
 
             steps += 1
@@ -541,19 +544,9 @@ def _rollout_batch(
         for q in q_low:
             env.step(_to_action_from_q(q, task_name, action_representation, env))
 
-        if env._check_success():
-            if task_name == "two_arm":
-                z0 = env._handle0_xpos[2]
-                z1 = env._handle1_xpos[2]
-
-                if abs(z1 - z0) < 0.05:
-                    successes += 1
-                    success_info.append({"traj": q_low, "setting": setting})
-                else:
-                    fail_info.append({"traj": q_low, "setting": setting})
-            else:
-                successes += 1
-                success_info.append({"traj": q_low, "setting": setting})
+        if _state_policy_success(env, task_name):
+            successes += 1
+            success_info.append({"traj": q_low, "setting": setting})
         else:
             fail_info.append({"traj": q_low, "setting": setting})
 
@@ -641,6 +634,14 @@ def _run_flow_batched(
     return out
 
 
+def _make_eval_torch_generator(device: str, seed: int) -> torch.Generator:
+    use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
+    generator_device = device if use_cuda else "cpu"
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(int(seed))
+    return generator
+
+
 @torch.no_grad()
 def _run_diffusion_batched(
     model,
@@ -661,6 +662,7 @@ def _run_diffusion_batched(
     pred_type: str = "x0",
     clip_sample: bool = True,
     clip_sample_range: float = 1.0,
+    policy_generators: list[torch.Generator] | None = None,
 ) -> np.ndarray:
     from Robot_simulation.models.DP_class import run_diffusion
 
@@ -671,6 +673,26 @@ def _run_diffusion_batched(
     n = cond_batch.shape[0]
     out = np.empty((n, seq_len, dof), dtype=np.float32)
     chunk = n if gpu_chunk_size is None or gpu_chunk_size <= 0 else gpu_chunk_size
+
+    if policy_generators is not None:
+        if len(policy_generators) != n:
+            raise ValueError(f"Expected {n} policy generators, got {len(policy_generators)}")
+        for idx, generator in enumerate(policy_generators):
+            xT = torch.randn(
+                (1, seq_len, dof), dtype=torch.float32, device=device, generator=generator
+            )
+            c = torch.from_numpy(cond_batch[idx:idx + 1].astype(np.float32)).to(device)
+            q_low = run_diffusion(
+                model, xT, c, device, T_diff=T_diff, schedule_type=schedule_type,
+                ddim_steps=ddim_steps, eta=eta, pred_type=pred_type,
+                clip_sample=clip_sample, clip_sample_range=clip_sample_range,
+                generator=generator,
+            )
+            q_np = _maybe_denormalize_policy_data(
+                q_low.float().cpu().numpy(), normalization_stats
+            )
+            out[idx:idx + 1] = _clip_policy_gripper_dims(q_np, task_name)
+        return out
 
     for s in range(0, n, chunk):
         e = min(n, s + chunk)
@@ -719,6 +741,7 @@ def _run_policy_batched(
     pred_type: str,
     clip_sample: bool,
     clip_sample_range: float,
+    policy_generators: list[torch.Generator] | None = None,
 ) -> np.ndarray:
     if sampler_type == "flow":
         return _run_flow_batched(
@@ -752,6 +775,7 @@ def _run_policy_batched(
             pred_type=pred_type,
             clip_sample=clip_sample,
             clip_sample_range=clip_sample_range,
+            policy_generators=policy_generators,
         )
     raise ValueError(f"Unknown sampler_type: {sampler_type}")
 
@@ -808,6 +832,13 @@ def _rollout_state_policy_synchronized(
         num_workers = max(1, min(num_workers, vision_workers))
 
     rng = np.random.RandomState(base_seed)
+    policy_generators = None
+    if sampler_type == "diffusion":
+        policy_seeds = evaluation_policy_seed_plan(base_seed, trials)
+        policy_generators = {
+            idx: _make_eval_torch_generator(device, policy_seeds[idx])
+            for idx in range(trials)
+        }
     total_success = 0
     total_reward = 0.0
     success_info: List[dict] = []
@@ -917,6 +948,10 @@ def _rollout_state_policy_synchronized(
                 pred_type=pred_type,
                 clip_sample=clip_sample,
                 clip_sample_range=clip_sample_range,
+                policy_generators=(
+                    [policy_generators[idx] for idx in ready]
+                    if policy_generators is not None else None
+                ),
             )
             for local_i, idx in enumerate(ready):
                 conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})
@@ -1132,6 +1167,11 @@ def eval_model(
                             q_low = flow.run_flow(x0, c)
                         q_low_all[s:e] = _maybe_denormalize_policy_data(q_low.cpu().numpy(), normalization_stats)
         elif sampler_type == "diffusion":
+            policy_seeds = evaluation_policy_seed_plan(base_seed, trials)
+            policy_generators = [
+                _make_eval_torch_generator(device, policy_seed)
+                for policy_seed in policy_seeds
+            ]
             q_low_all[:] = _run_diffusion_batched(
                 model,
                 task_name,
@@ -1149,6 +1189,7 @@ def eval_model(
                 pred_type=pred_type,
                 clip_sample=clip_sample,
                 clip_sample_range=clip_sample_range,
+                policy_generators=policy_generators,
             )
         else:
             raise ValueError(f"Unknown sampler_type: {sampler_type}")

@@ -7,7 +7,7 @@ from robosuite.environments.manipulation.two_arm_lift import TwoArmLift
 from robosuite.controllers.composite.composite_controller_factory import load_composite_controller_config
 from robosuite.utils.transform_utils import mat2quat, quat_slerp, quat_multiply, quat_inverse
 from Robot_simulation.environments.heuristics_util import (
-    capture_camera_views, get_environment_state,
+    capture_camera_views, get_environment_state, is_two_arm_lift_success,
 )
 
 
@@ -248,7 +248,7 @@ def generate_two_arm_trajectory(
         env.step(a)
         record_q()
 
-    success = env._check_success()
+    success = is_two_arm_lift_success(env)
 
     # ---------- optionally save frontview videos ----------
     if render and save_video:

@@ -49,6 +49,7 @@ def run_diffusion(
     pred_type: str = "x0",           # "x0" or "epsilon"
     clip_sample: bool = True,
     clip_sample_range: float = 1.0,
+    generator: torch.Generator | None = None,
 ):
     """
     Diffusion sampler (DDIM by default).
@@ -121,7 +122,10 @@ def run_diffusion(
             )
 
         c2 = torch.sqrt(torch.clamp(1.0 - abar_next - sigma**2, min=0.0))
-        z = torch.randn_like(x) if eta > 0 else 0.0
+        z = (
+            torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
+            if eta > 0 else 0.0
+        )
 
         x = torch.sqrt(abar_next) * x0 + c2 * eps + sigma * z
 
@@ -187,7 +191,7 @@ class DiffusionPolicy:
         return copy.deepcopy(self._eval_model()).eval()
 
     @torch.no_grad()
-    def run_diffusion(self, x, c):
+    def run_diffusion(self, x, c, generator: torch.Generator | None = None):
         return run_diffusion(
             self.model,
             x,
@@ -200,6 +204,7 @@ class DiffusionPolicy:
             pred_type=self.pred_type,
             clip_sample=self.clip_sample,
             clip_sample_range=self.clip_sample_range,
+            generator=generator,
         )
 
     def train(

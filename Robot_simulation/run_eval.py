@@ -170,8 +170,9 @@ from Robot_simulation.environments.heuristics_util import (
 )
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 from Robot_simulation.reproducibility import (
-    TASK_ENVIRONMENT_RANGES, dataset_fingerprint, git_commit,
-    selected_episode_indices, stable_hash, validation_suite_spec,
+    DP_EVAL_POLICY_SEED_SCHEME, TASK_ENVIRONMENT_RANGES, dataset_fingerprint,
+    evaluation_policy_seed_plan, git_commit,
+    selected_episode_indices, stable_hash, summarize_validation_records, validation_suite_spec,
 )
 
 
@@ -1256,20 +1257,6 @@ def train_and_eval_model(
         best_model.vision_image_height = DEFAULT_VISION_HEIGHT
         best_model.vision_image_width = DEFAULT_VISION_WIDTH
 
-    def _summarize_validation_records(records: dict) -> tuple[float, float, int, float]:
-        if not records:
-            raise ValueError("eval_fresh=False requires in-training validation records; set val_period/val_trials > 0.")
-        epochs = sorted(records.keys())
-        rates = [float(records[e].get("success_rate", float("nan"))) for e in epochs]
-        valid_pairs = [(e, r) for e, r in zip(epochs, rates) if not np.isnan(r)]
-        if not valid_pairs:
-            raise ValueError("eval_fresh=False found no finite validation success rates.")
-        best_epoch, best_rate = max(valid_pairs, key=lambda item: item[1])
-        tail_rates = [r for r in rates[-10:] if not np.isnan(r)]
-        avg_last_10 = float(np.mean(tail_rates)) if tail_rates else float("nan")
-        avg_reward = float(records[best_epoch].get("avg_reward", float("nan")))
-        return best_rate, avg_last_10, best_epoch, avg_reward
-
     validation_rollouts = getattr(flow, "best_validation_rollouts", None)
     if validation_rollouts is not None:
         rollout_path = os.path.join(exp_dir, "best_validation_rollouts.pkl")
@@ -1277,9 +1264,16 @@ def train_and_eval_model(
             pickle.dump(validation_rollouts, f)
         print(f"[Saved best validation rollouts to {rollout_path}]")
 
-    max_validation_success_rate = None
-    avg_last_10_validation_success_rate = None
-    best_validation_epoch = None
+    validation_summary = summarize_validation_records(recs) if recs else None
+    max_validation_success_rate = (
+        validation_summary["max_success_rate"] if validation_summary else None
+    )
+    avg_last_10_validation_success_rate = (
+        validation_summary["avg_success_rate"] if validation_summary else None
+    )
+    best_validation_epoch = (
+        validation_summary["best_validation_epoch"] if validation_summary else None
+    )
 
     # evaluate model
     if effective_eval_fresh:
@@ -1391,8 +1385,11 @@ def train_and_eval_model(
                 avg_reward_best = float("nan")
                 print("Training finished without validation records to summarize.")
             else:
-                success_rate_best, avg_last_10_validation_success_rate, best_validation_epoch, avg_reward_best = _summarize_validation_records(recs)
-                max_validation_success_rate = success_rate_best
+                success_rate_best = validation_summary["best_validation_success_rate"]
+                avg_last_10_validation_success_rate = validation_summary["avg_success_rate"]
+                best_validation_epoch = validation_summary["best_validation_epoch"]
+                avg_reward_best = validation_summary["best_validation_reward"]
+                max_validation_success_rate = validation_summary["max_success_rate"]
                 print(
                     "Training finished, reporting validation metrics without fresh environments: "
                     f"max_success={max_validation_success_rate:.3f} at epoch {best_validation_epoch}, "
@@ -1432,6 +1429,11 @@ def train_and_eval_model(
             "trajectory_sample_step": sample_step,
             "normalize_data": normalize_data,
             "use_ema": use_ema,
+            "ema_applied": bool(use_ema and getattr(flow, "ema", None) is not None),
+            "ema_decay": (
+                float(flow.ema.decay)
+                if use_ema and getattr(flow, "ema", None) is not None else None
+            ),
             "action_representation": action_representation,
             "latent_compression_rate": latent_compression_rate if model_type == "LatentFM" else None,
             "latent_dim": latent_dim_value if model_type == "LatentFM" else None,
@@ -1503,6 +1505,24 @@ def train_and_eval_model(
             "dp_pred_type":    dp_pred_type if model_type == "DP" else None,
             "dp_clip_sample":  dp_clip_sample if model_type == "DP" else None,
             "dp_clip_sample_range": dp_clip_sample_range if model_type == "DP" else None,
+            "eval_policy_rng_isolated": True if model_type == "DP" else None,
+            "eval_policy_seed_scheme": (
+                DP_EVAL_POLICY_SEED_SCHEME
+                if model_type == "DP" else None
+            ),
+            "eval_policy_trial_seeds": (
+                evaluation_policy_seed_plan(resolved_eval_base_seed, val_trials)
+                if model_type == "DP" else None
+            ),
+            "pca_covariance_mode": (
+                "full_rank_regularized" if model_type == "DGFMv2" else None
+            ),
+            "pca_ambient_dimension": (seq_len * dof if model_type == "DGFMv2" else None),
+            "pca_rank_truncation": False if model_type == "DGFMv2" else None,
+            "pca_regularization_eps": cluster_eps if model_type == "DGFMv2" else None,
+            "success_criterion": (
+                "two_arm_lift_strict_v1" if task_name == "two_arm" else f"{task_name}_default"
+            ),
             "n_t_global":      None,
             "n_t_local":       None,
             "maximum epoch":   max_epochs,
@@ -1517,6 +1537,20 @@ def train_and_eval_model(
             "average_reward_best": avg_reward_best,
             "max_validation_success_rate": max_validation_success_rate,
             "avg_last_10_validation_success_rate": avg_last_10_validation_success_rate,
+            "avg_success_rate": avg_last_10_validation_success_rate,
+            "avg_success_rate_definition": "mean success rate over the final 10 validation checkpoints on the fixed ordered 50-environment suite",
+            "avg_success_rate_num_checkpoints": (
+                validation_summary["avg_success_rate_num_checkpoints"] if validation_summary else 0
+            ),
+            "avg_success_rate_trials_per_checkpoint": val_trials,
+            "avg_success_rate_uses_fixed_validation_suite": validation_summary is not None,
+            "final_validation_success_rates": (
+                validation_summary["final_validation_success_rates"] if validation_summary else []
+            ),
+            "final_validation_epochs": (
+                validation_summary["final_validation_epochs"] if validation_summary else []
+            ),
+            "max_success_rate": max_validation_success_rate,
             "best_validation_epoch": best_validation_epoch,
             "training_thread_time_seconds": training_thread_time_seconds,
             "records":         recs,
@@ -1542,7 +1576,11 @@ def train_and_eval_model(
         excluded_signature_fields = {
             "timestamp", "success_rate_best", "average_reward_best",
             "max_validation_success_rate", "avg_last_10_validation_success_rate",
-            "best_validation_epoch", "training_thread_time_seconds", "records",
+            "best_validation_epoch", "avg_success_rate", "avg_success_rate_definition",
+            "avg_success_rate_num_checkpoints", "avg_success_rate_trials_per_checkpoint",
+            "avg_success_rate_uses_fixed_validation_suite", "final_validation_success_rates",
+            "final_validation_epochs", "max_success_rate",
+            "training_thread_time_seconds", "records",
         }
         signature_configuration = {
             key: value for key, value in output.items()

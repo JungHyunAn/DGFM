@@ -17,6 +17,7 @@ from Robot_simulation.models.DGFM_class import (
 )
 from Robot_simulation.env_util import _generate_val_env, eval_model
 from Robot_simulation.models.VanillaFM_class import VectorField
+from Robot_simulation.reproducibility import validation_result_is_better
 
 
 class MixtureSamplerV2:
@@ -153,6 +154,10 @@ def _process_one_cluster_x_only(X, C, idx, eps, chi2_thresh, max_pca_samples):
         ipca.fit(Xp_red)
         Bx = np.zeros((Dx, n_comp), dtype=np.float32)
         Bx[keep, :] = ipca.components_.T.astype(np.float32, copy=False)
+        # Intentional full-rank local PCA parameterization: retain every ambient
+        # trajectory direction and assign positive regularized variance to
+        # low-variance or completed orthogonal components. This is anisotropic
+        # and near-manifold, but not rank-deficient or an intrinsic-rank estimate.
         Bx = _pad_basis_to_rank(Bx, Dx, Dx)
 
     mu_x = Xi_c.mean(axis=0)
@@ -192,12 +197,17 @@ def compute_cluster_pca_fast_x_only(
     mu_x, B, Sig_zz, weights, c_mean, c_std = zip(*results)
     mu_x = np.vstack(mu_x).astype(np.float32, copy=False)
     B = np.stack([_pad_basis_to_rank(b, Dx, Dx) for b in B], axis=0)
+    # Basis completion and variance padding deliberately produce a full-rank,
+    # numerically stable ambient covariance without truncating PCA components.
     Sig_zz = np.stack([_pad_square(szz, Dx, eps) for szz in Sig_zz], axis=0)
     weights = np.asarray(weights, dtype=np.float32)
     c_mean = np.vstack(c_mean).astype(np.float32, copy=False)
     c_std = np.stack(c_std, axis=0).astype(np.float32, copy=False)
 
-    print(f"[DGFMv2] Packed full-dimensional X PCA rank={Dx} for {len(clusters)} clusters.")
+    print(
+        f"[DGFMv2] Packed full-rank regularized local PCA covariance: "
+        f"ambient_dim={Dx}, variance_floor={eps}, clusters={len(clusters)}"
+    )
     return mu_x, B, Sig_zz, weights, c_mean, c_std
 
 
@@ -353,7 +363,7 @@ class DGFMv2(DGFM):
         joint_N = N * n_t
         best_avg_reward = 0.0
         best_success_rate = 0.0
-        best_model = copy.deepcopy(self.model)
+        best_model = self._copy_eval_model()
         success_rate_recs = {}
         stop_count = 0
         best_validation_rollouts = None
@@ -366,6 +376,9 @@ class DGFMv2(DGFM):
 
         try:
             self.model = self.model.to(self.device)
+            self._init_ema()
+            if self.use_ema and self.ema is None:
+                raise RuntimeError("DGFMv2 EMA initialization failed while use_ema=True")
             target_trajectories = target_trajectories.to(self.device)
             conditions = conditions.to(self.device)
 
@@ -416,6 +429,7 @@ class DGFMv2(DGFM):
                         if vision_after_backward_hook is not None:
                             vision_after_backward_hook()
                         self.optimizer.step()
+                        self._step_ema()
 
                         loss_sum += float(loss.item())
                         batch_count += 1
@@ -425,9 +439,10 @@ class DGFMv2(DGFM):
 
                 avg_loss = loss_sum / max(1, batch_count)
                 if do_validation and epoch % val_period == 0:
-                    self.model.eval()
+                    eval_model_obj = self._eval_model()
+                    eval_model_obj.eval()
                     eval_kwargs = dict(
-                        model=self.model,
+                        model=eval_model_obj,
                         model_class=VectorField,
                         task_name=self.task_name,
                         seq_len=self.horizon,
@@ -458,7 +473,7 @@ class DGFMv2(DGFM):
                             eval_base_seed=eval_base_seed,
                             normalization_stats=self.normalization_stats,
                         )
-                        response = evaluator.evaluate(self.model, epoch, metadata)
+                        response = evaluator.evaluate(eval_model_obj, epoch, metadata)
                         success_rate = response.success_rate
                         avg_reward = response.avg_reward
                         validation_rollouts = response.validation_rollouts
@@ -483,10 +498,13 @@ class DGFMv2(DGFM):
                                 break
                             stop_count += 1
                     else:
-                        if best_validation_rollouts is None or (success_rate > best_success_rate) or (best_avg_reward < avg_reward):
+                        if validation_result_is_better(
+                            success_rate, avg_reward, best_success_rate, best_avg_reward,
+                            has_best=best_validation_rollouts is not None,
+                        ):
                             best_avg_reward = avg_reward
                             best_success_rate = success_rate
-                            best_model = copy.deepcopy(self.model)
+                            best_model = self._copy_eval_model()
                             best_validation_rollouts = validation_rollouts
                             self.best_validation_rollouts = best_validation_rollouts
                             stop_count = 0
@@ -504,7 +522,7 @@ class DGFMv2(DGFM):
             tqdm.write("Training interrupted by user. Returning best model so far...")
 
         if not success_rate_recs:
-            best_model = copy.deepcopy(self.model)
+            best_model = self._copy_eval_model()
         return best_model, self.model, success_rate_recs, mixture_sampler
 
 

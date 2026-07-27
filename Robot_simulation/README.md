@@ -83,6 +83,14 @@ To run all evaluation configurations for a single task, execute:
 bash Robot_simulation/run_all.sh <task_name> <seed>
 ```
 
+## Primary simulation metric
+
+We report the mean success rate over the final ten validation checkpoints, where every checkpoint is evaluated on the same fixed set of 50 task instances. This is the primary run-level simulation metric. Maximum validation success is retained as a secondary diagnostic. Paper-level tables aggregate the run-level metric across training seeds using mean and standard deviation; it is not labeled as held-out test performance.
+
+## Full-rank local PCA in NGFM
+
+NGFM summarizes local trajectory neighborhoods with PCA while retaining the full ambient trajectory basis. Principal variances encode locally dominant directions, while orthogonal or low-variance directions receive a positive variance floor. The result is a full-rank anisotropic Gaussian concentrated near locally observed trajectory geometry. This avoids singular covariance operations while preserving local geometric bias. The robot implementation does not explicitly infer or truncate to an intrinsic manifold dimension. We refer to this design as a **full-rank local PCA covariance with regularized low-variance directions**, or a **regularized near-manifold intermediate distribution**.
+
 ## Results
 
 For each experiment, the following outputs are saved under the specified ```bash results_path ```, organized by experiment timestamp:

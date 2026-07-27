@@ -562,7 +562,11 @@ def generate_data_parallel(
 
     # HDF5 init
     if hdf5_name is None:
-        hdf5_name = f"{task_name}_{action_representation}_dataset_{n}{'_vision' if vision else ''}.hdf5"
+        strict_suffix = "_strict_v1" if task_name == "two_arm" else ""
+        hdf5_name = (
+            f"{task_name}_{action_representation}_dataset_{n}"
+            f"{'_vision' if vision else ''}{strict_suffix}.hdf5"
+        )
     h5_path = os.path.join(output_dir, hdf5_name)
     if os.path.exists(h5_path):
         raise FileExistsError(
@@ -600,6 +604,12 @@ def generate_data_parallel(
     commit = git_commit(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     if commit is not None:
         hf["meta"].attrs["git_commit"] = commit
+    if task_name == "two_arm":
+        hf["meta"].attrs["success_criterion"] = "two_arm_lift_strict_v1"
+        hf["meta"].attrs["height_difference_threshold"] = 0.05
+        hf["meta"].attrs["height_difference_comparison"] = "strict_less_than"
+    else:
+        hf["meta"].attrs["success_criterion"] = f"{task_name}_default"
 
     success_count = 0
     heuristic_trials = 0
@@ -617,8 +627,8 @@ def generate_data_parallel(
     written_episode_ids: set[int] = set()
     with ProcessPoolExecutor(max_workers=num_workers) as pool, \
          tqdm(total=n, desc="Successful Trajectories", unit="traj") as pbar:
-        futures = {
-            pool.submit(
+        def submit_episode(episode_id: int):
+            return pool.submit(
                 worker_generate,
                 episode_id,
                 task_name,
@@ -629,17 +639,29 @@ def generate_data_parallel(
                 image_height,
                 image_width,
                 action_representation,
-            ): episode_id
-            for episode_id in range(n)
-        }
-        for future in as_completed(futures):
+            )
+
+        # A completed Future retains its raw RGB arrays. Keep the queue bounded
+        # so memory use depends on worker count, not completed episode count.
+        next_episode_id = 0
+        futures = {}
+        while next_episode_id < min(n, num_workers):
+            futures[submit_episode(next_episode_id)] = next_episode_id
+            next_episode_id += 1
+
+        while futures:
+            future = next(as_completed(tuple(futures)))
+            requested_episode_id = futures.pop(future)
             entry = future.result()
+            if next_episode_id < n:
+                futures[submit_episode(next_episode_id)] = next_episode_id
+                next_episode_id += 1
             resolved_episode_id = int(entry["episode_id"])
             if resolved_episode_id in written_episode_ids:
                 raise RuntimeError(f"Duplicate episode write index: {resolved_episode_id}")
-            if resolved_episode_id != futures[future]:
+            if resolved_episode_id != requested_episode_id:
                 raise RuntimeError(
-                    f"Worker returned episode_id={resolved_episode_id} for requested id={futures[future]}"
+                    f"Worker returned episode_id={resolved_episode_id} for requested id={requested_episode_id}"
                 )
             heuristic_trials += int(entry["trials"])
             heuristic_successes += 1
@@ -680,6 +702,11 @@ def generate_data_parallel(
             success_count += 1
             pbar.update(1)
             pbar.set_postfix({"episode": success_count})
+            if vision:
+                entry["camera_frames"] = None
+                del frames
+            del entry
+            del future
 
     if written_episode_ids != set(range(n)):
         missing = sorted(set(range(n)) - written_episode_ids)
