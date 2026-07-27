@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from Robot_simulation.reproducibility import (
-    DP_EVAL_POLICY_SEED_SCHEME, TASK_EVAL_BASE_SEEDS, dataset_fingerprint,
+    DP_EVAL_POLICY_SEED_SCHEME, DP_EVAL_SAMPLING_MODE, TASK_EVAL_BASE_SEEDS, dataset_fingerprint,
     selected_episode_indices, stable_hash,
 )
 
@@ -347,6 +347,8 @@ def method_metadata_compatible(result: dict[str, Any], config: dict[str, Any]) -
         if result.get("eval_policy_rng_isolated") is not True:
             return False
         if result.get("eval_policy_seed_scheme") != DP_EVAL_POLICY_SEED_SCHEME:
+            return False
+        if result.get("dp_eval_sampling_mode") != DP_EVAL_SAMPLING_MODE:
             return False
 
     if method == "DGFMv2":

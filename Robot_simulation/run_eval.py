@@ -170,7 +170,7 @@ from Robot_simulation.environments.heuristics_util import (
 )
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 from Robot_simulation.reproducibility import (
-    DP_EVAL_POLICY_SEED_SCHEME, TASK_ENVIRONMENT_RANGES, dataset_fingerprint,
+    DP_EVAL_POLICY_SEED_SCHEME, DP_EVAL_SAMPLING_MODE, TASK_ENVIRONMENT_RANGES, dataset_fingerprint,
     evaluation_policy_seed_plan, git_commit,
     selected_episode_indices, stable_hash, summarize_validation_records, validation_suite_spec,
 )
@@ -1513,6 +1513,9 @@ def train_and_eval_model(
             "eval_policy_trial_seeds": (
                 evaluation_policy_seed_plan(resolved_eval_base_seed, val_trials)
                 if model_type == "DP" else None
+            ),
+            "dp_eval_sampling_mode": (
+                DP_EVAL_SAMPLING_MODE if model_type == "DP" else None
             ),
             "pca_covariance_mode": (
                 "full_rank_regularized" if model_type == "DGFMv2" else None

@@ -16,6 +16,7 @@ DP_EVAL_POLICY_SEED_SCHEME = (
     "uint64 SeedSequence([eval_base_seed, trial_idx, sha256(dp_policy)]) "
     "with one torch.Generator per rollout"
 )
+DP_EVAL_SAMPLING_MODE = "per_trial_rng_batched_inference_v1"
 
 TASK_EVAL_BASE_SEEDS = {
     "door": 410_000,

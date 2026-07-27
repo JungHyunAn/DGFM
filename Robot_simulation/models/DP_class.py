@@ -35,6 +35,30 @@ class DiffusionSchedule:
         return out.view(-1, *([1] * (len(x_shape) - 1)))
 
 
+def randn_per_sample(
+    generators: list[torch.Generator],
+    sample_shape: tuple[int, ...],
+    *,
+    dtype: torch.dtype,
+    device: str | torch.device,
+) -> torch.Tensor:
+    """Draw one sample from each independent generator and stack the results."""
+    if not generators:
+        raise ValueError("generators must contain at least one torch.Generator")
+    return torch.cat(
+        [
+            torch.randn(
+                (1, *sample_shape),
+                dtype=dtype,
+                device=device,
+                generator=generator,
+            )
+            for generator in generators
+        ],
+        dim=0,
+    )
+
+
 @torch.no_grad()
 def run_diffusion(
     model,
@@ -50,6 +74,7 @@ def run_diffusion(
     clip_sample: bool = True,
     clip_sample_range: float = 1.0,
     generator: torch.Generator | None = None,
+    generators: list[torch.Generator] | None = None,
 ):
     """
     Diffusion sampler (DDIM by default).
@@ -67,6 +92,13 @@ def run_diffusion(
     device = device if use_cuda else "cpu"
     x = xT.to(device)
     c = c.to(device)
+    if generator is not None and generators is not None:
+        raise ValueError("Pass either generator or generators, not both")
+    if generators is not None and len(generators) != x.shape[0]:
+        raise ValueError(
+            f"Expected {x.shape[0]} generators for the diffusion batch, "
+            f"got {len(generators)}"
+        )
 
     sched = DiffusionSchedule(T=T_diff, device=torch.device(device), schedule=schedule_type)
 
@@ -122,10 +154,22 @@ def run_diffusion(
             )
 
         c2 = torch.sqrt(torch.clamp(1.0 - abar_next - sigma**2, min=0.0))
-        z = (
-            torch.randn(x.shape, dtype=x.dtype, device=x.device, generator=generator)
-            if eta > 0 else 0.0
-        )
+        if eta <= 0:
+            z = 0.0
+        elif generators is not None:
+            z = randn_per_sample(
+                generators,
+                tuple(x.shape[1:]),
+                dtype=x.dtype,
+                device=x.device,
+            )
+        else:
+            z = torch.randn(
+                x.shape,
+                dtype=x.dtype,
+                device=x.device,
+                generator=generator,
+            )
 
         x = torch.sqrt(abar_next) * x0 + c2 * eps + sigma * z
 
@@ -191,7 +235,13 @@ class DiffusionPolicy:
         return copy.deepcopy(self._eval_model()).eval()
 
     @torch.no_grad()
-    def run_diffusion(self, x, c, generator: torch.Generator | None = None):
+    def run_diffusion(
+        self,
+        x,
+        c,
+        generator: torch.Generator | None = None,
+        generators: list[torch.Generator] | None = None,
+    ):
         return run_diffusion(
             self.model,
             x,
@@ -205,6 +255,7 @@ class DiffusionPolicy:
             clip_sample=self.clip_sample,
             clip_sample_range=self.clip_sample_range,
             generator=generator,
+            generators=generators,
         )
 
     def train(

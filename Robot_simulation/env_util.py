@@ -664,7 +664,7 @@ def _run_diffusion_batched(
     clip_sample_range: float = 1.0,
     policy_generators: list[torch.Generator] | None = None,
 ) -> np.ndarray:
-    from Robot_simulation.models.DP_class import run_diffusion
+    from Robot_simulation.models.DP_class import randn_per_sample, run_diffusion
 
     use_cuda = str(device).startswith("cuda") and torch.cuda.is_available()
     if not use_cuda:
@@ -677,21 +677,29 @@ def _run_diffusion_batched(
     if policy_generators is not None:
         if len(policy_generators) != n:
             raise ValueError(f"Expected {n} policy generators, got {len(policy_generators)}")
-        for idx, generator in enumerate(policy_generators):
-            xT = torch.randn(
-                (1, seq_len, dof), dtype=torch.float32, device=device, generator=generator
+        for s in range(0, n, chunk):
+            e = min(n, s + chunk)
+            generators = policy_generators[s:e]
+            xT = randn_per_sample(
+                generators,
+                (seq_len, dof),
+                dtype=torch.float32,
+                device=device,
             )
-            c = torch.from_numpy(cond_batch[idx:idx + 1].astype(np.float32)).to(device)
+            c = torch.from_numpy(cond_batch[s:e].astype(np.float32)).to(device)
             q_low = run_diffusion(
                 model, xT, c, device, T_diff=T_diff, schedule_type=schedule_type,
                 ddim_steps=ddim_steps, eta=eta, pred_type=pred_type,
                 clip_sample=clip_sample, clip_sample_range=clip_sample_range,
-                generator=generator,
+                generators=generators,
             )
             q_np = _maybe_denormalize_policy_data(
                 q_low.float().cpu().numpy(), normalization_stats
             )
-            out[idx:idx + 1] = _clip_policy_gripper_dims(q_np, task_name)
+            out[s:e] = _clip_policy_gripper_dims(q_np, task_name)
+            del q_low
+            if use_cuda:
+                torch.cuda.empty_cache()
         return out
 
     for s in range(0, n, chunk):
@@ -928,6 +936,11 @@ def _rollout_state_policy_synchronized(
                 cond_batch = np.concatenate([cond_batch, vision_batch], axis=1)
             if cond_batch.shape[1] != param_len:
                 raise ValueError(f"Live condition length {cond_batch.shape[1]} != model param_len {param_len}")
+            ready_policy_generators = None
+            if policy_generators is not None:
+                ready_policy_generators = [policy_generators[idx] for idx in ready]
+                if len(ready_policy_generators) != cond_batch.shape[0]:
+                    raise AssertionError("Active DP generator alignment mismatch")
             q_low_batch = _run_policy_batched(
                 model,
                 sampler_type,
@@ -948,10 +961,7 @@ def _rollout_state_policy_synchronized(
                 pred_type=pred_type,
                 clip_sample=clip_sample,
                 clip_sample_range=clip_sample_range,
-                policy_generators=(
-                    [policy_generators[idx] for idx in ready]
-                    if policy_generators is not None else None
-                ),
+                policy_generators=ready_policy_generators,
             )
             for local_i, idx in enumerate(ready):
                 conns[idx].send({"type": "act", "q_low": q_low_batch[local_i]})

@@ -11,6 +11,7 @@ import h5py
 
 from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME,
+    DP_EVAL_SAMPLING_MODE,
     dataset_fingerprint,
     selected_episode_indices,
     stable_hash,
@@ -77,6 +78,14 @@ class ResumeCompatibilityTest(unittest.TestCase):
                 "dp_eta": 1.0,
                 "eval_policy_rng_isolated": True,
                 "eval_policy_seed_scheme": DP_EVAL_POLICY_SEED_SCHEME,
+            })
+            self.assertIsNone(completed_result_path(dp))
+            dp = self.make_fixture(root, "DP", {
+                "ema_applied": True,
+                "dp_eta": 1.0,
+                "eval_policy_rng_isolated": True,
+                "eval_policy_seed_scheme": DP_EVAL_POLICY_SEED_SCHEME,
+                "dp_eval_sampling_mode": DP_EVAL_SAMPLING_MODE,
             })
             self.assertIsNotNone(completed_result_path(dp))
 
