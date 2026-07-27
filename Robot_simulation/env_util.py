@@ -1,6 +1,8 @@
 """Environment construction, restoration, and policy evaluation utilities."""
 
 import os
+import random
+from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
 from multiprocessing import get_context
 from typing import List, Tuple
@@ -10,6 +12,7 @@ import torch
 from scipy.interpolate import CubicSpline
 
 from Robot_simulation.models.vision_encoder import encode_camera_history
+from Robot_simulation.reproducibility import validation_suite_spec
 
 from Robot_simulation.environments.heuristics_util import (
     _clip_policy_gripper_dims,
@@ -428,41 +431,74 @@ def _state_policy_env_worker(
         conn.close()
 
 
-def _generate_val_env(task_name, val_trials):
+@contextmanager
+def _isolated_rng_seed(seed: int):
+    """Temporarily seed every global RNG and restore the caller states."""
+    python_state = random.getstate()
+    numpy_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        yield
+    finally:
+        random.setstate(python_state)
+        np.random.set_state(numpy_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
+def _generate_val_env(
+    task_name,
+    val_trials,
+    eval_base_seed: int | None = None,
+    eval_trial_seeds: List[int] | None = None,
+):
+    """Build an ordered validation suite without perturbing training RNGs."""
     env_params_list: List[np.ndarray] = []
     env_settings_all: List[dict] = []
+    suite = validation_suite_spec(task_name, val_trials, eval_base_seed)
+    trial_seeds = suite["eval_trial_seeds"] if eval_trial_seeds is None else list(eval_trial_seeds)
+    if len(trial_seeds) != val_trials:
+        raise ValueError(f"Expected {val_trials} validation seeds, got {len(trial_seeds)}")
 
-    if task_name == "nut":
-        for _ in range(val_trials):
-            env = make_env(task_name, training=True)
-            env.reset()
-            configure_nut_pegs(env, delta_x=-0.05, delta_z=0.1)
-
-            env_settings_all.append({
-                "qpos": env.sim.data.qpos.copy(),
-                "qvel": env.sim.data.qvel.copy(),
-                "body_pos": env.sim.model.body_pos.copy(),
-                "body_quat": env.sim.model.body_quat.copy(),
-                "act": env.sim.data.act.copy(),
-                "ctrl": env.sim.data.ctrl.copy(),
-                "mocap_pos": env.sim.data.mocap_pos.copy(),
-                "mocap_quat": env.sim.data.mocap_quat.copy(),
-            })
-            env_params_list.append(_get_environment_params(env, task_name))
-            env.close()
-    else:
-        for _ in range(val_trials):
-            env = make_env(task_name, use_joint_control=True, training=True)
-            env.reset()
-
-            env_settings_all.append({
-                "qpos": env.sim.data.qpos.copy(),
-                "qvel": env.sim.data.qvel.copy(),
-                "body_pos": env.sim.model.body_pos.copy(),
-                "body_quat": env.sim.model.body_quat.copy(),
-            })
-            env_params_list.append(_get_environment_params(env, task_name))
-            env.close()
+    for trial_seed in trial_seeds:
+        env = None
+        with _isolated_rng_seed(int(trial_seed)):
+            try:
+                env = make_env(task_name, training=True, use_joint_control=(task_name != "nut"))
+                seed_fn = getattr(env, "seed", None)
+                if callable(seed_fn):
+                    seed_fn(int(trial_seed))
+                env.reset()
+                if task_name == "nut":
+                    configure_nut_pegs(env, delta_x=-0.05, delta_z=0.1)
+                    setting_keys = (
+                        "qpos", "qvel", "body_pos", "body_quat",
+                        "act", "ctrl", "mocap_pos", "mocap_quat",
+                    )
+                else:
+                    setting_keys = ("qpos", "qvel", "body_pos", "body_quat")
+                sources = {
+                    "qpos": env.sim.data.qpos,
+                    "qvel": env.sim.data.qvel,
+                    "body_pos": env.sim.model.body_pos,
+                    "body_quat": env.sim.model.body_quat,
+                    "act": env.sim.data.act,
+                    "ctrl": env.sim.data.ctrl,
+                    "mocap_pos": env.sim.data.mocap_pos,
+                    "mocap_quat": env.sim.data.mocap_quat,
+                }
+                env_settings_all.append({key: sources[key].copy() for key in setting_keys})
+                env_params_list.append(_get_environment_params(env, task_name))
+            finally:
+                if env is not None:
+                    env.close()
 
     val_params = np.asarray(env_params_list, dtype=np.float32)
     return env_settings_all, val_params

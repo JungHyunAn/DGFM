@@ -474,7 +474,7 @@ class LatentFM:
 
         env_settings_all, val_params = (None, None)
         if do_validation:
-            env_settings_all, val_params = _generate_val_env(self.task_name, val_trials)
+            env_settings_all, val_params = _generate_val_env(self.task_name, val_trials, eval_base_seed)
 
         try:
             self.model = self.model.to(self.device)

@@ -14,11 +14,20 @@ import shlex
 import subprocess
 import sys
 import time
+
+import h5py
 from pathlib import Path
 from typing import Any
 
+from Robot_simulation.reproducibility import (
+    TASK_EVAL_BASE_SEEDS, dataset_fingerprint, selected_episode_indices, stable_hash,
+)
+
 
 METHODS = ("UniformFM", "DP", "DGFMv2")
+FINAL_TASKS = ("door", "two_arm")
+FINAL_TRAINING_SEEDS = (1000, 2000, 3000)
+EXPERIMENT_VERSION = "clean_v1"
 PREFERRED_DGFM_ROOT = Path("/PublicHDD/ajh916/DGFM")
 FALLBACK_DGFM_ROOT = Path(__file__).resolve().parents[1]
 
@@ -29,37 +38,37 @@ def dgfm_path(relative_path: str) -> str:
 
 
 DEMO_SIZES_BY_TASK = {
-    "door": (20, 40, 80),
+    "door": (20, 40, 80, 160),
     "wipe": (),
-    "two_arm": (40, 80, 160),
+    "two_arm": (20, 40, 80, 160),
     "nut": (40, 80, 160),
 }
 
 MAX_EPOCHS_BY_TASK = {
-    "door": (4000, 2000, 1000),
+    "door": (4000, 2000, 1000, 500),
     "wipe": (),
-    "two_arm": (2000, 1000, 500),
+    "two_arm": (4000, 2000, 1000, 500),
     "nut": (2000, 1000, 500),
 }
 
 VAL_PERIODS_BY_TASK = {
-    "door": (80, 40, 20),
+    "door": (80, 40, 20, 10),
     "wipe": (),
-    "two_arm": (40, 20, 10),
+    "two_arm": (80, 40, 20, 10),
     "nut": (40, 20, 10),
 }
 
 CLUSTER_PARTITIONS_BY_TASK = {
-    "door": (10, 20, 40),
+    "door": (10, 20, 40, 80),
     "wipe": (),
-    "two_arm": (10, 20, 40),
+    "two_arm": (5, 10, 20, 40),
     "nut": (10, 20, 40),
 }
 
 DATASET_PATH_BY_TASK = {
-    "door": dgfm_path("Robot_simulation/heuristic_dataset/door_joint_space_dataset_1000_vision.hdf5"),
+    "door": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/door_joint_space_dataset_1000_vision.hdf5"),
     "wipe": None,
-    "two_arm": dgfm_path("Robot_simulation/heuristic_dataset/two_arm_joint_space_dataset_1000_vision.hdf5"),
+    "two_arm": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/two_arm_joint_space_dataset_1000_vision.hdf5"),
     "nut": dgfm_path("Robot_simulation/heuristic_dataset/nut_joint_space_dataset_1000_vision.hdf5"),
 }
 
@@ -75,7 +84,7 @@ SLEEP_SECONDS_BETWEEN_RUNS = 500
 
 SHARED_CONFIG: dict[str, Any] = {
     "use_ema": True,
-    "results_path": dgfm_path("Robot_simulation/eval_results/{task_name}/sweep_{seed}"),
+    "results_path": dgfm_path("Robot_simulation/eval_results_clean_v1/{task_name}/sweep_{seed}"),
     "device": "cuda",
     "n_t": 1,
     "learning_rate": 0.0001,
@@ -202,11 +211,23 @@ def build_config(
         "warmup_steps": int(max_epochs * 0.2),
         "val_period": val_period,
         "seed": seed,
+        "eval_base_seed": TASK_EVAL_BASE_SEEDS[task_name],
+        "experiment_version": EXPERIMENT_VERSION,
     }
     if method == "DGFMv2":
         config["cluster_partition"] = cluster_partition
         config["residual_lambda"] = residual_lambda
     return config
+
+
+def build_final_sweep() -> list[dict[str, Any]]:
+    """Return the intended 2 tasks x 4 budgets x 3 methods x 3 seeds payload."""
+    return [
+        config
+        for task_name in FINAL_TASKS
+        for seed in FINAL_TRAINING_SEEDS
+        for config in build_sweep(task_name, seed)
+    ]
 
 
 def build_sweep(
@@ -317,6 +338,23 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
 
         if not isinstance(result, dict):
             continue
+        if result.get("experiment_version") != EXPERIMENT_VERSION:
+            continue
+        if result.get("sweep_config_sha256") != config.get("sweep_config_sha256"):
+            continue
+        if not isinstance(result.get("run_signature"), dict) or not result.get("run_signature_sha256"):
+            continue
+        if stable_hash(result["run_signature"]) != result["run_signature_sha256"]:
+            continue
+        expected_dataset = dataset_fingerprint(config["dataset_path"])
+        if result.get("dataset_sha256") != expected_dataset["dataset_sha256"]:
+            continue
+        with h5py.File(config["dataset_path"], "r") as dataset:
+            expected_indices = selected_episode_indices(
+                len(dataset["data"]), config["seed"], config["N"]
+            )
+        if result.get("selected_episode_indices") != expected_indices:
+            continue
         if result.get("model_type") != config["FM_type"]:
             continue
         if result.get("task_name") != config["task_name"]:
@@ -348,6 +386,8 @@ def main() -> None:
         residual_lambda=args.residual_lambda,
     )
     sweep = [apply_validation_overrides(config, args) for config in sweep]
+    for config in sweep:
+        config["sweep_config_sha256"] = stable_hash(config)
     sweep_results_path = Path(sweep[0]["results_path"])
     sweep_results_path.mkdir(parents=True, exist_ok=True)
 

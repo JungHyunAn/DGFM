@@ -132,6 +132,7 @@ import time
 import sys
 import matplotlib.pyplot as plt
 from zoneinfo import ZoneInfo
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 import logging
@@ -168,6 +169,10 @@ from Robot_simulation.environments.heuristics_util import (
     _get_environment_params, configure_nut_pegs, validate_action_representation,
 )
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
+from Robot_simulation.reproducibility import (
+    TASK_ENVIRONMENT_RANGES, dataset_fingerprint, git_commit,
+    selected_episode_indices, stable_hash, validation_suite_spec,
+)
 
 
 class _TeeStream:
@@ -243,6 +248,16 @@ def _normalization_stats_to_json(stats: dict[str, np.ndarray] | None) -> dict | 
         "joint_max": np.asarray(stats["max"], dtype=np.float32).tolist(),
         "joint_range": np.asarray(stats["range"], dtype=np.float32).tolist(),
     }
+
+def _metadata_to_json(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
+    if isinstance(value, np.ndarray):
+        return [_metadata_to_json(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_scale=0.05, last_epoch=-1):
     def lr_lambda(epoch):
@@ -465,6 +480,9 @@ def train_and_eval_model(
     remote_eval_render_best: bool = False,
     remote_eval_timeout_sec: int = 3600,
     remote_eval_poll_interval_sec: float = 5.0,
+    eval_base_seed: int | None = None,
+    experiment_version: str = "clean_v1",
+    sweep_config_sha256: str | None = None,
 ):
     observation_type = validate_observation_type(observation_type)
     if vision_finetune_mode is None:
@@ -537,8 +555,14 @@ def train_and_eval_model(
     sys.stderr = _TeeStream(original_stderr, log_file)
     print(f"[Logging console output to {log_path}]")
 
-    # load dataset
+    # Load and identify the exact dataset before selecting a nested subset.
+    dataset_identity = dataset_fingerprint(dataset_path)
+    dataset_generation_metadata = {}
     with h5py.File(dataset_path, "r") as hf:
+        if "meta" in hf:
+            dataset_generation_metadata = {
+                key: _metadata_to_json(value) for key, value in hf["meta"].attrs.items()
+            }
         dataset_action_representation = hf.get("meta", {}).attrs.get("action_representation", "joint_space") if "meta" in hf else "joint_space"
         if isinstance(dataset_action_representation, bytes):
             dataset_action_representation = dataset_action_representation.decode("utf-8")
@@ -554,8 +578,9 @@ def train_and_eval_model(
         # collect episode subgroup names and select a seeded random subset
         ep_keys = sorted(data_grp.keys(), key=lambda s: int(s.split("_")[-1]))
         total_N = len(ep_keys)
-        rng = np.random.default_rng(seed)
-        selected_idx = rng.choice(total_N, size=min(N, total_N), replace=False)
+        selected_idx = np.asarray(
+            selected_episode_indices(total_N, seed, N), dtype=np.int64
+        )
         selected_ep_keys = [ep_keys[i] for i in selected_idx]
         if not selected_ep_keys:
             raise ValueError(f"No episodes found in dataset: {dataset_path}")
@@ -972,13 +997,15 @@ def train_and_eval_model(
         observation_owner.vision_image_height = DEFAULT_VISION_HEIGHT
         observation_owner.vision_image_width = DEFAULT_VISION_WIDTH
 
+    validation_suite = validation_suite_spec(task_name, val_trials, eval_base_seed)
+    resolved_eval_base_seed = validation_suite["eval_base_seed"]
     eval_metadata = {
         "stream_id": os.path.basename(exp_dir),
         "source_run_id": os.path.basename(exp_dir),
         "task_name": task_name,
         "model_type": model_type,
         "val_trials": val_trials,
-        "eval_base_seed": seed + 1,
+        "eval_base_seed": resolved_eval_base_seed,
         "flow_steps": n_t,
         "n_t": n_t,
         "n_t_global": n_t_global,
@@ -1134,7 +1161,7 @@ def train_and_eval_model(
                 max_policy_steps=max_policy_steps,
                 executed_horizon=executed_horizon,
                 observation_horizon=observation_horizon,
-                eval_base_seed=seed + 1,
+                eval_base_seed=resolved_eval_base_seed,
             )
 
             if model_type in ("DGFM", "DGFMv2"):
@@ -1170,7 +1197,7 @@ def train_and_eval_model(
                 max_policy_steps=max_policy_steps,
                 executed_horizon=executed_horizon,
                 observation_horizon=observation_horizon,
-                eval_base_seed=seed + 1,
+                eval_base_seed=resolved_eval_base_seed,
                 recorded_control_freq=recorded_control_freq,
                 trajectory_control_freq=trajectory_control_freq,
                 evaluator=validation_evaluator,
@@ -1494,6 +1521,45 @@ def train_and_eval_model(
             "training_thread_time_seconds": training_thread_time_seconds,
             "records":         recs,
         }
+        output.update(validation_suite)
+        output.update(dataset_identity)
+        output["selected_episode_indices"] = [int(index) for index in selected_idx]
+        output["dataset_generation_metadata"] = dataset_generation_metadata
+        output["environment_configuration"] = TASK_ENVIRONMENT_RANGES[task_name]
+        output["experiment_version"] = experiment_version
+        output["git_commit"] = git_commit(Path(__file__).resolve().parents[1])
+        output["sweep_config_sha256"] = sweep_config_sha256
+        output["validation_backend"] = validation_backend
+        output["remote_eval_config"] = (
+            str(Path(remote_eval_config).expanduser().resolve())
+            if remote_eval_config is not None else None
+        )
+        output["remote_eval_mode"] = remote_eval_mode
+        output["remote_eval_render_best"] = remote_eval_render_best
+        output["remote_eval_timeout_sec"] = remote_eval_timeout_sec
+        output["remote_eval_poll_interval_sec"] = remote_eval_poll_interval_sec
+        output["vision_batch_size"] = vision_batch_size
+        excluded_signature_fields = {
+            "timestamp", "success_rate_best", "average_reward_best",
+            "max_validation_success_rate", "avg_last_10_validation_success_rate",
+            "best_validation_epoch", "training_thread_time_seconds", "records",
+        }
+        signature_configuration = {
+            key: value for key, value in output.items()
+            if key not in excluded_signature_fields
+        }
+        run_signature = {
+            "schema_version": 1,
+            "configuration": signature_configuration,
+            "dataset": dataset_identity,
+            "selected_episode_indices": output["selected_episode_indices"],
+            "environment_configuration": TASK_ENVIRONMENT_RANGES[task_name],
+            "dataset_generation_metadata": dataset_generation_metadata,
+            "validation_suite": validation_suite,
+            "git_commit": output["git_commit"],
+        }
+        output["run_signature"] = run_signature
+        output["run_signature_sha256"] = stable_hash(run_signature)
         with open(json_path, "w") as f:
             json.dump(output, f, indent=2)
         print(f"[saved results to {json_path}]")
@@ -1717,6 +1783,10 @@ if __name__ == "__main__":
                         help="Policy trajectory representation. Defaults to the dataset metadata, or joint_space for old datasets.")
     parser.add_argument("--early_stopping", action="store_true")
     parser.add_argument("--seed", type=int, default=2002)
+    parser.add_argument("--eval_base_seed", type=int, default=None,
+                        help="Task-specific fixed validation base seed")
+    parser.add_argument("--experiment_version", type=str, default="clean_v1")
+    parser.add_argument("--sweep_config_sha256", type=str, default=None, help=argparse.SUPPRESS)
 
     _apply_config_defaults(parser, _load_json_config(config_args.config))
     args = parser.parse_args()
@@ -1841,4 +1911,7 @@ if __name__ == "__main__":
         remote_eval_render_best = args.remote_eval_render_best,
         remote_eval_timeout_sec = args.remote_eval_timeout_sec,
         remote_eval_poll_interval_sec = args.remote_eval_poll_interval_sec,
+        eval_base_seed = args.eval_base_seed,
+        experiment_version = args.experiment_version,
+        sweep_config_sha256 = args.sweep_config_sha256,
     )
