@@ -15,12 +15,12 @@ except ImportError as exc:
     ) from exc
 
 DATASETS = {
-    "peg_in_hole_camera": "11_K9_jZUrj5Wn-nnJtWA8v6vHFIwvLDH",
-    "peg_in_hole_trajectory": "1aHehI6P7tjiDkTdqMkKj3KyYvKo9Tpse",
-    "sweep_camera": "1bjXfy5txVUPq9vyuppslVRAiKbymANiE",
-    "sweep_trajectory": "1KHhyPZhlswp_TLRq3hiKGpHJenCgHmUW",
-    "pick_and_place_camera": "1Xa5j_zUzNpjB4kzX36gm-g4EHsY5SM2w",
-    "pick_and_place_trajectory": "1vDbzkEw-X720sglMz3HcZHISi1G5f_jJ",
+    "peg_in_hole_camera": "144JkgmgOT3lQ_7iI4Rtha7oM6gEXYd7V",
+    "peg_in_hole_trajectory": "1BNVcZu8vXV2TMsDT0wrF3Jio2V58mpK3",
+    "sweep_camera": "16zwURIuE-e9ZhZ0Qas889ou3i5hazfL8",
+    "sweep_trajectory": "11cHZ79tShv4DxM67GI4iV7CR9mIGb0bD",
+    "pick_and_place_camera": "1wujZ6cV-Z5iCeVuBsTGNrp84soDnqCMf",
+    "pick_and_place_trajectory": "1A8T6Ed1byFGJJYNBgBS7NXxTfQmXNMh1",
     "pick_and_place_smokerun_camera": "1JoPVaorlFknDl2HIosaoPtR1xB_FBMjO",
     "pick_and_place_smokerun_trajectory": "1ZK4unMlYInNZ0oy9qzMKxMvBAl2NnZEN",
 }
