@@ -43,6 +43,7 @@ class AlignedDemo:
     states: np.ndarray
     actions: np.ndarray
     image_paths: np.ndarray
+    camera_frame_valid: np.ndarray
     alignment_error_s: np.ndarray
     image_cache: dict[int, torch.Tensor] = field(default_factory=dict, repr=False)
 
@@ -101,49 +102,60 @@ def match_rollout_directories(paths: DatasetPaths) -> list[tuple[Path, Path]]:
     return list(zip(camera_rollouts, trajectory_rollouts))
 
 
-def _read_camera_frames(camera_rollout: Path) -> tuple[np.ndarray, np.ndarray]:
+def _read_camera_frames(
+    camera_rollout: Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     frames_csv = camera_rollout / "frames.csv"
     if not frames_csv.is_file():
         raise FileNotFoundError(f"Missing camera metadata: {frames_csv}")
 
-    records: list[tuple[int, str, str]] = []
-    reused_frame_count = 0
-    reused_image_count = 0
+    records: list[tuple[int, str, str, bool]] = []
+    incomplete_frame_count = 0
+    missing_image_count = 0
     with frames_csv.open(newline="") as stream:
         for row in csv.DictReader(stream):
             timestamp_ns = int(row["timestamp_ns"])
             paths = [item.strip() for item in row["realsense_rgb"].split(";") if item.strip()]
+            frame_valid = True
             if len(paths) != 2:
                 if not records:
                     raise ValueError(
                         f"Cannot fill incomplete first camera frame in {frames_csv}"
                     )
-                previous_front, previous_wrist = records[-1][1:]
+                previous_front, previous_wrist = records[-1][1:3]
                 if not paths:
                     paths = [previous_front, previous_wrist]
-                    reused_image_count += 2
+                    missing_image_count += 2
                 elif len(paths) == 1 and "realsense_1" in Path(paths[0]).parts:
                     paths = [paths[0], previous_wrist]
-                    reused_image_count += 1
+                    missing_image_count += 1
                 elif len(paths) == 1 and "realsense_2" in Path(paths[0]).parts:
                     paths = [previous_front, paths[0]]
-                    reused_image_count += 1
+                    missing_image_count += 1
                 else:
                     raise ValueError(
                         f"Expected front/wrist paths in {frames_csv}, "
                         f"got {row['realsense_rgb']!r}"
                     )
-                reused_frame_count += 1
+                incomplete_frame_count += 1
+                frame_valid = False
             absolute_paths = [(camera_rollout / item).resolve() for item in paths]
             missing = [str(item) for item in absolute_paths if not item.is_file()]
             if missing:
                 raise FileNotFoundError(f"Missing camera image(s): {missing}")
-            records.append((timestamp_ns, str(absolute_paths[0]), str(absolute_paths[1])))
+            records.append(
+                (
+                    timestamp_ns,
+                    str(absolute_paths[0]),
+                    str(absolute_paths[1]),
+                    frame_valid,
+                )
+            )
 
-    if reused_frame_count:
+    if incomplete_frame_count:
         warnings.warn(
-            f"Reused {reused_image_count} previous camera image(s) across "
-            f"{reused_frame_count} incomplete frame(s) in {frames_csv}.",
+            f"Marked {incomplete_frame_count} camera frame(s) with "
+            f"{missing_image_count} missing image(s) as invalid in {frames_csv}.",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -152,7 +164,8 @@ def _read_camera_frames(camera_rollout: Path) -> tuple[np.ndarray, np.ndarray]:
     records.sort(key=lambda item: item[0])
     timestamps_s = np.asarray([item[0] for item in records], dtype=np.float64) / 1e9
     image_paths = np.asarray([[item[1], item[2]] for item in records], dtype=object)
-    return timestamps_s, image_paths
+    camera_frame_valid = np.asarray([item[3] for item in records], dtype=bool)
+    return timestamps_s, image_paths, camera_frame_valid
 
 
 def _read_joint_trajectory(
@@ -361,7 +374,7 @@ def load_aligned_demo(
     max_alignment_error_s: float = 0.05,
 ) -> AlignedDemo:
     """Align 10 Hz images to arm samples and interpolated gripper positions."""
-    camera_times, image_paths = _read_camera_frames(camera_rollout)
+    camera_times, image_paths, camera_frame_valid = _read_camera_frames(camera_rollout)
     has_teleop_state_action = (
         (trajectory_rollout / "teleop_state_joint.csv").is_file()
         and (trajectory_rollout / "teleop_action_joint.csv").is_file()
@@ -386,6 +399,7 @@ def load_aligned_demo(
         )
         camera_times = camera_times[overlap]
         image_paths = image_paths[overlap]
+        camera_frame_valid = camera_frame_valid[overlap]
         if len(camera_times) == 0:
             raise ValueError(
                 f"No temporal overlap between {camera_rollout.name} and "
@@ -412,6 +426,7 @@ def load_aligned_demo(
             states=state_positions[state_nearest],
             actions=action_positions[action_nearest],
             image_paths=image_paths,
+            camera_frame_valid=camera_frame_valid,
             alignment_error_s=errors,
         )
 
@@ -446,6 +461,7 @@ def load_aligned_demo(
         )
     camera_times = camera_times[overlap]
     image_paths = image_paths[overlap]
+    camera_frame_valid = camera_frame_valid[overlap]
     if len(camera_times) == 0:
         raise ValueError(
             f"No temporal overlap between {camera_rollout.name} and {trajectory_rollout.name}"
@@ -482,6 +498,7 @@ def load_aligned_demo(
         states=aligned_positions,
         actions=aligned_positions.copy(),
         image_paths=image_paths,
+        camera_frame_valid=camera_frame_valid,
         alignment_error_s=errors,
     )
 
@@ -695,6 +712,9 @@ class ActionChunkDataset(Dataset):
             self.samples.extend(
                 (demo_index, start)
                 for start in range(max(0, len(demo) - self.horizon + 1))
+                if np.all(
+                    demo.camera_frame_valid[self.observation_indices(start)]
+                )
             )
         if not self.samples:
             raise ValueError(f"No demonstrations contain at least {horizon} aligned frames")
