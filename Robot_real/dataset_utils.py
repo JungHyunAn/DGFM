@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -106,20 +107,46 @@ def _read_camera_frames(camera_rollout: Path) -> tuple[np.ndarray, np.ndarray]:
         raise FileNotFoundError(f"Missing camera metadata: {frames_csv}")
 
     records: list[tuple[int, str, str]] = []
+    reused_frame_count = 0
+    reused_image_count = 0
     with frames_csv.open(newline="") as stream:
         for row in csv.DictReader(stream):
             timestamp_ns = int(row["timestamp_ns"])
             paths = [item.strip() for item in row["realsense_rgb"].split(";") if item.strip()]
             if len(paths) != 2:
-                raise ValueError(
-                    f"Expected front/wrist paths in {frames_csv}, got {row['realsense_rgb']!r}"
-                )
+                if not records:
+                    raise ValueError(
+                        f"Cannot fill incomplete first camera frame in {frames_csv}"
+                    )
+                previous_front, previous_wrist = records[-1][1:]
+                if not paths:
+                    paths = [previous_front, previous_wrist]
+                    reused_image_count += 2
+                elif len(paths) == 1 and "realsense_1" in Path(paths[0]).parts:
+                    paths = [paths[0], previous_wrist]
+                    reused_image_count += 1
+                elif len(paths) == 1 and "realsense_2" in Path(paths[0]).parts:
+                    paths = [previous_front, paths[0]]
+                    reused_image_count += 1
+                else:
+                    raise ValueError(
+                        f"Expected front/wrist paths in {frames_csv}, "
+                        f"got {row['realsense_rgb']!r}"
+                    )
+                reused_frame_count += 1
             absolute_paths = [(camera_rollout / item).resolve() for item in paths]
             missing = [str(item) for item in absolute_paths if not item.is_file()]
             if missing:
                 raise FileNotFoundError(f"Missing camera image(s): {missing}")
             records.append((timestamp_ns, str(absolute_paths[0]), str(absolute_paths[1])))
 
+    if reused_frame_count:
+        warnings.warn(
+            f"Reused {reused_image_count} previous camera image(s) across "
+            f"{reused_frame_count} incomplete frame(s) in {frames_csv}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if not records:
         raise ValueError(f"No camera frames found in {frames_csv}")
     records.sort(key=lambda item: item[0])
