@@ -35,3 +35,4 @@ Robot_real/__pycache__/
 Robot_real/checkpoints/
 Synthetic_visualize/
 Robot_simulation/tests/__pycache__/
+Robot_real/tests/__pycache__/
