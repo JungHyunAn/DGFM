@@ -42,28 +42,28 @@ DEMO_SIZES_BY_TASK = {
     "door": (20, 40, 80),
     "wipe": (),
     "two_arm": (20, 40, 80),
-    "nut": (40, 80, 160),
+    "nut": (20, 40, 80),
 }
 
 MAX_EPOCHS_BY_TASK = {
     "door": (4000, 2000, 1000),
     "wipe": (),
     "two_arm": (4000, 2000, 1000),
-    "nut": (2000, 1000, 500),
+    "nut": (4000, 2000, 1000),
 }
 
 VAL_PERIODS_BY_TASK = {
     "door": (80, 40, 20),
     "wipe": (),
     "two_arm": (80, 40, 20),
-    "nut": (40, 20, 10),
+    "nut": (80, 40, 20),
 }
 
 CLUSTER_PARTITIONS_BY_TASK = {
     "door": (5, 5, 5),
     "wipe": (),
     "two_arm": (10, 10, 10),
-    "nut": (10, 20, 40),
+    "nut": (5, 5, 5),
 }
 
 DATASET_PATH_BY_TASK = {
@@ -100,7 +100,7 @@ SHARED_CONFIG: dict[str, Any] = {
     "recorded_control_freq": 20,
     "trajectory_control_freq": 10,
     "max_policy_steps": 40,
-    "observation_horizon": 1,
+    "observation_horizon": 2,
     "observation_type": "vision",
     "vision_batch_size": 128,
     "condition_embed_dim": 256,

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 _IMAGE_CACHE: dict[str, np.ndarray] = {}
@@ -360,23 +361,44 @@ def encode_image_path_windows(
     encoder: FrozenResNet18Encoder,
     device: torch.device | str,
     cache_images: bool = True,
+    encoder_batch_size: int | None = None,
+    gradient_checkpointing: bool = False,
 ) -> torch.Tensor:
     """Differentiably encode image windows shaped (B, observation_horizon, views)."""
     paths = np.asarray(path_windows, dtype=object)
     if paths.ndim != 3:
         raise ValueError(f"Expected path windows shaped (B, O, V), got {paths.shape}")
-    batch_size, observation_horizon, num_views = paths.shape
+    policy_batch_size, observation_horizon, num_views = paths.shape
     if num_views != len(encoder.camera_names):
         raise ValueError(f"Expected {len(encoder.camera_names)} views, got {num_views}")
-    images = np.stack([
-        np.stack([
-            _read_rgb_image(path, dataset_dir, cache_images)
-            for path in row
+    flat_paths = paths.reshape(-1, num_views)
+    encoder_batch_size = (
+        len(flat_paths) if encoder_batch_size is None else int(encoder_batch_size)
+    )
+    if encoder_batch_size <= 0:
+        raise ValueError(
+            f"encoder_batch_size must be positive, got {encoder_batch_size}"
+        )
+
+    feature_batches = []
+    for start in range(0, len(flat_paths), encoder_batch_size):
+        path_rows = flat_paths[start:start + encoder_batch_size]
+        images = np.stack([
+            np.stack([
+                _read_rgb_image(path, dataset_dir, cache_images)
+                for path in row
+            ], axis=0)
+            for row in path_rows
         ], axis=0)
-        for row in paths.reshape(-1, num_views)
-    ], axis=0)
-    features = encoder(torch.from_numpy(images).to(device))
-    return features.reshape(batch_size, observation_horizon * encoder.output_dim)
+        image_tensor = torch.from_numpy(images).to(device)
+        if gradient_checkpointing and torch.is_grad_enabled():
+            encoded = checkpoint(encoder, image_tensor, use_reentrant=False)
+        else:
+            encoded = encoder(image_tensor)
+        feature_batches.append(encoded)
+
+    features = torch.cat(feature_batches, dim=0)
+    return features.reshape(policy_batch_size, observation_horizon * encoder.output_dim)
 
 
 @torch.no_grad()
@@ -447,4 +469,3 @@ def encode_camera_history(
     ], axis=0)
     features = encoder(torch.from_numpy(images).to(device))
     return features.cpu().numpy().reshape(-1).astype(np.float32)
-
