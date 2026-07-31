@@ -512,6 +512,8 @@ def train_and_eval_model(
         raise ValueError(f"vision_projection_lr_scale must be positive, got {vision_projection_lr_scale}")
     if vision_warmup_freeze_epochs < 0:
         raise ValueError("vision_warmup_freeze_epochs must be non-negative")
+    if vision_batch_size <= 0:
+        raise ValueError(f"vision_batch_size must be positive, got {vision_batch_size}")
     if condition_embed_dim is None:
         condition_embed_dim = 128 if observation_type == "vision" else 32
     vision_online_training = (
@@ -956,6 +958,8 @@ def train_and_eval_model(
                 f"mode={vision_finetune_mode} | pool={vision_pool} | "
                 f"feature_proj_dim={vision_feature_proj_dim} | condition_embed_dim={condition_embed_dim} | "
                 f"batchnorm_train={vision_train_bn} | augmentation={vision_aug} | "
+                f"encoder_microbatch_size={vision_batch_size} | "
+                f"gradient_checkpointing={not vision_train_bn} | image_cache=False | "
                 f"policy_lr={learning_rate} | projection_lr={learning_rate * vision_projection_lr_scale} | "
                 f"encoder_lr={learning_rate * vision_encoder_lr_scale} | "
                 f"trainable_encoder_parameters={trainable_encoder_parameters} | "
@@ -1115,7 +1119,17 @@ def train_and_eval_model(
         def vision_condition_fn(indices, base_conditions):
             path_batch = vision_window_paths[indices.detach().cpu().numpy()]
             vision_condition = encode_image_path_windows(
-                path_batch, dataset_dir, model.vision_encoder, device
+                path_batch,
+                dataset_dir,
+                model.vision_encoder,
+                device,
+                cache_images=False,
+                encoder_batch_size=vision_batch_size,
+                # Checkpointing avoids retaining ResNet activations for every
+                # observation and camera until the policy backward pass.
+                # Trainable BatchNorm is excluded because recomputation would
+                # update its running statistics twice.
+                gradient_checkpointing=not vision_train_bn,
             )
             # Flow trainers pass base_conditions; this callback returns the full vision-conditioned tensor.
             return torch.cat([base_conditions[:, :state_param_len], vision_condition], dim=1)
@@ -1612,6 +1626,10 @@ def train_and_eval_model(
         output["remote_eval_timeout_sec"] = remote_eval_timeout_sec
         output["remote_eval_poll_interval_sec"] = remote_eval_poll_interval_sec
         output["vision_batch_size"] = vision_batch_size
+        output["vision_gradient_checkpointing"] = bool(
+            vision_online_training and not vision_train_bn
+        )
+        output["vision_online_image_cache"] = False if vision_online_training else None
         excluded_signature_fields = {
             "timestamp", "success_rate_best", "average_reward_best",
             "max_validation_success_rate", "avg_last_10_validation_success_rate",

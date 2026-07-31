@@ -644,6 +644,20 @@ class DGFM(VanillaFM):
     path_weight_atol = 1e-5
 
     def _path_weights(self, t, interpolation_path, residual_lambda=0.2):
+        if interpolation_path == "beizer":
+            # Quadratic Bezier path through source x0, guide y, and target x1.
+            one_minus_t = 1.0 - t
+            a = one_minus_t.square()
+            b = 2.0 * one_minus_t * t
+            c = t.square()
+
+            a_dot = 2.0 * (t - 1.0)
+            b_dot = 2.0 * (1.0 - 2.0 * t)
+            c_dot = 2.0 * t
+
+            self._check_path_partition(a, b, c)
+            return a, b, c, a_dot, b_dot, c_dot
+
         if interpolation_path == "piecewise-linear-midpoint":
             midpoint = torch.as_tensor(0.5, dtype=t.dtype, device=t.device)
             left = t < midpoint
