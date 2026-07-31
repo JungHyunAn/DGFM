@@ -959,7 +959,7 @@ def train_and_eval_model(
                 f"feature_proj_dim={vision_feature_proj_dim} | condition_embed_dim={condition_embed_dim} | "
                 f"batchnorm_train={vision_train_bn} | augmentation={vision_aug} | "
                 f"encoder_microbatch_size={vision_batch_size} | "
-                f"gradient_checkpointing={not vision_train_bn} | image_cache=False | "
+                f"gradient_checkpointing={not vision_train_bn} | image_cache=True | "
                 f"policy_lr={learning_rate} | projection_lr={learning_rate * vision_projection_lr_scale} | "
                 f"encoder_lr={learning_rate * vision_encoder_lr_scale} | "
                 f"trainable_encoder_parameters={trainable_encoder_parameters} | "
@@ -1123,7 +1123,7 @@ def train_and_eval_model(
                 dataset_dir,
                 model.vision_encoder,
                 device,
-                cache_images=False,
+                cache_images=True,
                 encoder_batch_size=vision_batch_size,
                 # Checkpointing avoids retaining ResNet activations for every
                 # observation and camera until the policy backward pass.
@@ -1629,7 +1629,7 @@ def train_and_eval_model(
         output["vision_gradient_checkpointing"] = bool(
             vision_online_training and not vision_train_bn
         )
-        output["vision_online_image_cache"] = False if vision_online_training else None
+        output["vision_online_image_cache"] = True if vision_online_training else None
         excluded_signature_fields = {
             "timestamp", "success_rate_best", "average_reward_best",
             "max_validation_success_rate", "avg_last_10_validation_success_rate",
