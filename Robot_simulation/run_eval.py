@@ -387,48 +387,49 @@ def _build_vision_path_windows(
     return np.asarray(windows, dtype=object)
 
 
+# Main train + evaluation function
 def train_and_eval_model(
-    model_type: str,
-    N: int,
+    model_type: str, 
+    N: int,                                                 # Dataset size
     dataset_path: str,
-    task_name: str,
+    task_name: str,                                         # Robot task name (door, two_arm, nut, wipe)
     device,
     results_path: str,
-    mf: int = 4,
-    model_path: str = None,
-    n_t: int = None,
-    n_t_global: int = None,
-    n_t_local: int = None,
-    time_sampling: str = "uniform",
-    beta_a: float = 1.5,
-    beta_b: float = 1.0,
-    interpolation_path: str = "piecewise-linear-midpoint",
-    residual_lambda: float = 0.2,
-    max_epochs: int = 1000,
+    mf: int = 4,                                            # LEGACY: multiplication factor for DGFMv1
+    model_path: str = None,                                 # Only given for evaluation only (skip model training)
+    n_t: int = None,                                        # number of timestep sampling per noise/target pair 
+    n_t_global: int = None,                                 # LEGACY: n_t for GFM part of DGFMv1
+    n_t_local: int = None,                                  # LEGACY: n_t for LFM part of DGFMv1
+    time_sampling: str = "uniform",                         # LEGACY: time_sampling method (may be "shifted")
+    beta_a: float = 1.5,                                    # LEGACY: time_sampling coefficient for "shifted"
+    beta_b: float = 1.0,                                    # LEGACY: time_sampling coefficient for "shifted"
+    interpolation_path: str = "piecewise-linear-midpoint",  # Three-point interpolation method for DGFMv2
+    residual_lambda: float = 0.2,                           # Residual coefficient for "piecewise-linear-midpoint"
+    max_epochs: int = 1000,                                 
     batch_size: int = 200,
-    warmup_steps: int = 200,
-    val_period: int = 5,
-    early_stopping: bool = True,
+    warmup_steps: int = 200,                                # Warmup "epochs" (not optimization steps)
+    val_period: int = 5,                                    # Period for validation rollout
+    early_stopping: bool = True,                            # Early stop when model doesn't improve; set as False
     stop_criteria: int = 3,
-    evaluation_samples: int = 1000,
-    val_trials: int = 5,
+    evaluation_samples: int = 1000,                         # Number for final evaluation rollouts
+    val_trials: int = 5,                                    
     seed: int = 2002,
-    horizon: int = 32,
-    executed_horizon: int | None = None,
-    window_stride: int = 1,
-    recorded_control_freq: int | float = 20,
-    trajectory_control_freq: int | float = 20,
-    max_policy_steps: int = 20,
+    horizon: int = 32,                                      # Action chunk horizon
+    executed_horizon: int | None = None,                    # Number of executed actions
+    window_stride: int = 1,                                 # Stride for sampling action chunks from dataset
+    recorded_control_freq: int | float = 20,                # Frequency of recorded dataset (20Hz by default)
+    trajectory_control_freq: int | float = 20,              # Frequency for rollout
+    max_policy_steps: int = 20,                             # Max. action chunks generated per rollout
     observation_horizon: int = 2,
-    cluster_partition: int = 5,
-    cluster_jaccard_thresh: float = 0.8,
-    cluster_merge_k: int = 10,
-    cluster_standardize: bool = True,
-    cluster_scale_x: float = 1.0,
-    cluster_scale_c: float = 1.0,
+    cluster_partition: int = 5,                             # Partitioning number for DGFMv2
+    cluster_jaccard_thresh: float = 0.8,                    # Merging criterion for DGFMv2
+    cluster_merge_k: int = 10,                              # Coefficient to form merging tree
+    cluster_standardize: bool = True,                       # Normalize vector before clustering
+    cluster_scale_x: float = 1.0,                           # LEGACY: weight for trajectory
+    cluster_scale_c: float = 1.0,                           # LEGACY: weight for condition (for state-based policy)
     cluster_eps: float = 1e-3,
-    cluster_outlier_q: float = 0.9,
-    max_pca_samples: int = 2000,
+    cluster_outlier_q: float = 0.9,                         # Outlier threshold before per-cluster PCA 
+    max_pca_samples: int = 2000,                            # Max number for PCA
     pca_n_jobs: int = -1,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-6,
@@ -442,11 +443,11 @@ def train_and_eval_model(
     dp_ddim_steps: int | None = None,
     dp_eta: float = 0.0,
     dp_pred_type: str = "x0",
-    dp_clip_sample: bool = True,
+    dp_clip_sample: bool = True,                            # Clip intermediate vector during Diffusion rollout
     dp_clip_sample_range: float = 1.0,
-    normalize_data: bool = False,
-    use_ema: bool = False,
-    eval_fresh: bool = True,
+    normalize_data: bool = False,                           # Normalize data to [-1, 1]
+    use_ema: bool = False,                                  # Use EMA model
+    eval_fresh: bool = True,                                # use fresh evaluation environments
     latent_compression_rate: float = 0.25,
     latent_ae_epochs: int | None = None,
     latent_dim: int | None = None,
@@ -485,6 +486,9 @@ def train_and_eval_model(
     experiment_version: str = "clean_v1",
     sweep_config_sha256: str | None = None,
 ):
+    ###################################
+    #### 0) Argument Sanity Checks ####
+    ###################################
     observation_type = validate_observation_type(observation_type)
     if vision_finetune_mode is None:
         vision_finetune_mode = "layer4" if vision_finetune else "frozen"
@@ -541,52 +545,66 @@ def train_and_eval_model(
     if remote_eval_mode not in ("direct", "queue"):
         raise ValueError(f"Unsupported remote_eval_mode={remote_eval_mode!r}")
 
+    ######################################################
+    #### 1) Initialize Experiment Directory + Logging ####
+    ######################################################    
     timestamp = datetime.now(ZoneInfo('Asia/Seoul')).strftime("%Y%m%dT%H%M%S")
 
     if model_path is None:
-        exp_dir = os.path.join(results_path, timestamp)
+        exp_dir = os.path.join(results_path, timestamp) # timestamped directory
         os.makedirs(exp_dir, exist_ok=True)
     else:
         exp_dir = results_path
 
-    log_path = os.path.join(exp_dir, "training.log")
+    log_path = os.path.join(exp_dir, "training.log") # log path
     log_file = open(log_path, "a", buffering=1)
     original_stdout, original_stderr = sys.stdout, sys.stderr
     sys.stdout = _TeeStream(original_stdout, log_file)
     sys.stderr = _TeeStream(original_stderr, log_file)
     print(f"[Logging console output to {log_path}]")
 
-    # Load and identify the exact dataset before selecting a nested subset.
+    ######################################################
+    #### 2) Load Selected Demonstrations from Dataset ####
+    ######################################################    
+    # 2a. Fingerprint the dataset + read metadata
     dataset_identity = dataset_fingerprint(dataset_path)
     dataset_generation_metadata = {}
     with h5py.File(dataset_path, "r") as hf:
+
+        # 2b. Resolve and validate trajectory action representation
         if "meta" in hf:
             dataset_generation_metadata = {
                 key: _metadata_to_json(value) for key, value in hf["meta"].attrs.items()
             }
         dataset_action_representation = hf.get("meta", {}).attrs.get("action_representation", "joint_space") if "meta" in hf else "joint_space"
+        
         if isinstance(dataset_action_representation, bytes):
             dataset_action_representation = dataset_action_representation.decode("utf-8")
+        
         if action_representation is None:
             action_representation = dataset_action_representation
         action_representation = validate_action_representation(action_representation)
+        
         if dataset_action_representation != action_representation:
             raise ValueError(
                 f"Dataset action_representation={dataset_action_representation!r} does not match "
                 f"requested action_representation={action_representation!r}"
             )
+        
+        # 2c. Select the deterministic nested demo. subset
         data_grp = hf["data"]
-        # collect episode subgroup names and select a seeded random subset
         ep_keys = sorted(data_grp.keys(), key=lambda s: int(s.split("_")[-1]))
         total_N = len(ep_keys)
+
         selected_idx = np.asarray(
             selected_episode_indices(total_N, seed, N), dtype=np.int64
         )
         selected_ep_keys = [ep_keys[i] for i in selected_idx]
+
         if not selected_ep_keys:
             raise ValueError(f"No episodes found in dataset: {dataset_path}")
 
-        # read the first to get shapes/dtypes
+        # 2d. Obtain episode schema and effective trajectory dimensions
         first = data_grp[selected_ep_keys[0]]
         traj0 = first["joint_angles"][:]                         # shape (T, dof)
         if observation_type == "state":
@@ -613,18 +631,24 @@ def train_and_eval_model(
 
         full_len, dof = traj0.shape
         dyn_dim = dyn0.shape[1]
+
         sample_step = get_trajectory_sample_step(recorded_control_freq, trajectory_control_freq)
         downsampled_full_len = len(traj0[::sample_step])
         seq_len = min(horizon, downsampled_full_len)
+        
         if executed_horizon is None:
             executed_horizon = seq_len
+        
         if executed_horizon <= 0:
             raise ValueError(f"executed_horizon must be positive, got {executed_horizon}")
+        
         if executed_horizon > seq_len:
             raise ValueError(
                 f"executed_horizon={executed_horizon} exceeds planned seq_len={seq_len}. "
                 f"Increase available trajectory length or lower executed_horizon."
             )
+
+        # 2e. Validate vision + Load selected trajectories and observations
         data_trajectories = []
         data_dynamic = []
         data_static_env = []
@@ -668,6 +692,11 @@ def train_and_eval_model(
                     raise ValueError(f"Episode {ep} is missing image_paths")
                 data_image_paths.append(load_camera_path_matrix(grp["image_paths"], camera_names))
         data_static_env = np.asarray(data_static_env, dtype=param0.dtype)
+
+        #################################################################
+        #### 3) Build Trajectory Windows (Conditioned Action Chunks) ####
+        #################################################################
+        # 3a. Determine state type + Initialize vision encoder for "vision"
         state_param_len = (
             observation_horizon * dof
             if observation_type == "vision"
@@ -701,7 +730,7 @@ def train_and_eval_model(
                     vision_encoder, device, batch_size=vision_batch_size, verbose=True, cache_images=False,
                 )
 
-        # Online vision keeps only the base joint-history condition here; image features are appended per batch.
+        # 3b. Generate windows for training
         window_traj, window_cond = build_state_conditioned_windows(
             data_trajectories,
             data_dynamic,
@@ -726,6 +755,7 @@ def train_and_eval_model(
                     f"Vision path windows {len(vision_window_paths)} != trajectory windows {len(window_traj)}"
                 )
         vision_feature_dim = 0 if vision_encoder is None else vision_encoder.output_dim
+        
         if observation_type == "vision":
             expected_full_condition_dim = observation_horizon * (dof + vision_feature_dim)
             expected_window_condition_dim = state_param_len if vision_online_training else expected_full_condition_dim
@@ -754,13 +784,17 @@ def train_and_eval_model(
             f"expected_full_condition_dim={expected_full_condition_dim} | "
             f"actual_condition_dim={window_cond.shape[1]}"
         )
+
         if window_cond.shape[1] != expected_window_condition_dim:
             raise ValueError(
                 "Condition schema mismatch: unexpected data entered window_cond; "
                 f"expected {expected_window_condition_dim}, got {window_cond.shape[1]}"
             )
+
         if not np.all(np.isfinite(window_traj)) or not np.all(np.isfinite(window_cond)):
             raise ValueError("Non-finite values found in window_traj or window_cond")
+        
+        # 3c. Normalize data
         normalization_stats = _fit_joint_normalization_stats(window_traj) if normalize_data else None
         if normalize_data:
             print(
@@ -774,7 +808,9 @@ def train_and_eval_model(
         num_demos = len(selected_ep_keys)
         num_windows = window_traj.shape[0]
 
-    # sample the target trajectories & its environment parameters
+    #########################################################
+    #### 4) Common Backbone + Method-specific Objectives ####
+    #########################################################
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
