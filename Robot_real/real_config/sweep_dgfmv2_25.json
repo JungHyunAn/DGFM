@@ -47,7 +47,7 @@
   "num_convs_per_block": 1,
   "sampler_steps": 100,
   "interpolation_path": "residual-cosine-midpoint",
-  "cluster_partition": 10,
+  "cluster_partition": 5,
   "cluster_size": null,
   "cluster_jaccard_thresh": 0.8,
   "cluster_merge_k": 10,
