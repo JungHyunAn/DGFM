@@ -39,28 +39,28 @@ def dgfm_path(relative_path: str) -> str:
 
 
 DEMO_SIZES_BY_TASK = {
-    "door": (20, 40, 80, 160),
+    "door": (20, 40, 80),
     "wipe": (),
     "two_arm": (20, 40, 80),
     "nut": (40, 80, 160),
 }
 
 MAX_EPOCHS_BY_TASK = {
-    "door": (4000, 2000, 1000, 500),
+    "door": (4000, 2000, 1000),
     "wipe": (),
     "two_arm": (4000, 2000, 1000),
     "nut": (2000, 1000, 500),
 }
 
 VAL_PERIODS_BY_TASK = {
-    "door": (80, 40, 20, 10),
+    "door": (80, 40, 20),
     "wipe": (),
     "two_arm": (80, 40, 20),
     "nut": (40, 20, 10),
 }
 
 CLUSTER_PARTITIONS_BY_TASK = {
-    "door": (10, 20, 40, 80),
+    "door": (5, 5, 5),
     "wipe": (),
     "two_arm": (10, 10, 10),
     "nut": (10, 20, 40),
