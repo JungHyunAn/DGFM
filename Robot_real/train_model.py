@@ -574,6 +574,8 @@ def _checkpoint_payload(
     )
     metadata = {key: config.get(key) for key in metadata_keys}
     metadata.update(
+        use_ema=bool(config.get("use_ema", False)),
+        ema_includes_vision_encoder=bool(config.get("use_ema", False)),
         dof=len(action_joint_names),
         state_dof=len(state_joint_names),
         action_dof=len(action_joint_names),
@@ -738,6 +740,7 @@ def train(config: dict[str, Any]) -> Path:
         )
 
     ema = EMAModel(model) if config["use_ema"] else None
+    encoder_ema = EMAModel(encoder) if config["use_ema"] else None
     last_validation_mse: float | None = None
     history: list[dict[str, Any]] = []
 
@@ -797,6 +800,7 @@ def train(config: dict[str, Any]) -> Path:
             optimizer.step()
             if ema is not None:
                 ema.step(model)
+                encoder_ema.step(encoder)
             total_loss += float(loss)
             batches += 1
         scheduler.step()
@@ -808,9 +812,12 @@ def train(config: dict[str, Any]) -> Path:
         )
         if should_validate:
             evaluation_model = ema.averaged_model if ema is not None else model
+            evaluation_encoder = (
+                encoder_ema.averaged_model if encoder_ema is not None else encoder
+            )
             val_mse, per_demo = validate_offline(
                 evaluation_model,
-                encoder,
+                evaluation_encoder,
                 val_demos,
                 state_stats,
                 action_stats,
@@ -836,8 +843,9 @@ def train(config: dict[str, Any]) -> Path:
         history.append(record)
 
     final_model = ema.averaged_model if ema is not None else model
+    final_encoder = encoder_ema.averaged_model if encoder_ema is not None else encoder
     final_model_state = copy.deepcopy(final_model.state_dict())
-    final_encoder_state = copy.deepcopy(encoder.state_dict())
+    final_encoder_state = copy.deepcopy(final_encoder.state_dict())
     checkpoint_path = Path(config["checkpoint_path"]).expanduser().resolve()
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     if config["model_type"] == "DGFMv2":
