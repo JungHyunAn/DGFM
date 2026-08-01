@@ -70,7 +70,7 @@ DATASET_PATH_BY_TASK = {
     "door": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/door_joint_space_dataset_1000_vision.hdf5"),
     "wipe": None,
     "two_arm": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/two_arm_joint_space_dataset_1000_vision_strict_v1.hdf5"),
-    "nut": dgfm_path("Robot_simulation/heuristic_dataset/nut_joint_space_dataset_1000_vision.hdf5"),
+    "nut": dgfm_path("Robot_simulation/heuristic_dataset_clean_v1/nut_joint_space_dataset_1000_vision.hdf5"),
 }
 
 CAMERA_NAMES_BY_TASK = {
@@ -100,9 +100,9 @@ SHARED_CONFIG: dict[str, Any] = {
     "recorded_control_freq": 20,
     "trajectory_control_freq": 10,
     "max_policy_steps": 40,
-    "observation_horizon": 2,
+    "observation_horizon": 1,
     "observation_type": "vision",
-    "vision_batch_size": 128,
+    "vision_batch_size": 500,
     "condition_embed_dim": 256,
     "vision_finetune": True,
     "vision_finetune_mode": "layer4",
@@ -154,7 +154,7 @@ METHOD_CONFIGS: dict[str, dict[str, Any]] = {
         "dgfm_trunc_low": -1.5,
         "dgfm_trunc_high": 1.5,
         "time_sampling": "uniform",
-        "interpolation_path": "residual-cosine-midpoint",
+        "interpolation_path": "beizer",
         "residual_lambda": 0.2,
     },
 }

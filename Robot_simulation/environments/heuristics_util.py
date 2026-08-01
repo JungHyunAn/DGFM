@@ -76,6 +76,7 @@ ACTION_REPRESENTATIONS = ("joint_space", "task_space")
 DEFAULT_VISION_CAMERAS = ("frontview", "robot0_eye_in_hand")
 DEFAULT_VISION_HEIGHT = 224
 DEFAULT_VISION_WIDTH = 224
+NUT_FRONTVIEW_POSITION = np.array([1.0, 0.0, 1.45], dtype=np.float64)
 
 
 def capture_camera_views(
@@ -144,8 +145,25 @@ def get_square_nut_pose(env) -> np.ndarray:
     return np.concatenate([nut_pos.astype(np.float32), _mat_to_roll_pitch_yaw(nut_rot)], axis=0)
 
 
+def configure_nut_frontview(env, camera_name: str = "frontview") -> bool:
+    """Tighten the nut-task view while keeping the Panda and target peg visible."""
+    try:
+        camera_id = env.sim.model.camera_name2id(camera_name)
+    except (KeyError, ValueError):
+        return False
+    if camera_id < 0:
+        return False
+
+    # Keep RoboSuite's original camera orientation and move only along its
+    # viewing axis. At x=1.0 the reset and insertion poses remain fully framed,
+    # while the task occupies substantially more of a 4:3 or square image.
+    env.sim.model.cam_pos[camera_id] = NUT_FRONTVIEW_POSITION
+    env.sim.forward()
+    return True
+
+
 def configure_nut_pegs(env, delta_x: float = -0.05, delta_z: float = 0.1) -> None:
-    """Apply the deterministic nut peg layout used by the heuristic task."""
+    """Apply the deterministic nut peg layout and task-specific camera view."""
     if not hasattr(env, "_dgfm_nut_peg1_base_pos"):
         env._dgfm_nut_peg1_base_pos = env.sim.model.body_pos[env.peg1_body_id].copy()
         env._dgfm_nut_peg2_base_pos = env.sim.model.body_pos[env.peg2_body_id].copy()
@@ -159,6 +177,7 @@ def configure_nut_pegs(env, delta_x: float = -0.05, delta_z: float = 0.1) -> Non
     env.sim.model.body_pos[env.peg1_body_id] = peg1_pos
     env.sim.model.body_pos[env.peg2_body_id] = peg2_pos
     env.sim.forward()
+    configure_nut_frontview(env)
 
 
 def _gripper_qpos_to_normalized(gripper_qpos: np.ndarray) -> np.ndarray:
@@ -761,7 +780,7 @@ def make_env(
                 name="SquareNutSampler",
                 x_range=[-0.12, -0.11],
                 y_range=[0.11, 0.14],
-                rotation=(np.pi/2 - np.pi / 6, np.pi/2 + np.pi / 6),
+                rotation=(np.pi - np.pi / 6, np.pi + np.pi / 6),
                 rotation_axis="z",
                 ensure_object_boundary_in_range=False,
                 ensure_valid_placement=True,
@@ -824,6 +843,7 @@ def make_env(
             restore_environment(env, environment_setting)
             env.placement_initializer = None
             env.sim.forward()
+            configure_nut_frontview(env)
     else:
         raise ValueError(f"Unsupported task type={task_name}.")
 

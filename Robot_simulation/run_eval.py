@@ -959,7 +959,7 @@ def train_and_eval_model(
                 f"feature_proj_dim={vision_feature_proj_dim} | condition_embed_dim={condition_embed_dim} | "
                 f"batchnorm_train={vision_train_bn} | augmentation={vision_aug} | "
                 f"encoder_microbatch_size={vision_batch_size} | "
-                f"gradient_checkpointing={not vision_train_bn} | image_cache=True | "
+                f"gradient_checkpointing=False | image_cache=True | "
                 f"policy_lr={learning_rate} | projection_lr={learning_rate * vision_projection_lr_scale} | "
                 f"encoder_lr={learning_rate * vision_encoder_lr_scale} | "
                 f"trainable_encoder_parameters={trainable_encoder_parameters} | "
@@ -1125,11 +1125,7 @@ def train_and_eval_model(
                 device,
                 cache_images=True,
                 encoder_batch_size=vision_batch_size,
-                # Checkpointing avoids retaining ResNet activations for every
-                # observation and camera until the policy backward pass.
-                # Trainable BatchNorm is excluded because recomputation would
-                # update its running statistics twice.
-                gradient_checkpointing=not vision_train_bn,
+                gradient_checkpointing=False,
             )
             # Flow trainers pass base_conditions; this callback returns the full vision-conditioned tensor.
             return torch.cat([base_conditions[:, :state_param_len], vision_condition], dim=1)
@@ -1626,9 +1622,7 @@ def train_and_eval_model(
         output["remote_eval_timeout_sec"] = remote_eval_timeout_sec
         output["remote_eval_poll_interval_sec"] = remote_eval_poll_interval_sec
         output["vision_batch_size"] = vision_batch_size
-        output["vision_gradient_checkpointing"] = bool(
-            vision_online_training and not vision_train_bn
-        )
+        output["vision_gradient_checkpointing"] = False if vision_online_training else None
         output["vision_online_image_cache"] = True if vision_online_training else None
         excluded_signature_fields = {
             "timestamp", "success_rate_best", "average_reward_best",
