@@ -16,12 +16,13 @@ import sys
 import time
 
 import h5py
+import numpy as np
 from pathlib import Path
 from typing import Any
 
 from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME, DP_EVAL_SAMPLING_MODE, TASK_EVAL_BASE_SEEDS, dataset_fingerprint,
-    selected_episode_indices, stable_hash,
+    environment_grid_episode_indices, stable_hash,
 )
 
 
@@ -90,7 +91,8 @@ SHARED_CONFIG: dict[str, Any] = {
     "n_t": 1,
     "learning_rate": 0.0001,
     "weight_decay": 1e-6,
-    "batch_size": 500,
+    "batch_size": 250,
+    "gradient_accumulation_steps": 2,
     "val_trials": 50,
     "stop_criteria": 3,
     "evaluation_samples": 100,
@@ -100,7 +102,7 @@ SHARED_CONFIG: dict[str, Any] = {
     "recorded_control_freq": 20,
     "trajectory_control_freq": 10,
     "max_policy_steps": 40,
-    "observation_horizon": 1,
+    "observation_horizon": 2,
     "observation_type": "vision",
     "vision_batch_size": 500,
     "condition_embed_dim": 256,
@@ -392,8 +394,16 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
         if result.get("dataset_sha256") != expected_dataset["dataset_sha256"]:
             continue
         with h5py.File(config["dataset_path"], "r") as dataset:
-            expected_indices = selected_episode_indices(
-                len(dataset["data"]), config["seed"], config["N"]
+            data = dataset["data"]
+            episode_keys = sorted(
+                data.keys(), key=lambda key: int(key.split("_")[-1])
+            )
+            environment_parameters = np.asarray([
+                data[key]["environment_parameters"]["values"][:]
+                for key in episode_keys
+            ])
+            expected_indices = environment_grid_episode_indices(
+                environment_parameters, config["seed"], config["N"]
             )
         if result.get("selected_episode_indices") != expected_indices:
             continue

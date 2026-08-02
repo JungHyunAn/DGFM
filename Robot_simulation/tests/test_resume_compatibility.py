@@ -8,12 +8,13 @@ import unittest
 from pathlib import Path
 
 import h5py
+import numpy as np
 
 from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME,
     DP_EVAL_SAMPLING_MODE,
     dataset_fingerprint,
-    selected_episode_indices,
+    environment_grid_episode_indices,
     stable_hash,
 )
 from Robot_simulation.run_eval_sweep import completed_result_path
@@ -26,7 +27,11 @@ class ResumeCompatibilityTest(unittest.TestCase):
             with h5py.File(dataset_path, "w") as dataset:
                 data = dataset.create_group("data")
                 for idx in range(10):
-                    data.create_group(f"entire_episode_{idx}")
+                    episode = data.create_group(f"entire_episode_{idx}")
+                    parameters = episode.create_group("environment_parameters")
+                    parameters.create_dataset(
+                        "values", data=np.asarray([idx], dtype=np.float32)
+                    )
         results_path = root / method
         run_path = results_path / "run"
         run_path.mkdir(parents=True, exist_ok=True)
@@ -49,7 +54,9 @@ class ResumeCompatibilityTest(unittest.TestCase):
             "run_signature": signature,
             "run_signature_sha256": stable_hash(signature),
             "dataset_sha256": dataset_fingerprint(dataset_path)["dataset_sha256"],
-            "selected_episode_indices": selected_episode_indices(10, 1000, 4),
+            "selected_episode_indices": environment_grid_episode_indices(
+                np.arange(10, dtype=np.float32).reshape(-1, 1), 1000, 4
+            ),
             "model_type": method,
             "task_name": "door",
             "N": 4,

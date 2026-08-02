@@ -5,7 +5,7 @@ import torch
 from tqdm import tqdm
 
 from Robot_simulation.env_util import _generate_val_env, eval_model
-from Robot_simulation.models.VanillaFM_class import EMAModel
+from Robot_simulation.models.VanillaFM_class import EMAModel, normalize_accumulated_gradients
 
 
 def cosine_beta_schedule(T: int, s: float = 0.008, max_beta: float = 0.999):
@@ -266,6 +266,7 @@ class DiffusionPolicy:
         n_t: int,
         max_epochs: int,
         batch_size: int,
+        gradient_accumulation_steps: int = 1,
         val_period: int = 5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
@@ -280,6 +281,11 @@ class DiffusionPolicy:
         eval_metadata: dict | None = None,
     ):
         """Train the diffusion baseline with the same data contract as FM trainers."""
+        if gradient_accumulation_steps <= 0:
+            raise ValueError(
+                "gradient_accumulation_steps must be positive, got "
+                f"{gradient_accumulation_steps}"
+            )
         N = target_trajectories.shape[0]
         best_avg_reward = 0.0
         best_success_rate = 0.0
@@ -313,6 +319,9 @@ class DiffusionPolicy:
                 perm = torch.randperm(N, device=self.device)
                 loss_sum = 0.0
                 batch_count = 0
+                accumulated_microbatches = 0
+                accumulated_samples = 0
+                self.optimizer.zero_grad()
 
                 for i in range(0, N, batch_size):
                     idx = perm[i:min(i + batch_size, N)]
@@ -338,13 +347,28 @@ class DiffusionPolicy:
                         sq_err = sq_err * self.model.loss_mask
                     loss = sq_err.mean()
 
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    vision_after_backward_hook = getattr(self, "vision_after_backward_hook", None)
-                    if vision_after_backward_hook is not None:
-                        vision_after_backward_hook()
-                    self.optimizer.step()
-                    self._step_ema()
+                    microbatch_samples = x0r.shape[0]
+                    (loss * microbatch_samples).backward()
+                    accumulated_microbatches += 1
+                    accumulated_samples += microbatch_samples
+                    accumulation_boundary = (
+                        accumulated_microbatches == gradient_accumulation_steps
+                        or i + batch_size >= N
+                    )
+                    if accumulation_boundary:
+                        normalize_accumulated_gradients(
+                            self.optimizer, accumulated_samples
+                        )
+                        vision_after_backward_hook = getattr(
+                            self, "vision_after_backward_hook", None
+                        )
+                        if vision_after_backward_hook is not None:
+                            vision_after_backward_hook()
+                        self.optimizer.step()
+                        self._step_ema()
+                        self.optimizer.zero_grad()
+                        accumulated_microbatches = 0
+                        accumulated_samples = 0
                     loss_sum += float(loss.item())
                     batch_count += 1
 
@@ -457,6 +481,7 @@ def train_DP(
     ddim_steps: int | None = None,
     eta: float = 0.0,
     use_ema: bool = False,
+    gradient_accumulation_steps: int = 1,
 ):
     policy = DiffusionPolicy(
         model=model,
@@ -481,6 +506,7 @@ def train_DP(
         n_t=n_t,
         max_epochs=max_epochs,
         batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
         val_period=val_period,
         early_stopping=early_stopping,
         stop_criteria=stop_criteria,

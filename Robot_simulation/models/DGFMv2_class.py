@@ -16,7 +16,7 @@ from Robot_simulation.models.DGFM_class import (
     cluster_points_x,
 )
 from Robot_simulation.env_util import _generate_val_env, eval_model
-from Robot_simulation.models.VanillaFM_class import VectorField
+from Robot_simulation.models.VanillaFM_class import VectorField, normalize_accumulated_gradients
 from Robot_simulation.reproducibility import validation_result_is_better
 
 
@@ -273,6 +273,7 @@ class DGFMv2(DGFM):
         cluster_size: int,
         max_epochs: int,
         batch_size: int,
+        gradient_accumulation_steps: int = 1,
         interpolation_path: str = "piecewise-linear-midpoint",
         residual_lambda: float = 0.2,
         val_period: int = 5,
@@ -306,6 +307,11 @@ class DGFMv2(DGFM):
         eval_metadata: dict | None = None,
         **_,
     ):
+        if gradient_accumulation_steps <= 0:
+            raise ValueError(
+                "gradient_accumulation_steps must be positive, got "
+                f"{gradient_accumulation_steps}"
+            )
         if mf is not None or n_t_local is not None or n_t_global is not None:
             print("[DGFMv2] Ignoring deprecated mf/n_t_local/n_t_global; using n_t only.")
         if max_pca_samples <= 0:
@@ -406,6 +412,9 @@ class DGFMv2(DGFM):
 
                 loss_sum = 0.0
                 batch_count = 0
+                accumulated_microbatches = 0
+                accumulated_samples = 0
+                self.optimizer.zero_grad()
                 for i in range(0, joint_N, batch_size):
                     xb = XT[i:i + batch_size]
                     tb = TIN[i:i + batch_size]
@@ -423,13 +432,28 @@ class DGFMv2(DGFM):
                             sq_err = sq_err * self.model.loss_mask
                         loss = sq_err.mean()
 
-                        self.optimizer.zero_grad()
-                        loss.backward()
-                        vision_after_backward_hook = getattr(self, "vision_after_backward_hook", None)
-                        if vision_after_backward_hook is not None:
-                            vision_after_backward_hook()
-                        self.optimizer.step()
-                        self._step_ema()
+                        microbatch_samples = xb.shape[0]
+                        (loss * microbatch_samples).backward()
+                        accumulated_microbatches += 1
+                        accumulated_samples += microbatch_samples
+                        accumulation_boundary = (
+                            accumulated_microbatches == gradient_accumulation_steps
+                            or i + batch_size >= joint_N
+                        )
+                        if accumulation_boundary:
+                            normalize_accumulated_gradients(
+                                self.optimizer, accumulated_samples
+                            )
+                            vision_after_backward_hook = getattr(
+                                self, "vision_after_backward_hook", None
+                            )
+                            if vision_after_backward_hook is not None:
+                                vision_after_backward_hook()
+                            self.optimizer.step()
+                            self._step_ema()
+                            self.optimizer.zero_grad()
+                            accumulated_microbatches = 0
+                            accumulated_samples = 0
 
                         loss_sum += float(loss.item())
                         batch_count += 1

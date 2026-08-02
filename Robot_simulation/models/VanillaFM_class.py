@@ -71,6 +71,17 @@ class EMAModel:
         self.optimization_step += 1
 
 
+@torch.no_grad()
+def normalize_accumulated_gradients(optimizer, sample_count: int) -> None:
+    """Convert sample-summed gradients into a mean before an optimizer step."""
+    if sample_count <= 0:
+        raise ValueError(f"sample_count must be positive, got {sample_count}")
+    for group in optimizer.param_groups:
+        for parameter in group["params"]:
+            if parameter.grad is not None:
+                parameter.grad.div_(sample_count)
+
+
 class FiLM(nn.Module):
     """Feature-wise Linear Modulation (FiLM) for 1D feature maps.
 
@@ -445,6 +456,7 @@ class VanillaFM:
         n_t: int,
         max_epochs: int,
         batch_size: int,
+        gradient_accumulation_steps: int = 1,
         val_period: int = 5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
@@ -458,6 +470,11 @@ class VanillaFM:
         evaluator=None,
         eval_metadata: dict | None = None,
     ):
+        if gradient_accumulation_steps <= 0:
+            raise ValueError(
+                "gradient_accumulation_steps must be positive, got "
+                f"{gradient_accumulation_steps}"
+            )
         N = target_trajectories.shape[0]
         best_avg_reward = 0.0
         best_success_rate = 0.0
@@ -487,6 +504,9 @@ class VanillaFM:
                     vision_epoch_hook(epoch)
                 perm_t = torch.randperm(N, device=self.device)
                 loss_sum = 0.0
+                accumulated_microbatches = 0
+                accumulated_samples = 0
+                self.optimizer.zero_grad()
                 for i in range(0, N, batch_size):
                     idx = perm_t[i:min(i + batch_size, N)]
                     x1 = target_trajectories[idx]
@@ -510,13 +530,28 @@ class VanillaFM:
                         sq_err = sq_err * self.model.loss_mask
                     loss = sq_err.mean()
 
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    vision_after_backward_hook = getattr(self, "vision_after_backward_hook", None)
-                    if vision_after_backward_hook is not None:
-                        vision_after_backward_hook()
-                    self.optimizer.step()
-                    self._step_ema()
+                    microbatch_samples = x1r.shape[0]
+                    (loss * microbatch_samples).backward()
+                    accumulated_microbatches += 1
+                    accumulated_samples += microbatch_samples
+                    accumulation_boundary = (
+                        accumulated_microbatches == gradient_accumulation_steps
+                        or i + batch_size >= N
+                    )
+                    if accumulation_boundary:
+                        normalize_accumulated_gradients(
+                            self.optimizer, accumulated_samples
+                        )
+                        vision_after_backward_hook = getattr(
+                            self, "vision_after_backward_hook", None
+                        )
+                        if vision_after_backward_hook is not None:
+                            vision_after_backward_hook()
+                        self.optimizer.step()
+                        self._step_ema()
+                        self.optimizer.zero_grad()
+                        accumulated_microbatches = 0
+                        accumulated_samples = 0
                     loss_sum += float(loss.item())
 
                 if self.scheduler is not None:
@@ -585,5 +620,4 @@ class VanillaFM:
         if not records:
             best_model = self._copy_eval_model()
         return best_model, self.model, records
-
 

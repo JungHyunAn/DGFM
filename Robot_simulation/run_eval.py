@@ -171,8 +171,8 @@ from Robot_simulation.environments.heuristics_util import (
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME, DP_EVAL_SAMPLING_MODE, TASK_ENVIRONMENT_RANGES, dataset_fingerprint,
-    evaluation_policy_seed_plan, git_commit,
-    selected_episode_indices, stable_hash, summarize_validation_records, validation_suite_spec,
+    environment_grid_episode_indices, evaluation_policy_seed_plan, git_commit,
+    stable_hash, summarize_validation_records, validation_suite_spec,
 )
 
 
@@ -407,6 +407,7 @@ def train_and_eval_model(
     residual_lambda: float = 0.2,                           # Residual coefficient for "piecewise-linear-midpoint"
     max_epochs: int = 1000,                                 
     batch_size: int = 200,
+    gradient_accumulation_steps: int = 1,
     warmup_steps: int = 200,                                # Warmup "epochs" (not optimization steps)
     val_period: int = 5,                                    # Period for validation rollout
     early_stopping: bool = True,                            # Early stop when model doesn't improve; set as False
@@ -514,6 +515,11 @@ def train_and_eval_model(
         raise ValueError("vision_warmup_freeze_epochs must be non-negative")
     if vision_batch_size <= 0:
         raise ValueError(f"vision_batch_size must be positive, got {vision_batch_size}")
+    if gradient_accumulation_steps <= 0:
+        raise ValueError(
+            "gradient_accumulation_steps must be positive, got "
+            f"{gradient_accumulation_steps}"
+        )
     if condition_embed_dim is None:
         condition_embed_dim = 128 if observation_type == "vision" else 32
     vision_online_training = (
@@ -593,13 +599,17 @@ def train_and_eval_model(
                 f"requested action_representation={action_representation!r}"
             )
         
-        # 2c. Select the deterministic nested demo. subset
+        # 2c. Select a deterministic, environment-grid-stratified demo subset
         data_grp = hf["data"]
         ep_keys = sorted(data_grp.keys(), key=lambda s: int(s.split("_")[-1]))
         total_N = len(ep_keys)
 
+        all_environment_parameters = np.asarray([
+            data_grp[ep]["environment_parameters"]["values"][:] for ep in ep_keys
+        ])
         selected_idx = np.asarray(
-            selected_episode_indices(total_N, seed, N), dtype=np.int64
+            environment_grid_episode_indices(all_environment_parameters, seed, N),
+            dtype=np.int64,
         )
         selected_ep_keys = [ep_keys[i] for i in selected_idx]
 
@@ -858,7 +868,10 @@ def train_and_eval_model(
         f"max_policy_steps={max_policy_steps} | observation_horizon={observation_horizon} | "
         f"cluster_partition={cluster_partition} | "
         f"learning_rate={learning_rate} | weight_decay={weight_decay} | "
-        f"max_epochs={max_epochs} | batch_size={batch_size} | warmup_steps={warmup_steps} | "
+        f"max_epochs={max_epochs} | batch_size={batch_size} | "
+        f"gradient_accumulation_steps={gradient_accumulation_steps} | "
+        f"effective_batch_size={batch_size * gradient_accumulation_steps} | "
+        f"warmup_steps={warmup_steps} | "
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"residual_lambda={residual_lambda} | "
@@ -1077,6 +1090,8 @@ def train_and_eval_model(
         "action_representation": action_representation,
         "normalization_stats": normalization_stats,
         "use_ema": use_ema,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_batch_size": batch_size * gradient_accumulation_steps,
         "dp_T_diff": dp_T_diff if model_type == "DP" else None,
         "dp_schedule_type": dp_schedule_type if model_type == "DP" else None,
         "dp_ddim_steps": dp_ddim_steps if model_type == "DP" else None,
@@ -1217,6 +1232,7 @@ def train_and_eval_model(
                     n_t=n_t,
                     max_epochs=max_epochs,
                     batch_size=batch_size,
+                    gradient_accumulation_steps=gradient_accumulation_steps,
                     interpolation_path=interpolation_path,
                     residual_lambda=residual_lambda,
                     val_period=effective_val_period,
@@ -1237,6 +1253,7 @@ def train_and_eval_model(
                 n_t=n_t,
                 max_epochs=max_epochs,
                 batch_size=batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
                 val_period=effective_val_period,
                 early_stopping=early_stopping,
                 stop_criteria=stop_criteria,
@@ -1475,6 +1492,8 @@ def train_and_eval_model(
             "trajectory_sample_step": sample_step,
             "normalize_data": normalize_data,
             "use_ema": use_ema,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "effective_batch_size": batch_size * gradient_accumulation_steps,
             "ema_applied": bool(use_ema and getattr(flow, "ema", None) is not None),
             "ema_decay": (
                 float(flow.ema.decay)
@@ -1577,6 +1596,8 @@ def train_and_eval_model(
             "maximum epoch":   max_epochs,
             "warmup steps":    warmup_steps,
             "batch_size":      batch_size,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "effective_batch_size": batch_size * gradient_accumulation_steps,
             "val_period":      val_period,
             "val_trials":      val_trials,
             "early_stopping":  early_stopping,
@@ -1771,6 +1792,7 @@ if __name__ == "__main__":
     parser.add_argument("--residual_lambda", type=float, default=0.2)
     parser.add_argument("--max_epochs",     type=int,   default=1000)
     parser.add_argument("--batch_size",     type=int,   default=200)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--warmup_steps",    type=int,   default=200)
     parser.add_argument("--val_period",     type=int,   default=5)
     parser.add_argument("--val_trials",     type=int,   default=5)
@@ -1925,6 +1947,7 @@ if __name__ == "__main__":
         residual_lambda    = args.residual_lambda,
         max_epochs         = args.max_epochs,
         batch_size         = args.batch_size,
+        gradient_accumulation_steps = args.gradient_accumulation_steps,
         warmup_steps       = args.warmup_steps,
         val_period         = args.val_period,
         val_trials         = args.val_trials,

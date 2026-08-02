@@ -144,6 +144,93 @@ def selected_episode_indices(total_episodes: int, training_seed: int, budget: in
     return permutation[: min(budget, total_episodes)].astype(np.int64).tolist()
 
 
+def environment_grid_episode_indices(
+    environment_parameters: np.ndarray,
+    training_seed: int,
+    budget: int,
+) -> list[int]:
+    """Select one seeded episode from each of evenly spaced environment-grid cells."""
+    parameters = np.asarray(environment_parameters)
+    if parameters.ndim != 2:
+        raise ValueError(
+            "environment_parameters must have shape (episodes, dimensions), "
+            f"got {parameters.shape}"
+        )
+    total_episodes, environment_dim = parameters.shape
+    if budget < 0:
+        raise ValueError(f"budget must be non-negative, got {budget}")
+    if budget > total_episodes:
+        raise ValueError(
+            f"Requested {budget} demonstrations, but the dataset contains only "
+            f"{total_episodes} episodes"
+        )
+    minimum_budget = 2**environment_dim
+    if budget < minimum_budget:
+        raise ValueError(
+            f"Requested {budget} demonstrations for environment dimension "
+            f"{environment_dim}; at least 2 ** {environment_dim} = "
+            f"{minimum_budget} are required"
+        )
+    if budget == 0:
+        return []
+    if environment_dim == 0:
+        return selected_episode_indices(total_episodes, training_seed, budget)
+    if not np.all(np.isfinite(parameters)):
+        raise ValueError("environment_parameters must contain only finite values")
+
+    lower = parameters.min(axis=0)
+    spans = parameters.max(axis=0) - lower
+    constant_dimensions = np.flatnonzero(spans == 0)
+    if constant_dimensions.size:
+        raise ValueError(
+            "Cannot construct an environment grid from constant parameter "
+            f"dimensions {constant_dimensions.tolist()}"
+        )
+
+    bins_per_dimension = int(np.ceil(np.exp(np.log(budget) / environment_dim)))
+    coordinates = np.floor(
+        (parameters - lower) / spans * bins_per_dimension
+    ).astype(np.int64)
+    np.clip(coordinates, 0, bins_per_dimension - 1, out=coordinates)
+    cell_ids = np.ravel_multi_index(
+        coordinates.T, (bins_per_dimension,) * environment_dim
+    )
+
+    total_cells = bins_per_dimension**environment_dim
+    selected_cells = np.floor(
+        np.arange(budget, dtype=np.float64) * total_cells / budget
+    ).astype(np.int64)
+    target_coordinates = np.stack(
+        np.unravel_index(
+            selected_cells, (bins_per_dimension,) * environment_dim
+        ),
+        axis=1,
+    )
+    target_centers = (target_coordinates + 0.5) / bins_per_dimension
+    normalized_parameters = (parameters - lower) / spans
+
+    permutation = np.random.default_rng(int(training_seed)).permutation(total_episodes)
+    ranks = np.empty(total_episodes, dtype=np.int64)
+    ranks[permutation] = np.arange(total_episodes)
+    available = np.ones(total_episodes, dtype=bool)
+    selected = []
+    for cell, center in zip(selected_cells, target_centers, strict=True):
+        candidates = np.flatnonzero(available & (cell_ids == cell))
+        if candidates.size:
+            chosen = candidates[np.argmin(ranks[candidates])]
+        else:
+            candidates = np.flatnonzero(available)
+            squared_distances = np.sum(
+                (normalized_parameters[candidates] - center) ** 2, axis=1
+            )
+            best_distance = squared_distances.min()
+            nearest = candidates[np.isclose(squared_distances, best_distance)]
+            chosen = nearest[np.argmin(ranks[nearest])]
+        selected.append(int(chosen))
+        available[chosen] = False
+    return selected
+
+
 def validation_suite_spec(
     task_name: str,
     trial_count: int = 50,

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from Robot_simulation.reproducibility import (
+    environment_grid_episode_indices,
     episode_seed_plan,
     selected_episode_indices,
     stable_hash,
@@ -58,6 +59,27 @@ class ReproducibilityHelpersTest(unittest.TestCase):
             for method in ("VanillaFM", "DP", "NGFM"):
                 received = selected_episode_indices(1000, training_seed, 160)
                 self.assertEqual(received, selections[160], method)
+
+    def test_environment_grid_selection_is_sparse_and_deterministic(self):
+        parameters = np.stack(
+            np.unravel_index(np.arange(27), (3, 3, 3)), axis=1
+        ).astype(np.float64)
+        expected = np.floor(np.arange(20) * 27 / 20).astype(int).tolist()
+
+        selected = environment_grid_episode_indices(parameters, 1000, 20)
+
+        self.assertEqual(selected, expected)
+        self.assertEqual(
+            environment_grid_episode_indices(parameters, 1000, 20), selected
+        )
+        self.assertEqual(len(selected), len(set(selected)))
+
+    def test_environment_grid_selection_requires_two_bins_per_dimension(self):
+        parameters = np.stack(
+            np.unravel_index(np.arange(8), (2, 2, 2)), axis=1
+        ).astype(np.float64)
+        with self.assertRaisesRegex(ValueError, r"at least 2 \*\* 3 = 8"):
+            environment_grid_episode_indices(parameters, 1000, 7)
 
     def test_validation_spec_is_method_and_training_seed_independent(self):
         expected = validation_suite_spec("two_arm", 50)
