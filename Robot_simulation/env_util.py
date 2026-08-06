@@ -67,6 +67,32 @@ def get_trajectory_sample_step(
     return sample_step
 
 
+def _rollout_history_sample_indices(
+    num_control_steps: int,
+    observation_horizon: int,
+    sample_step: int,
+) -> tuple[int, ...]:
+    """Return query-aligned control steps to retain as observation history.
+
+    The final executed control step is the current observation. Earlier retained
+    observations are spaced by ``sample_step`` simulator steps so rollout uses
+    the same temporal spacing as the downsampled training windows.
+    """
+    if num_control_steps <= 0:
+        return ()
+    if observation_horizon <= 0:
+        raise ValueError("observation_horizon must be positive")
+    if sample_step <= 0:
+        raise ValueError("sample_step must be positive")
+
+    first_index = num_control_steps - 1 - (observation_horizon - 1) * sample_step
+    return tuple(
+        index
+        for index in range(first_index, num_control_steps, sample_step)
+        if index >= 0
+    )
+
+
 def normalize_policy_data(q: np.ndarray, normalization_stats: dict[str, np.ndarray]) -> np.ndarray:
     q = np.asarray(q, dtype=np.float32)
     if "min" in normalization_stats:
@@ -379,10 +405,36 @@ def _state_policy_env_worker(
                 action_representation,
             )
 
+            history_sample_step = get_trajectory_sample_step(
+                recorded_control_freq,
+                trajectory_control_freq,
+            )
+            history_sample_indices = set(
+                _rollout_history_sample_indices(
+                    len(q_low),
+                    observation_horizon,
+                    history_sample_step,
+                )
+            )
+
             done = False
-            for q in q_low:
+            for control_step, q in enumerate(q_low):
                 _, _, done, _ = env.step(_to_action_from_q(q, task_name, action_representation, env))
                 executed.append(q.copy())
+                if control_step in history_sample_indices:
+                    q_history.append(_current_robot_q(env, task_name, action_representation))
+                    dynamic_history.append(
+                        get_environment_state(env, task_name)
+                        if include_environment_state
+                        else np.zeros((0,), dtype=np.float32)
+                    )
+                    q_history = q_history[-observation_horizon:]
+                    dynamic_history = dynamic_history[-observation_horizon:]
+                    if observation_type == "vision":
+                        image_history.append(
+                            capture_camera_views(env, camera_names, image_width, image_height)
+                        )
+                        image_history = image_history[-observation_horizon:]
                 if done or _state_policy_success(env, task_name):
                     break
 
@@ -399,17 +451,6 @@ def _state_policy_env_worker(
                 })
                 break
 
-            q_history.append(_current_robot_q(env, task_name, action_representation))
-            dynamic_history.append(
-                get_environment_state(env, task_name)
-                if include_environment_state
-                else np.zeros((0,), dtype=np.float32)
-            )
-            q_history = q_history[-observation_horizon:]
-            dynamic_history = dynamic_history[-observation_horizon:]
-            if observation_type == "vision":
-                image_history.append(capture_camera_views(env, camera_names, image_width, image_height))
-                image_history = image_history[-observation_horizon:]
             cond, _ = _condition_from_env(
                 env,
                 task_name,
