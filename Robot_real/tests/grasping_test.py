@@ -257,8 +257,8 @@ def chunk_metrics(
     predicted_open = prefix[:, -1] >= gripper_threshold
     target_closed = target_prefix[:, -1] < gripper_threshold
     false_open = predicted_open & target_closed
-    arm_prediction = prediction[:, :-1]
-    arm_target = target[:, :-1]
+    arm_prediction = prefix[:, :-1]
+    arm_target = target_prefix[:, :-1]
     second = np.diff(arm_prediction, n=2, axis=0)
     return {
         "predicted_open_in_executed_prefix": bool(np.any(predicted_open)),
@@ -581,6 +581,19 @@ def run_self_tests() -> None:
     assert metrics["false_open_step_count"] == 2
     assert metrics["arm_mean_second_difference_l2"] == 0.0
     assert metrics["arm_first_action_state_jump_l2"] == 0.0
+
+    suffix_only_jitter = np.zeros((32, 3), dtype=np.float64)
+    suffix_only_jitter[16:, 0] = np.tile([0.0, 1.0], 8)
+    prefix_metrics = chunk_metrics(
+        suffix_only_jitter,
+        np.zeros_like(suffix_only_jitter),
+        np.zeros(3),
+        gripper_threshold=levels.threshold,
+        execution_horizon=16,
+        guard_steps=2,
+    )
+    assert prefix_metrics["arm_mean_second_difference_l2"] == 0.0
+    assert prefix_metrics["arm_mae"] == 0.0
 
     mocked = []
     for method in METHOD_SPECS:

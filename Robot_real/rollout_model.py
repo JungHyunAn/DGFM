@@ -24,6 +24,23 @@ GRIPPER_POSITION_NAME = "gripper_position"
 FINGER_JOINT_PAIR = ("fr3_finger_joint1", "fr3_finger_joint2")
 
 
+def normalize_proprioception(
+    joints: torch.Tensor,
+    stats: dict[str, torch.Tensor],
+) -> torch.Tensor:
+    """Apply the state transform stored in a real-policy checkpoint."""
+    if "min" in stats:
+        unit_normalized = torch.clamp(
+            (joints - stats["min"]) / stats["range"], 0.0, 1.0
+        )
+        if "normalization_mask" in stats:
+            return torch.where(
+                stats["normalization_mask"].bool(), unit_normalized, joints
+            )
+        return 2.0 * unit_normalized - 1.0
+    return (joints - stats["mean"]) / stats["std"]
+
+
 def _prepare_rgb_image(image: ImageInput, image_size: int) -> np.ndarray:
     """Load/resize one RGB image to the representation used during training."""
     if isinstance(image, (str, Path)):
@@ -245,19 +262,9 @@ class RealRobotPolicy:
             joints = torch.cat(
                 (joints[:, :-1], joints[:, -1:].repeat(1, 2)), dim=-1
             )
-        if "min" in self.state_normalization:
-            normalized_joints = torch.clamp(
-                (2.0 / self.state_normalization["range"])
-                * (joints - self.state_normalization["min"])
-                - 1.0,
-                -1.0,
-                1.0,
-            ).unsqueeze(0)
-        else:
-            normalized_joints = (
-                (joints - self.state_normalization["mean"])
-                / self.state_normalization["std"]
-            ).unsqueeze(0)
+        normalized_joints = normalize_proprioception(
+            joints, self.state_normalization
+        ).unsqueeze(0)
         condition = make_condition(
             self.encoder,
             image_batch,

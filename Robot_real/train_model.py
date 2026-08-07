@@ -24,6 +24,7 @@ from Robot_real.dataset_utils import (
     compute_joint_stats,
     demo_subset_dataset,
     load_aligned_demos,
+    make_gripper_only_proprioception_stats,
     normalize_joint_angles,
     select_train_validation_demos,
 )
@@ -525,6 +526,7 @@ def _checkpoint_payload(
         "observation_dt_sec",
         "image_size",
         "use_gripper",
+        "proprioception_normalization",
         "feature_proj_dim",
         "condition_embed_dim",
         "num_convs_per_block",
@@ -602,6 +604,17 @@ def _checkpoint_payload(
         gripper_action_source=(
             TELEOP_ACTION_GRIPPER_COLUMN if config.get("use_gripper") else None
         ),
+        gripper_state_representation=(
+            "measured_width" if config.get("use_gripper") else None
+        ),
+        gripper_action_representation=(
+            "continuous_target_width" if config.get("use_gripper") else None
+        ),
+        gripper_proprioception_bounds_source=(
+            "training_state_min_max"
+            if config.get("proprioception_normalization") == "gripper_0_1"
+            else None
+        ),
     )
     return {
         "model_state_dict": model_state,
@@ -637,6 +650,20 @@ def train(config: dict[str, Any]) -> Path:
         f"val_demos={[demo.name for demo in val_demos]}"
     )
     state_stats = compute_joint_stats(train_demos, source="state")
+    proprioception_normalization = config.get("proprioception_normalization", "all")
+    if proprioception_normalization == "gripper_0_1":
+        state_stats = make_gripper_only_proprioception_stats(
+            state_stats, train_demos[0].state_joint_names
+        )
+        print(
+            "Proprioception normalization: arm joints remain raw radians; "
+            "gripper coordinates map to [0, 1]"
+        )
+    elif proprioception_normalization != "all":
+        raise ValueError(
+            "proprioception_normalization must be 'all' or 'gripper_0_1', got "
+            f"{proprioception_normalization!r}"
+        )
     action_stats = compute_joint_stats(train_demos, source="action")
     train_dataset = ActionChunkDataset(
         train_demos,

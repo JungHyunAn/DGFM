@@ -27,58 +27,106 @@ Datasets are expected under `Robot_real/real_dataset`:
     realsense/realsense_2/    # wrist view
 
 {task}_trajectory/<rollout timestamp>/
-    teleop_action_joint.csv    # legacy/sweep/peg-in-hole format
-    right_arm_joints.csv       # pick-and-place arm positions
-    right_arm_gripper.csv      # pick-and-place finger positions
+    teleop_state_joint.csv     # measured arm joints and gripper_width
+    teleop_action_joint.csv    # commanded arm joints and gripper_target_width
+
+# Legacy pick-and-place format:
+    right_arm_joints.csv       # measured arm positions
+    right_arm_gripper.csv      # measured finger positions
 ```
 
 Camera rollouts and trajectory rollouts are paired in timestamp-folder order.
-Each 10 Hz camera timestamp is matched to the closest arm-joint sample. Camera
-frames outside the trajectory recording's time span are discarded, and matching
-fails if the nearest arm-joint sample is more than 50 ms away. The pick-and-place
-gripper position is linearly interpolated at the camera timestamps because its
+For the preferred teleoperation format, each 10 Hz camera timestamp is matched
+to the nearest state and action samples. Camera frames outside their shared time
+span are discarded, and matching fails if either nearest sample is more than
+50 ms away. In the legacy pick-and-place format, arm joints use nearest-sample
+matching and the measured gripper position is linearly interpolated because its
 CSV can have a different sampling phase.
 
 Each training example contains:
 
 - Current front and wrist RGB images, resized to `224 x 224`.
-- Current joint angles.
-- The next 16 absolute joint-position targets at the camera rate (10 Hz).
+- A history of current proprioceptive states.
+- The configured action horizon of absolute joint-position targets at 10 Hz.
 
 ### Gripper selection
 
 The `use_gripper` setting controls which coordinates become part of the current
 joint state and every timestep of the target action chunk:
 
-- With `use_gripper: false`, gripper/finger coordinates are excluded. For
-  pick-and-place, only the seven positions in `right_arm_joints.csv` are loaded,
-  so `joint_state` has shape `(7,)` and each action chunk has shape `(16, 7)`.
-  `right_arm_gripper.csv` is not required or read.
-- With `use_gripper: true`, pick-and-place still gets its seven arm positions
-  from `right_arm_joints.csv`, then appends one `gripper_position`. This value is
-  the mean of `finger_joint1_position` and `finger_joint2_position` from
-  `right_arm_gripper.csv`. Arm positions are matched to the nearest samples and
-  the gripper position is linearly interpolated at each camera timestamp, so
-  `joint_state` has shape `(8,)` and each action chunk has shape `(16, 8)`.
+- With `use_gripper: false`, gripper/finger coordinates are excluded, leaving
+  seven arm coordinates in both state and action.
+- With `use_gripper: true` and the preferred teleoperation format, the state is
+  the seven measured arm positions from `teleop_state_joint.csv` followed by
+  its continuous `gripper_width`. The action is the seven commanded arm targets
+  from `teleop_action_joint.csv` followed by its continuous
+  `gripper_target_width`. State and action therefore both have eight coordinates.
+- With `use_gripper: true` and the legacy pick-and-place format, one
+  `gripper_position` is appended to the seven arm positions. It is the mean of
+  `finger_joint1_position` and `finger_joint2_position` from
+  `right_arm_gripper.csv`. Because this format has no separate state/action
+  recordings, its aligned measured trajectory is also copied as the action
+  target.
 
 For the legacy sweep and peg-in-hole trajectory format, `use_gripper: true`
 retains all coordinates recorded in `teleop_action_joint.csv`, while `false`
 removes coordinates whose joint name contains `finger`.
 
-The selected coordinates are used consistently for normalization, model input,
-training targets, checkpoint metadata, and rollout output. At inference time,
-the current joint vector must match `policy.joint_names` exactly in both length
-and order.
+The selected coordinates are used consistently for model input, training
+targets, checkpoint metadata, and rollout output. At inference time, the
+current joint vector must match `policy.joint_names` exactly in both length and
+order.
 
-Joint angles are normalized independently to `[-1, 1]` using the minimum and
-maximum values from the selected training demonstrations. The checkpoint stores
-the per-joint `min`, `max`, and `range` needed for inference.
+### State and action normalization
+
+A policy trained with `use_gripper: false` has seven-dimensional state and action
+vectors. With the existing no-gripper configs, all seven model-state arm angles
+and all seven action targets are independently min-max normalized to `[-1, 1]`
+using training data statistics:
+
+```text
+model state (7D)
+  normalize_to_-1_1([measured_q1, ..., measured_q7])
+
+action target at each chunk step (7D)
+  normalize_to_-1_1([target_q1, ..., target_q7])
+```
+
+The pick-and-place configs set
+`proprioception_normalization: "gripper_0_1"`. Their model tensors have different
+state and action transforms by design:
+
+```text
+proprioceptive state (8D)
+  [q1, ..., q7, clip((measured_gripper_width - grip_min) /
+                       (grip_max - grip_min), 0, 1)]
+   raw radians       normalized with training-state gripper bounds
+
+action target at each chunk step (8D)
+  normalize_to_-1_1([target_q1, ..., target_q7, gripper_target_width])
+```
+
+Thus all output-action coordinates, including the continuous gripper target,
+are min-max normalized to `[-1, 1]` using action statistics from the selected
+training demonstrations. Arm proprioception is not normalized in this mode;
+the only normalized state coordinate is the current measured gripper width. Its
+minimum and maximum are fitted from the selected training demonstrations, and
+values outside that fitted interval are clipped to `[0, 1]`. The state contains
+no previous gripper measurement or command.
+
+Training computes and stores separate state and action statistics. At rollout,
+`RealRobotPolicy` applies the state transform above, samples a normalized action
+chunk, and denormalizes every action coordinate with the stored action
+statistics before returning it. Configs without `proprioception_normalization:
+"gripper_0_1"` retain the legacy behavior of min-max normalizing every state
+coordinate to `[-1, 1]`.
 
 ## Train a model
 
-Run training from the repository root. Configs are provided for `peg_in_hole`, `sweep`,
-and `pick_and_place`; swap the task prefix in the config filename to train a
-different real dataset.
+Run training from the repository root. The supplied peg-in-hole examples below
+disable the gripper and produce seven-dimensional policies. The
+pick-and-place configs enable the gripper and produce
+eight-dimensional policies.
 
 ### UniformFM
 
@@ -108,7 +156,25 @@ python -m Robot_real.train_model \
   --config Robot_real/real_config/pick_and_place_uniformfm_50.json
 ```
 
-To train the corresponding 25-demo variant:
+For the strict 8D pick-and-place contract documented above, use one of the
+25-demo pick-and-place configs:
+
+```bash
+python -m Robot_real.train_model \
+  --config Robot_real/real_config/pick_and_place_uniformfm_25.json
+
+python -m Robot_real.train_model \
+  --config Robot_real/real_config/pick_and_place_dgfmv2_25.json
+
+python -m Robot_real.train_model \
+  --config Robot_real/real_config/pick_and_place_diffusion_25.json
+```
+
+These settings apply when the models are retrained. Existing `.pt` files retain
+the normalization metadata with which they were originally trained and do not
+change merely because their JSON config was edited.
+
+To train the corresponding 25-demo peg-in-hole variant:
 
 ```bash
 python -m Robot_real.train_model \
@@ -158,31 +224,54 @@ import numpy as np
 from Robot_real.rollout_model import RealRobotPolicy
 
 
-policy = RealRobotPolicy(
-    "Robot_real/checkpoints/peg_in_hole_uniformfm.pt",
-    device="cuda",
-)
-
 # NumPy inputs must be RGB. OpenCV camera frames are normally BGR.
 front_bgr = front_camera.read()
 wrist_bgr = wrist_camera.read()
 front_rgb = cv2.cvtColor(front_bgr, cv2.COLOR_BGR2RGB)
 wrist_rgb = cv2.cvtColor(wrist_bgr, cv2.COLOR_BGR2RGB)
 
-current_joints = robot.get_joint_positions()
-action_chunk = policy.predict_action_chunk(
-    images=(front_rgb, wrist_rgb),
-    joint_angles=current_joints,
-)
 
-assert action_chunk.shape == (policy.horizon, policy.dof)
+# Policy without gripper: seven physical arm angles in radians.
+arm_policy = RealRobotPolicy(
+    "Robot_real/checkpoints/peg_in_hole_uniformfm_50.pt",
+    device="cuda",
+)
+arm_state = robot.get_arm_joint_positions()
+arm_action_chunk = arm_policy.predict_action_chunk(
+    images=(front_rgb, wrist_rgb),
+    joint_angles=arm_state,
+)
+assert arm_action_chunk.shape == (arm_policy.horizon, 7)
+
+# Policy with gripper: append the current physical gripper width in meters.
+gripper_policy = RealRobotPolicy(
+    "Robot_real/checkpoints/pick_and_place_uniformfm_25.pt",
+    device="cuda",
+)
+gripper_state = np.concatenate(
+    [robot.get_arm_joint_positions(), [robot.get_gripper_width()]]
+)
+gripper_action_chunk = gripper_policy.predict_action_chunk(
+    images=(front_rgb, wrist_rgb),
+    joint_angles=gripper_state,
+)
+assert gripper_action_chunk.shape == (gripper_policy.horizon, 8)
 ```
 
-The returned values are denormalized absolute joint positions, not deltas. For
-the default non-gripper model, the expected joint vector and output dimension
-are seven. A pick-and-place checkpoint trained with `use_gripper: true` expects
-the seven arm joints followed by the averaged `gripper_position`, for eight
-values total. `policy.joint_names` gives the required order.
+Pass physical values to both calls; do not pre-normalize them.
+
+- Without gripper, pass the seven current arm-joint angles in radians.
+  `arm_policy` uses its checkpoint state statistics internally and returns seven
+  denormalized absolute arm-joint targets.
+- With gripper, pass the seven current arm-joint angles followed by the current
+  measured total gripper width in meters. `gripper_policy` leaves the arm angles
+  raw for the model and normalizes only the gripper coordinate using the fitted
+  training-state bounds. It returns seven absolute arm-joint targets followed
+  by the continuous gripper target width.
+
+Both returned chunks contain physical absolute targets, not normalized values
+or delta commands. Use each policy’s `joint_names`, `dof`, and `horizon`
+properties rather than hard-coding the interface in a controller.
 
 For compatibility with checkpoints trained from `teleop_action_joint.csv`
 with two trailing Franka finger coordinates, rollout exposes the same
@@ -196,23 +285,23 @@ converted from OpenCV BGR to RGB automatically.
 
 ## Command-line inference
 
-For a smoke run without camera images or joint readings, only pass the checkpoint.
-Missing images are replaced with zero tensors and missing joints are replaced
-with a zero vector sized for the policy rollout interface:
+For a no-gripper smoke run without camera images or joint readings, only pass
+the checkpoint. Missing images are replaced with zero tensors, and missing
+joints are replaced with a zero vector sized for the policy rollout interface:
 
 ```bash
 python -m Robot_real.rollout_model \
   --checkpoint Robot_real/checkpoints/peg_in_hole_uniformfm_50.pt
 ```
 
-For a saved pair of images:
+For a with-gripper run using a saved image pair and physical 8D state:
 
 ```bash
 python -m Robot_real.rollout_model \
-  --checkpoint Robot_real/checkpoints/peg_in_hole_uniformfm.pt \
+  --checkpoint Robot_real/checkpoints/pick_and_place_uniformfm_25.pt \
   --front-image front.png \
   --wrist-image wrist.png \
-  --joint-angles q1 q2 q3 q4 q5 q6 q7
+  --joint-angles q1 q2 q3 q4 q5 q6 q7 gripper_width
 ```
 
 The command prints a JSON object containing `joint_names`, output shape, and the

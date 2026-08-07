@@ -1,7 +1,9 @@
 """Offline action-chunk smoothness comparison for real-robot policies.
 
-This module only reads recorded data and checkpoints.  It never imports a
-robot driver, creates a robot environment, or executes a predicted action.
+The primary comparison uses the first 16 predicted steps, matching the real
+controller execution prefix; full prediction metrics remain in the JSON output.
+This module only reads recorded data and checkpoints. It never imports a robot
+driver, creates a robot environment, or executes a predicted action.
 """
 
 from __future__ import annotations
@@ -30,8 +32,13 @@ from Robot_real.dataset_utils import (  # noqa: E402
     default_dataset_paths,
     denormalize_joint_angles,
     load_aligned_demos,
+    make_gripper_only_proprioception_stats,
+    normalize_joint_angles,
 )
-from Robot_real.rollout_model import RealRobotPolicy  # noqa: E402
+from Robot_real.rollout_model import (  # noqa: E402
+    RealRobotPolicy,
+    normalize_proprioception,
+)
 from Robot_real.train_model import set_seed  # noqa: E402
 
 
@@ -39,6 +46,7 @@ ROBOT_REAL_ROOT = REPOSITORY_ROOT / "Robot_real"
 CHECKPOINT_ROOT = ROBOT_REAL_ROOT / "checkpoints"
 CONFIG_ROOT = ROBOT_REAL_ROOT / "real_config"
 DEFAULT_OUTPUT_DIR = ROBOT_REAL_ROOT / "tests" / "smoothness_test_results"
+DEFAULT_EXECUTION_HORIZON = 16
 
 METHOD_SPECS = {
     "VanillaFM": {"uniformfm", "vanillafm", "fm"},
@@ -51,6 +59,8 @@ COMPARISON_METADATA_KEYS = (
     "observation_dt_sec",
     "image_size",
     "use_gripper",
+    "proprioception_normalization",
+    "gripper_proprioception_bounds_source",
     "camera_names",
     "state_joint_names",
     "action_joint_names",
@@ -67,6 +77,7 @@ CONFIG_VALIDATION_KEYS = (
     "observation_dt_sec",
     "image_size",
     "use_gripper",
+    "proprioception_normalization",
     "sampler_steps",
     "diffusion_steps",
     "diffusion_schedule",
@@ -475,6 +486,8 @@ def _serializable_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         "observation_dt_sec",
         "image_size",
         "use_gripper",
+        "proprioception_normalization",
+        "gripper_proprioception_bounds_source",
         "camera_names",
         "state_joint_names",
         "action_joint_names",
@@ -532,6 +545,13 @@ def run_comparison(args: argparse.Namespace) -> Path:
     )
     camera_dir, trajectory_dir, dataset_path = resolve_dataset(args.task_name, effective)
     reference = effective["VanillaFM"]
+    prediction_horizon = int(reference["horizon"])
+    execution_horizon = int(args.execution_horizon)
+    if execution_horizon > prediction_horizon:
+        raise ValueError(
+            f"execution_horizon={execution_horizon} exceeds "
+            f"prediction_horizon={prediction_horizon}"
+        )
     demos = load_aligned_demos(
         args.task_name,
         camera_dir=camera_dir,
@@ -566,7 +586,6 @@ def run_comparison(args: argparse.Namespace) -> Path:
                 f"expected {action_joint_names}"
             )
         starts = [sample["start"] for sample in samples]
-        execution_horizon = int(effective[method]["execution_horizon"])
         methods[method] = {
             "full_prediction": compute_smoothness_metrics(chunks, start_indices=starts),
             "executed_prefix": compute_smoothness_metrics(
@@ -578,9 +597,7 @@ def run_comparison(args: argparse.Namespace) -> Path:
             torch.cuda.empty_cache()
 
     assert action_joint_names is not None
-    print_summary(methods, action_joint_names, "full_prediction")
-    if reference["execution_horizon"] != reference["horizon"]:
-        print_summary(methods, action_joint_names, "executed_prefix")
+    print_summary(methods, action_joint_names, "executed_prefix")
 
     timestamp = datetime.now(timezone.utc)
     result = {
@@ -600,13 +617,9 @@ def run_comparison(args: argparse.Namespace) -> Path:
         "observation_fingerprints": [sample["fingerprint"] for sample in samples],
         "control_frequency_hz": 1.0 / float(reference["observation_dt_sec"]),
         "observation_horizon": int(reference["observation_horizon"]),
-        "prediction_horizon": int(reference["horizon"]),
-        "execution_horizon": int(reference["execution_horizon"]),
-        "execution_horizon_source": (
-            "checkpoint"
-            if raw_metadata["VanillaFM"].get("execution_horizon") is not None
-            else "no controller prefix configured; full prediction horizon used"
-        ),
+        "prediction_horizon": prediction_horizon,
+        "execution_horizon": execution_horizon,
+        "execution_horizon_source": "command_line_or_default",
         "action_representation": "joint_position",
         "action_dimension": len(action_joint_names),
         "joint_names": action_joint_names,
@@ -649,6 +662,13 @@ def run_self_tests() -> None:
     alternating_metrics = compute_smoothness_metrics(alternating)
     assert alternating_metrics["mean_second_difference_l2"] > 0.0
 
+    suffix_only_jitter = np.zeros((1, 32, 2), dtype=np.float64)
+    suffix_only_jitter[:, 16:, 0] = np.tile([0.0, 1.0], 8)
+    executed_metrics = compute_smoothness_metrics(suffix_only_jitter[:, :16])
+    full_metrics = compute_smoothness_metrics(suffix_only_jitter)
+    assert executed_metrics["mean_second_difference_l2"] == 0.0
+    assert full_metrics["mean_second_difference_l2"] > 0.0
+
     separated = np.asarray(
         [[[0.0], [1.0], [2.0]], [[100.0], [101.0], [102.0]]]
     )
@@ -671,6 +691,27 @@ def run_self_tests() -> None:
         compute_smoothness_metrics(physical)["mean_first_difference_l2"],
     )
 
+    mixed_stats = make_gripper_only_proprioception_stats(
+        {
+            "min": np.asarray([-2.0, -3.0, 0.02], dtype=np.float32),
+            "max": np.asarray([2.0, 3.0, 0.07], dtype=np.float32),
+            "range": np.asarray([4.0, 6.0, 0.05], dtype=np.float32),
+        },
+        ("arm_1", "arm_2", "gripper_position"),
+    )
+    raw_state = np.asarray([[1.5, -2.0, 0.04]], dtype=np.float32)
+    mixed_state = normalize_joint_angles(raw_state, mixed_stats)
+    assert np.allclose(mixed_state, [[1.5, -2.0, 0.4]])
+    assert np.allclose(denormalize_joint_angles(mixed_state, mixed_stats), raw_state)
+    rollout_stats = {
+        key: torch.as_tensor(value, dtype=torch.float32)
+        for key, value in mixed_stats.items()
+    }
+    rollout_state = normalize_proprioception(
+        torch.from_numpy(raw_state), rollout_stats
+    ).numpy()
+    assert np.allclose(rollout_state, mixed_state)
+
     def mocked_model(seed: int) -> np.ndarray:
         generator = np.random.default_rng(seed)
         return generator.normal(size=(3, 5, 2))
@@ -685,7 +726,7 @@ def run_self_tests() -> None:
     for _method in METHOD_SPECS:
         received.append([id(observation) for observation in shared_observations])
     assert received[0] == received[1] == received[2]
-    print("Smoothness self-tests passed (9 offline invariants; no robot initialized).")
+    print("Smoothness self-tests passed (11 offline invariants; no robot initialized).")
 
 
 def parse_args() -> argparse.Namespace:
@@ -694,6 +735,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training_demos", "--training-demos", type=int)
     parser.add_argument("--test_chunks", "--test-chunks", type=int, default=10)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--execution-horizon",
+        type=int,
+        default=DEFAULT_EXECUTION_HORIZON,
+        help="Predicted prefix evaluated as executed actions (default: 16).",
+    )
     parser.add_argument(
         "--device",
         default=("cuda" if torch.cuda.is_available() else "cpu"),
@@ -714,6 +761,8 @@ def parse_args() -> argparse.Namespace:
             parser.error("--training_demos must be positive")
         if args.test_chunks <= 0:
             parser.error("--test_chunks must be positive")
+        if args.execution_horizon < 3:
+            parser.error("--execution-horizon must be at least 3")
     return args
 
 

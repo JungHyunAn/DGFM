@@ -601,15 +601,46 @@ def compute_joint_stats(
     return {"min": joint_min, "max": joint_max, "range": joint_range}
 
 
+def make_gripper_only_proprioception_stats(
+    stats: dict[str, np.ndarray],
+    state_joint_names: Sequence[str],
+) -> dict[str, np.ndarray]:
+    """Keep arm proprioception raw while mapping the gripper to fitted [0, 1]."""
+    if "min" not in stats:
+        raise ValueError("Gripper-only proprioception requires min-max statistics")
+    coordinate_count = len(stats["min"])
+    if len(state_joint_names) != coordinate_count:
+        raise ValueError(
+            f"State schema has {len(state_joint_names)} names but statistics have "
+            f"{coordinate_count} coordinates"
+        )
+    normalization_mask = np.asarray(
+        [name == PICK_AND_PLACE_GRIPPER_NAME for name in state_joint_names],
+        dtype=bool,
+    )
+    if not normalization_mask.any():
+        raise ValueError(
+            "Gripper-only proprioception requested without a gripper coordinate"
+        )
+    result = {key: np.asarray(value).copy() for key, value in stats.items()}
+    result["normalization_mask"] = normalization_mask
+    return result
+
+
 def normalize_joint_angles(
     joints: np.ndarray,
     stats: dict[str, np.ndarray],
 ) -> np.ndarray:
-    """Normalize joint angles to [-1, 1], with legacy z-score support."""
+    """Normalize joint data, supporting selective raw/0-to-1 proprioception."""
     joints = np.asarray(joints, dtype=np.float32)
     if "min" in stats:
-        normalized = (2.0 / stats["range"]) * (joints - stats["min"]) - 1.0
-        return np.clip(normalized, -1.0, 1.0).astype(np.float32)
+        unit_normalized = np.clip(
+            (joints - stats["min"]) / stats["range"], 0.0, 1.0
+        )
+        if "normalization_mask" in stats:
+            mask = np.asarray(stats["normalization_mask"], dtype=bool)
+            return np.where(mask, unit_normalized, joints).astype(np.float32)
+        return (2.0 * unit_normalized - 1.0).astype(np.float32)
     return ((joints - stats["mean"]) / stats["std"]).astype(np.float32)
 
 
@@ -620,7 +651,13 @@ def denormalize_joint_angles(
     """Restore normalized model outputs to physical joint angles."""
     joints = np.asarray(joints, dtype=np.float32)
     if "min" in stats:
-        return ((joints + 1.0) * 0.5 * stats["range"] + stats["min"]).astype(np.float32)
+        if "normalization_mask" in stats:
+            mask = np.asarray(stats["normalization_mask"], dtype=bool)
+            denormalized = joints * stats["range"] + stats["min"]
+            return np.where(mask, denormalized, joints).astype(np.float32)
+        return ((joints + 1.0) * 0.5 * stats["range"] + stats["min"]).astype(
+            np.float32
+        )
     return (joints * stats["std"] + stats["mean"]).astype(np.float32)
 
 

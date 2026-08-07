@@ -8,6 +8,7 @@
   "checkpoint_path": "Robot_real/checkpoints/pick_and_place_uniformfm_25.pt",
   "dataset_size": 25,
   "use_gripper": true,
+  "proprioception_normalization": "gripper_0_1",
   "horizon": 32,
   "observation_horizon": 2,
   "observation_dt_sec": 0.1,
