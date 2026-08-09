@@ -251,6 +251,7 @@ def chunk_metrics(
     gripper_threshold: float,
     execution_horizon: int,
     guard_steps: int,
+    open_wait_steps: int,
 ) -> dict[str, Any]:
     prediction = np.asarray(prediction, dtype=np.float64)
     target = np.asarray(target, dtype=np.float64)
@@ -264,12 +265,18 @@ def chunk_metrics(
         raise ValueError("execution_horizon must lie within the predicted chunk")
     if guard_steps < 0 or guard_steps >= execution_horizon:
         raise ValueError("guard_steps must lie in [0, execution_horizon)")
+    if open_wait_steps <= 0 or open_wait_steps > execution_horizon:
+        raise ValueError("open_wait_steps must lie in [1, execution_horizon]")
 
     prefix = prediction[:execution_horizon]
     target_prefix = target[:execution_horizon]
     predicted_open = prefix[:, -1] >= gripper_threshold
     target_closed = target_prefix[:, -1] < gripper_threshold
     false_open = predicted_open & target_closed
+    false_open_after_wait = any(
+        _sustained(false_open, index, True, open_wait_steps)
+        for index in range(len(false_open))
+    )
     arm_prediction = prefix[:, :-1]
     arm_target = target_prefix[:, :-1]
     second = np.diff(arm_prediction, n=2, axis=0)
@@ -278,6 +285,7 @@ def chunk_metrics(
         "predicted_open_after_guard": bool(np.any(predicted_open[guard_steps:])),
         "false_open_in_executed_prefix": bool(np.any(false_open)),
         "false_open_after_guard": bool(np.any(false_open[guard_steps:])),
+        "false_open_after_switch_wait": bool(false_open_after_wait),
         "false_open_step_count": int(false_open.sum()),
         "target_closed_step_count": int(target_closed.sum()),
         "arm_mean_second_difference_l2": float(
@@ -300,6 +308,7 @@ def _run_policy(
     levels: GripperLevels,
     execution_horizon: int,
     guard_steps: int,
+    open_wait_steps: int,
 ) -> tuple[list[dict[str, Any]], tuple[str, ...]]:
     records: list[dict[str, Any]] = []
     action_joint_names: tuple[str, ...] | None = None
@@ -322,6 +331,7 @@ def _run_policy(
                     gripper_threshold=levels.threshold,
                     execution_horizon=execution_horizon,
                     guard_steps=guard_steps,
+                    open_wait_steps=open_wait_steps,
                 )
                 records.append(
                     {
@@ -358,6 +368,7 @@ def summarize_records(
         "predicted_open_after_guard",
         "false_open_in_executed_prefix",
         "false_open_after_guard",
+        "false_open_after_switch_wait",
     )
     scalar_metrics = (
         "false_open_step_count",
@@ -395,11 +406,13 @@ def print_summary(
     summary: dict[str, dict[str, dict[str, Any]]],
     *,
     offset_sec: float,
+    open_wait_steps: int,
 ) -> None:
     label = _offset_label(offset_sec)
     print(f"\nCarry diagnostic at close {label}")
     print(
         f"{'Method':<12} {'false-open/exec':>15} {'false-open/>guard':>18} "
+        f"{f'false-open/{open_wait_steps}wait':>18} "
         f"{'mean ||delta2 q||':>20} {'first jump':>14} {'arm MAE':>12}"
     )
     for method in METHOD_SPECS:
@@ -409,6 +422,7 @@ def print_summary(
             f"{method:<12} "
             f"{metrics['false_open_in_executed_prefix_count']:>7}/{chunks:<7} "
             f"{metrics['false_open_after_guard_count']:>9}/{chunks:<8} "
+            f"{metrics['false_open_after_switch_wait_count']:>9}/{chunks:<8} "
             f"{metrics['mean_arm_mean_second_difference_l2']:>20.8f} "
             f"{metrics['mean_arm_first_action_state_jump_l2']:>14.8f} "
             f"{metrics['mean_arm_mae']:>12.8f}"
@@ -473,6 +487,7 @@ def run_diagnostic(args: argparse.Namespace) -> Path:
             levels=levels,
             execution_horizon=args.execution_horizon,
             guard_steps=args.guard_steps,
+            open_wait_steps=args.open_wait_steps,
         )
         if joint_names is None:
             joint_names = method_joint_names
@@ -484,7 +499,11 @@ def run_diagnostic(args: argparse.Namespace) -> Path:
 
     summary = summarize_records(all_records, args.offsets_sec)
     carry_offset = min(args.offsets_sec, key=lambda value: abs(value - 0.8))
-    print_summary(summary, offset_sec=carry_offset)
+    print_summary(
+        summary,
+        offset_sec=carry_offset,
+        open_wait_steps=args.open_wait_steps,
+    )
 
     carry_samples = [
         sample
@@ -504,6 +523,7 @@ def run_diagnostic(args: argparse.Namespace) -> Path:
         "prediction_horizon": horizon,
         "execution_horizon": int(args.execution_horizon),
         "guard_steps": int(args.guard_steps),
+        "open_wait_steps": int(args.open_wait_steps),
         "sample_selection": "target_gripper_closed_for_full_prediction_horizon",
         "observation_horizon": int(reference["observation_horizon"]),
         "observation_dt_sec": float(reference["observation_dt_sec"]),
@@ -592,13 +612,28 @@ def run_self_tests() -> None:
         gripper_threshold=levels.threshold,
         execution_horizon=4,
         guard_steps=2,
+        open_wait_steps=3,
     )
     assert metrics["predicted_open_in_executed_prefix"]
     assert metrics["false_open_in_executed_prefix"]
     assert not metrics["predicted_open_after_guard"]
+    assert not metrics["false_open_after_switch_wait"]
     assert metrics["false_open_step_count"] == 2
     assert metrics["arm_mean_second_difference_l2"] == 0.0
     assert metrics["arm_first_action_state_jump_l2"] == 0.0
+
+    persistent_prediction = target.copy()
+    persistent_prediction[:3, -1] = 0.08
+    persistent_metrics = chunk_metrics(
+        persistent_prediction,
+        target,
+        np.zeros(3),
+        gripper_threshold=levels.threshold,
+        execution_horizon=4,
+        guard_steps=2,
+        open_wait_steps=3,
+    )
+    assert persistent_metrics["false_open_after_switch_wait"]
 
     suffix_only_jitter = np.zeros((32, 3), dtype=np.float64)
     suffix_only_jitter[16:, 0] = np.tile([0.0, 1.0], 8)
@@ -609,6 +644,7 @@ def run_self_tests() -> None:
         gripper_threshold=levels.threshold,
         execution_horizon=16,
         guard_steps=2,
+        open_wait_steps=3,
     )
     assert prefix_metrics["arm_mean_second_difference_l2"] == 0.0
     assert prefix_metrics["arm_mae"] == 0.0
@@ -624,6 +660,7 @@ def run_self_tests() -> None:
                     "predicted_open_after_guard": False,
                     "false_open_in_executed_prefix": False,
                     "false_open_after_guard": False,
+                    "false_open_after_switch_wait": False,
                     "false_open_step_count": 0,
                     "arm_mean_second_difference_l2": 0.0,
                     "arm_first_action_state_jump_l2": 0.0,
@@ -640,6 +677,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--training-demos", type=int, default=25)
     parser.add_argument("--execution-horizon", type=int, default=16)
     parser.add_argument("--guard-steps", type=int, default=2)
+    parser.add_argument("--open-wait-steps", type=int, default=3)
     parser.add_argument("--minimum-run", type=int, default=3)
     parser.add_argument("--offsets-sec", type=float, nargs="+", default=DEFAULT_OFFSETS_SEC)
     parser.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
@@ -657,6 +695,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--execution-horizon must be positive")
     if args.guard_steps < 0 or args.guard_steps >= args.execution_horizon:
         parser.error("--guard-steps must be in [0, execution-horizon)")
+    if args.open_wait_steps <= 0 or args.open_wait_steps > args.execution_horizon:
+        parser.error("--open-wait-steps must be in [1, execution-horizon]")
     if args.minimum_run <= 0:
         parser.error("--minimum-run must be positive")
     if not args.offsets_sec:
