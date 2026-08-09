@@ -1,9 +1,9 @@
 """Offline grasp/carry diagnostic for real pick-and-place policies.
 
-The script samples identical held-out observations around the demonstrated
-gripper-close transition, asks every policy for an action chunk, and measures
-false gripper reopen commands plus arm-chunk smoothness.  It only reads data
-and checkpoints; it never imports a robot driver or executes an action.
+The script samples identical held-out observations during demonstrated closed
+gripper holds, asks every policy for an action chunk, and measures false gripper
+reopen commands plus arm-chunk smoothness.  It only reads data and checkpoints;
+it never imports a robot driver or executes an action.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ from Robot_real.train_model import set_seed  # noqa: E402
 
 
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "grasping_task_results"
-DEFAULT_OFFSETS_SEC = (-0.2, 0.0, 0.2, 0.8)
+DEFAULT_OFFSETS_SEC = (0.0, 0.2, 0.8)
 DEFAULT_SEEDS = (0, 1, 2)
 
 
@@ -152,6 +152,14 @@ def _offset_label(offset_sec: float) -> str:
     return f"{offset_sec:+.1f}s"
 
 
+def is_closed_target_chunk(target: np.ndarray, threshold: float) -> bool:
+    """Return whether every gripper target in a full action chunk is closed."""
+    target = np.asarray(target)
+    if target.ndim != 2 or target.shape[0] == 0 or target.shape[1] == 0:
+        raise ValueError(f"Expected a non-empty (H, D) target chunk, got {target.shape}")
+    return bool(np.all(target[:, -1] < threshold))
+
+
 def build_grasp_samples(
     demos: Sequence[Any],
     demo_indices: Sequence[int],
@@ -211,6 +219,11 @@ def build_grasp_samples(
             ]
             state_history = demo.states[observation_indices].copy()
             target = demo.actions[start : start + horizon].copy()
+            if not is_closed_target_chunk(target, levels.threshold):
+                raise ValueError(
+                    f"{demo.name}: offset {_offset_label(offset_sec)} does not keep "
+                    f"the gripper target closed for the full {horizon}-step chunk"
+                )
             samples.append(
                 {
                     "demo_index": int(demo_index),
@@ -386,7 +399,7 @@ def print_summary(
     label = _offset_label(offset_sec)
     print(f"\nCarry diagnostic at close {label}")
     print(
-        f"{'Method':<12} {'open/exec':>12} {'open/>guard':>13} "
+        f"{'Method':<12} {'false-open/exec':>15} {'false-open/>guard':>18} "
         f"{'mean ||delta2 q||':>20} {'first jump':>14} {'arm MAE':>12}"
     )
     for method in METHOD_SPECS:
@@ -394,8 +407,8 @@ def print_summary(
         chunks = metrics["chunks"]
         print(
             f"{method:<12} "
-            f"{metrics['predicted_open_in_executed_prefix_count']:>4}/{chunks:<4} "
-            f"{metrics['predicted_open_after_guard_count']:>5}/{chunks:<4} "
+            f"{metrics['false_open_in_executed_prefix_count']:>7}/{chunks:<7} "
+            f"{metrics['false_open_after_guard_count']:>9}/{chunks:<8} "
             f"{metrics['mean_arm_mean_second_difference_l2']:>20.8f} "
             f"{metrics['mean_arm_first_action_state_jump_l2']:>14.8f} "
             f"{metrics['mean_arm_mae']:>12.8f}"
@@ -491,6 +504,7 @@ def run_diagnostic(args: argparse.Namespace) -> Path:
         "prediction_horizon": horizon,
         "execution_horizon": int(args.execution_horizon),
         "guard_steps": int(args.guard_steps),
+        "sample_selection": "target_gripper_closed_for_full_prediction_horizon",
         "observation_horizon": int(reference["observation_horizon"]),
         "observation_dt_sec": float(reference["observation_dt_sec"]),
         "dataset_path": dataset_path,
@@ -563,6 +577,10 @@ def run_self_tests() -> None:
         minimum_run=3,
     )
     assert event == GraspEvent(close_index=2, release_index=5)
+    assert is_closed_target_chunk(np.zeros((4, 3)), levels.threshold)
+    opening_target = np.zeros((4, 3))
+    opening_target[-1, -1] = 0.08
+    assert not is_closed_target_chunk(opening_target, levels.threshold)
 
     target = np.zeros((5, 3), dtype=np.float64)
     prediction = target.copy()
