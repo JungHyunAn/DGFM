@@ -60,26 +60,37 @@ class ReproducibilityHelpersTest(unittest.TestCase):
                 received = selected_episode_indices(1000, training_seed, 160)
                 self.assertEqual(received, selections[160], method)
 
-    def test_environment_grid_selection_is_sparse_and_deterministic(self):
-        parameters = np.stack(
+    def test_environment_grid_selection_is_nested_balanced_and_deterministic(self):
+        cells = np.stack(
             np.unravel_index(np.arange(27), (3, 3, 3)), axis=1
         ).astype(np.float64)
-        expected = np.floor(np.arange(20) * 27 / 20).astype(int).tolist()
+        parameters = np.repeat(cells, 4, axis=0)
 
-        selected = environment_grid_episode_indices(parameters, 1000, 20)
+        selections = {
+            budget: environment_grid_episode_indices(parameters, 1000, budget)
+            for budget in (20, 40, 80)
+        }
 
-        self.assertEqual(selected, expected)
         self.assertEqual(
-            environment_grid_episode_indices(parameters, 1000, 20), selected
+            environment_grid_episode_indices(parameters, 1000, 80),
+            selections[80],
         )
-        self.assertEqual(len(selected), len(set(selected)))
+        self.assertLessEqual(set(selections[20]), set(selections[40]))
+        self.assertLessEqual(set(selections[40]), set(selections[80]))
+        for budget, selected in selections.items():
+            self.assertEqual(len(selected), len(set(selected)))
+            selected_cells = np.asarray(selected) // 4
+            counts = np.bincount(selected_cells, minlength=27)
+            self.assertLessEqual(counts.max() - counts.min(), 1, budget)
 
-    def test_environment_grid_selection_requires_two_bins_per_dimension(self):
+    def test_environment_grid_selection_validates_fixed_bin_count(self):
         parameters = np.stack(
             np.unravel_index(np.arange(8), (2, 2, 2)), axis=1
         ).astype(np.float64)
-        with self.assertRaisesRegex(ValueError, r"at least 2 \*\* 3 = 8"):
-            environment_grid_episode_indices(parameters, 1000, 7)
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            environment_grid_episode_indices(
+                parameters, 1000, 7, bins_per_dimension=0
+            )
 
     def test_validation_spec_is_method_and_training_seed_independent(self):
         expected = validation_suite_spec("two_arm", 50)
