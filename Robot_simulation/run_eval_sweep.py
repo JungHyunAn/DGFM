@@ -29,7 +29,7 @@ from Robot_simulation.reproducibility import (
 METHODS = ("UniformFM", "DP", "DGFMv2")
 FINAL_TASKS = ("door", "two_arm")
 FINAL_TRAINING_SEEDS = (1000, 2000, 3000)
-EXPERIMENT_VERSION = "clean_v1"
+EXPERIMENT_VERSION = "clean_v2"
 PREFERRED_DGFM_ROOT = Path("/PublicHDD/ajh916/DGFM")
 FALLBACK_DGFM_ROOT = Path(__file__).resolve().parents[1]
 
@@ -86,7 +86,7 @@ SLEEP_SECONDS_BETWEEN_RUNS = 500
 
 SHARED_CONFIG: dict[str, Any] = {
     "use_ema": True,
-    "results_path": dgfm_path("Robot_simulation/eval_results_clean_v1/{task_name}/sweep_{seed}"),
+    "results_path": dgfm_path("Robot_simulation/eval_results_clean_v2/{task_name}/sweep_{seed}"),
     "device": "cuda",
     "n_t": 1,
     "learning_rate": 0.0001,
@@ -105,7 +105,7 @@ SHARED_CONFIG: dict[str, Any] = {
     "observation_horizon": 2,
     "observation_type": "vision",
     "vision_batch_size": 500,
-    "condition_embed_dim": 256,
+    "condition_embed_dim": 512,
     "vision_finetune": True,
     "vision_finetune_mode": "layer4",
     "vision_train_bn": False,
