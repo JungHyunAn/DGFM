@@ -171,7 +171,8 @@ from Robot_simulation.environments.heuristics_util import (
 from Robot_simulation import DEFAULT_DATASET_DIR, DEFAULT_RECORDS_DIR
 from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME, DP_EVAL_SAMPLING_MODE, TASK_ENVIRONMENT_RANGES, dataset_fingerprint,
-    environment_grid_episode_indices, evaluation_policy_seed_plan, git_commit,
+    environment_grid_episode_order, environment_grid_sampler_metadata,
+    evaluation_policy_seed_plan, git_commit,
     stable_hash, summarize_validation_records, validation_suite_spec,
 )
 
@@ -607,10 +608,22 @@ def train_and_eval_model(
         all_environment_parameters = np.asarray([
             data_grp[ep]["environment_parameters"]["values"][:] for ep in ep_keys
         ])
-        selected_idx = np.asarray(
-            environment_grid_episode_indices(all_environment_parameters, seed, N),
-            dtype=np.int64,
+        full_episode_order = environment_grid_episode_order(
+            all_environment_parameters, task_name, seed
         )
+        if N > len(full_episode_order):
+            raise ValueError(
+                f"Requested {N} demonstrations, but the dataset contains only "
+                f"{len(full_episode_order)} episodes"
+            )
+        selected_idx = np.asarray(full_episode_order[:N], dtype=np.int64)
+        episode_sampler_metadata = environment_grid_sampler_metadata(
+            all_environment_parameters, task_name, seed, full_episode_order
+        )
+        episode_sampler_metadata["dataset_base_seed"] = dataset_generation_metadata.get(
+            "dataset_base_seed"
+        )
+        episode_sampler_metadata["selected_prefix_length"] = int(N)
         selected_ep_keys = [ep_keys[i] for i in selected_idx]
 
         if not selected_ep_keys:
@@ -1628,6 +1641,7 @@ def train_and_eval_model(
         output.update(validation_suite)
         output.update(dataset_identity)
         output["selected_episode_indices"] = [int(index) for index in selected_idx]
+        output["episode_sampler"] = episode_sampler_metadata
         output["dataset_generation_metadata"] = dataset_generation_metadata
         output["environment_configuration"] = TASK_ENVIRONMENT_RANGES[task_name]
         output["experiment_version"] = experiment_version

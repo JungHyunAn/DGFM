@@ -22,7 +22,7 @@ from typing import Any
 
 from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME, DP_EVAL_SAMPLING_MODE, TASK_EVAL_BASE_SEEDS, dataset_fingerprint,
-    environment_grid_episode_indices, stable_hash,
+    environment_grid_episode_order, environment_grid_sampler_metadata, stable_hash,
 )
 
 
@@ -402,10 +402,21 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
                 data[key]["environment_parameters"]["values"][:]
                 for key in episode_keys
             ])
-            expected_indices = environment_grid_episode_indices(
-                environment_parameters, config["seed"], config["N"]
+            expected_order = environment_grid_episode_order(
+                environment_parameters, config["task_name"], config["seed"]
             )
+            expected_indices = expected_order[:config["N"]]
+            expected_sampler = environment_grid_sampler_metadata(
+                environment_parameters, config["task_name"], config["seed"], expected_order
+            )
+            expected_sampler["dataset_base_seed"] = (
+                dataset["meta"].attrs.get("dataset_base_seed")
+                if "meta" in dataset else None
+            )
+            expected_sampler["selected_prefix_length"] = int(config["N"])
         if result.get("selected_episode_indices") != expected_indices:
+            continue
+        if result.get("episode_sampler") != expected_sampler:
             continue
         if result.get("model_type") != config["FM_type"]:
             continue

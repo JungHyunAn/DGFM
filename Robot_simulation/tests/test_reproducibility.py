@@ -11,8 +11,9 @@ import torch
 
 from Robot_simulation.reproducibility import (
     environment_grid_episode_indices,
+    environment_grid_episode_order,
+    environment_grid_sampler_metadata,
     episode_seed_plan,
-    selected_episode_indices,
     stable_hash,
     validation_suite_spec,
 )
@@ -47,39 +48,108 @@ class ReproducibilityHelpersTest(unittest.TestCase):
             ],
         )
 
-    def test_demo_budgets_are_nested_and_method_independent(self):
-        for training_seed in (1000, 2000, 3000):
-            selections = {
-                budget: selected_episode_indices(1000, training_seed, budget)
-                for budget in (20, 40, 80, 160)
-            }
-            self.assertLessEqual(set(selections[20]), set(selections[40]))
-            self.assertLessEqual(set(selections[40]), set(selections[80]))
-            self.assertLessEqual(set(selections[80]), set(selections[160]))
-            for method in ("VanillaFM", "DP", "NGFM"):
-                received = selected_episode_indices(1000, training_seed, 160)
-                self.assertEqual(received, selections[160], method)
+    @staticmethod
+    def _door_grid_parameters(cell_counts):
+        lower = np.asarray([-0.075, -0.3, -(np.pi / 2 + np.pi / 8)])
+        upper = np.asarray([0.075, -0.1, -np.pi / 2])
+        rows = []
+        labels = []
+        for coordinate, count in cell_counts.items():
+            center = lower + (np.asarray(coordinate) + 0.5) * (upper - lower) / 3.0
+            rows.extend([center] * count)
+            labels.extend([coordinate] * count)
+        return np.asarray(rows, dtype=np.float64).reshape(-1, 3), labels
 
-    def test_environment_grid_selection_is_sparse_and_deterministic(self):
-        parameters = np.stack(
-            np.unravel_index(np.arange(27), (3, 3, 3)), axis=1
-        ).astype(np.float64)
-        expected = np.floor(np.arange(20) * 27 / 20).astype(int).tolist()
+    def test_grid_prefixes_are_deterministic_nested_unique_and_method_independent(self):
+        parameters, _ = self._door_grid_parameters({
+            coordinate: 4
+            for coordinate in np.ndindex(3, 3, 3)
+        })
+        selections = {
+            budget: environment_grid_episode_indices(
+                parameters, 1000, budget, "door"
+            )
+            for budget in (20, 40, 80)
+        }
 
-        selected = environment_grid_episode_indices(parameters, 1000, 20)
-
-        self.assertEqual(selected, expected)
+        self.assertEqual(len(selections[20]), 20)
+        self.assertEqual(len(selections[40]), 40)
+        self.assertEqual(len(selections[80]), 80)
+        self.assertEqual(len(selections[80]), len(set(selections[80])))
+        self.assertLess(set(selections[20]), set(selections[40]))
+        self.assertLess(set(selections[40]), set(selections[80]))
+        self.assertEqual(selections[20], selections[40][:20])
+        self.assertEqual(selections[40], selections[80][:40])
         self.assertEqual(
-            environment_grid_episode_indices(parameters, 1000, 20), selected
+            environment_grid_episode_indices(parameters, 1000, 80, "door"),
+            selections[80],
         )
-        self.assertEqual(len(selected), len(set(selected)))
+        different_seed = environment_grid_episode_indices(
+            parameters, 2000, 80, "door"
+        )
+        self.assertNotEqual(different_seed, selections[80])
+        self.assertEqual(len(different_seed), len(set(different_seed)))
 
-    def test_environment_grid_selection_requires_two_bins_per_dimension(self):
-        parameters = np.stack(
-            np.unravel_index(np.arange(8), (2, 2, 2)), axis=1
-        ).astype(np.float64)
-        with self.assertRaisesRegex(ValueError, r"at least 2 \*\* 3 = 8"):
-            environment_grid_episode_indices(parameters, 1000, 7)
+        for method in ("UniformFM", "DP", "DGFMv2"):
+            random.random()
+            np.random.random()
+            torch.rand(1)
+            received = environment_grid_episode_indices(
+                parameters, 1000, 80, "door"
+            )
+            self.assertEqual(received, selections[80], method)
+
+    def test_grid_round_robin_balances_sparse_occupied_cells(self):
+        cell_counts = {(0, 0, 0): 4, (1, 1, 1): 2, (2, 2, 2): 1}
+        parameters, episode_cells = self._door_grid_parameters(cell_counts)
+        ordering = environment_grid_episode_order(parameters, "door", 1234)
+        ordered_cells = [episode_cells[index] for index in ordering]
+
+        self.assertEqual(set(ordered_cells[:3]), set(cell_counts))
+        self.assertEqual(len(set(ordered_cells[:3])), 3)
+        self.assertEqual(set(ordered_cells[3:5]), {(0, 0, 0), (1, 1, 1)})
+        self.assertEqual(ordered_cells[5:], [(0, 0, 0), (0, 0, 0)])
+        self.assertEqual(len(ordering), len(set(ordering)))
+
+        metadata = environment_grid_sampler_metadata(
+            parameters, "door", 1234, ordering
+        )
+        self.assertEqual(metadata["bins_per_dimension"], 3)
+        self.assertEqual(metadata["total_grid_cells"], 27)
+        self.assertEqual(metadata["occupied_grid_cells"], 3)
+        self.assertEqual(metadata["episode_order_length"], 7)
+
+    def test_grid_handles_empty_dataset_and_zero_parameter_dimensions(self):
+        empty = np.empty((0, 3), dtype=np.float64)
+        self.assertEqual(environment_grid_episode_order(empty, "door", 5), [])
+        self.assertEqual(
+            environment_grid_episode_indices(empty, 5, 0, "door"), []
+        )
+
+        parameterless = np.empty((7, 0), dtype=np.float64)
+        ordering = environment_grid_episode_order(parameterless, "wipe", 5)
+        self.assertEqual(len(ordering), 7)
+        self.assertEqual(len(ordering), len(set(ordering)))
+        self.assertEqual(
+            environment_grid_sampler_metadata(parameterless, "wipe", 5, ordering)[
+                "occupied_grid_cells"
+            ],
+            1,
+        )
+
+    def test_two_arm_yaw_wraps_into_configured_grid_range(self):
+        lower = np.asarray([-0.015, -0.015, np.pi - np.pi / 6])
+        upper = np.asarray([0.015, 0.015, np.pi + np.pi / 6])
+        coordinates = np.asarray(list(np.ndindex(3, 3, 3)))
+        parameters = lower + (coordinates + 0.5) * (upper - lower) / 3.0
+        parameters[:, 2] = (parameters[:, 2] + np.pi) % (2.0 * np.pi) - np.pi
+
+        ordering = environment_grid_episode_order(parameters, "two_arm", 99)
+        metadata = environment_grid_sampler_metadata(
+            parameters, "two_arm", 99, ordering
+        )
+        self.assertEqual(len(ordering), 27)
+        self.assertEqual(metadata["occupied_grid_cells"], 27)
 
     def test_validation_spec_is_method_and_training_seed_independent(self):
         expected = validation_suite_spec("two_arm", 50)

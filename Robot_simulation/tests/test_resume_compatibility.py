@@ -14,7 +14,8 @@ from Robot_simulation.reproducibility import (
     DP_EVAL_POLICY_SEED_SCHEME,
     DP_EVAL_SAMPLING_MODE,
     dataset_fingerprint,
-    environment_grid_episode_indices,
+    environment_grid_episode_order,
+    environment_grid_sampler_metadata,
     stable_hash,
 )
 from Robot_simulation.run_eval_sweep import completed_result_path
@@ -30,7 +31,11 @@ class ResumeCompatibilityTest(unittest.TestCase):
                     episode = data.create_group(f"entire_episode_{idx}")
                     parameters = episode.create_group("environment_parameters")
                     parameters.create_dataset(
-                        "values", data=np.asarray([idx], dtype=np.float32)
+                        "values",
+                        data=np.asarray(
+                            [-0.07 + 0.014 * idx, -0.29 + 0.018 * idx, -1.95 + 0.035 * idx],
+                            dtype=np.float32,
+                        ),
                     )
         results_path = root / method
         run_path = results_path / "run"
@@ -48,15 +53,26 @@ class ResumeCompatibilityTest(unittest.TestCase):
         }
         config["sweep_config_sha256"] = stable_hash(config)
         signature = {"fixture": method}
+        fixture_parameters = np.asarray([
+            [-0.07 + 0.014 * idx, -0.29 + 0.018 * idx, -1.95 + 0.035 * idx]
+            for idx in range(10)
+        ], dtype=np.float32)
+        fixture_order = environment_grid_episode_order(
+            fixture_parameters, "door", 1000
+        )
+        fixture_sampler = environment_grid_sampler_metadata(
+            fixture_parameters, "door", 1000, fixture_order
+        )
+        fixture_sampler["dataset_base_seed"] = None
+        fixture_sampler["selected_prefix_length"] = 4
         result = {
             "experiment_version": "clean_v1",
             "sweep_config_sha256": config["sweep_config_sha256"],
             "run_signature": signature,
             "run_signature_sha256": stable_hash(signature),
             "dataset_sha256": dataset_fingerprint(dataset_path)["dataset_sha256"],
-            "selected_episode_indices": environment_grid_episode_indices(
-                np.arange(10, dtype=np.float32).reshape(-1, 1), 1000, 4
-            ),
+            "selected_episode_indices": fixture_order[:4],
+            "episode_sampler": fixture_sampler,
             "model_type": method,
             "task_name": "door",
             "N": 4,

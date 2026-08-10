@@ -50,6 +50,22 @@ TASK_ENVIRONMENT_RANGES = {
     },
 }
 
+TASK_ENVIRONMENT_PARAMETER_RANGE_KEYS = {
+    "door": ("x_range", "y_range", "yaw_range"),
+    "wipe": (),
+    "two_arm": ("x_range", "y_range", "yaw_range"),
+    "nut": (
+        "square_nut_x_range",
+        "square_nut_y_range",
+        "square_nut_yaw_range",
+        "round_nut_x_range",
+        "round_nut_y_range",
+    ),
+}
+
+ENVIRONMENT_GRID_BINS_PER_DIMENSION = 3
+ENVIRONMENT_GRID_SAMPLER_SCHEME = "fixed_task_range_3_bin_round_robin_v1"
+
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -148,87 +164,147 @@ def environment_grid_episode_indices(
     environment_parameters: np.ndarray,
     training_seed: int,
     budget: int,
+    task_name: str,
 ) -> list[int]:
-    """Select one seeded episode from each of evenly spaced environment-grid cells."""
+    """Return a budget prefix of one fixed, seeded task-grid episode ordering."""
+    ordering = environment_grid_episode_order(
+        environment_parameters, task_name, training_seed
+    )
+    if budget < 0:
+        raise ValueError(f"budget must be non-negative, got {budget}")
+    if budget > len(ordering):
+        raise ValueError(
+            f"Requested {budget} demonstrations, but the dataset contains only "
+            f"{len(ordering)} episodes"
+        )
+    return ordering[:budget]
+
+
+def _environment_grid_cell_ids(
+    environment_parameters: np.ndarray,
+    task_name: str,
+) -> tuple[np.ndarray, tuple[str, ...], np.ndarray]:
     parameters = np.asarray(environment_parameters)
     if parameters.ndim != 2:
         raise ValueError(
             "environment_parameters must have shape (episodes, dimensions), "
             f"got {parameters.shape}"
         )
-    total_episodes, environment_dim = parameters.shape
-    if budget < 0:
-        raise ValueError(f"budget must be non-negative, got {budget}")
-    if budget > total_episodes:
-        raise ValueError(
-            f"Requested {budget} demonstrations, but the dataset contains only "
-            f"{total_episodes} episodes"
-        )
-    minimum_budget = 2**environment_dim
-    if budget < minimum_budget:
-        raise ValueError(
-            f"Requested {budget} demonstrations for environment dimension "
-            f"{environment_dim}; at least 2 ** {environment_dim} = "
-            f"{minimum_budget} are required"
-        )
-    if budget == 0:
-        return []
+    _, environment_dim = parameters.shape
+    if task_name not in TASK_ENVIRONMENT_PARAMETER_RANGE_KEYS:
+        raise ValueError(f"Unsupported task_name={task_name!r}")
+    range_keys = TASK_ENVIRONMENT_PARAMETER_RANGE_KEYS[task_name]
     if environment_dim == 0:
-        return selected_episode_indices(total_episodes, training_seed, budget)
+        range_keys = ()
+    if environment_dim != len(range_keys):
+        raise ValueError(
+            f"Task {task_name!r} has {len(range_keys)} configured environment-parameter "
+            f"ranges, but the dataset contains {environment_dim} dimensions"
+        )
     if not np.all(np.isfinite(parameters)):
         raise ValueError("environment_parameters must contain only finite values")
+    if environment_dim == 0:
+        return np.zeros(len(parameters), dtype=np.int64), range_keys, np.empty((0, 2))
 
-    lower = parameters.min(axis=0)
-    spans = parameters.max(axis=0) - lower
-    constant_dimensions = np.flatnonzero(spans == 0)
-    if constant_dimensions.size:
+    ranges = np.asarray(
+        [TASK_ENVIRONMENT_RANGES[task_name][key] for key in range_keys],
+        dtype=np.float64,
+    )
+    lower, upper = ranges[:, 0], ranges[:, 1]
+    spans = upper - lower
+    if not np.all(np.isfinite(ranges)) or np.any(spans <= 0):
+        raise ValueError(f"Invalid configured environment ranges for task {task_name!r}")
+
+    grid_parameters = parameters.astype(np.float64, copy=True)
+    # atan2 stores angles in [-pi, pi], while a configured yaw interval may cross pi.
+    for dimension, key in enumerate(range_keys):
+        if "yaw" in key:
+            center = (lower[dimension] + upper[dimension]) / 2.0
+            grid_parameters[:, dimension] += 2.0 * np.pi * np.round(
+                (center - grid_parameters[:, dimension]) / (2.0 * np.pi)
+            )
+
+    tolerance = 1e-6 * np.maximum(1.0, np.maximum(np.abs(lower), np.abs(upper)))
+    outside = (grid_parameters < lower - tolerance) | (grid_parameters > upper + tolerance)
+    if np.any(outside):
+        episode, dimension = np.argwhere(outside)[0]
         raise ValueError(
-            "Cannot construct an environment grid from constant parameter "
-            f"dimensions {constant_dimensions.tolist()}"
+            f"Episode {int(episode)} parameter {range_keys[int(dimension)]!r}="
+            f"{grid_parameters[episode, dimension]} lies outside configured range "
+            f"{ranges[dimension].tolist()}"
         )
 
-    bins_per_dimension = int(np.ceil(np.exp(np.log(budget) / environment_dim)))
+    normalized = np.clip((grid_parameters - lower) / spans, 0.0, 1.0)
     coordinates = np.floor(
-        (parameters - lower) / spans * bins_per_dimension
+        normalized * ENVIRONMENT_GRID_BINS_PER_DIMENSION
     ).astype(np.int64)
-    np.clip(coordinates, 0, bins_per_dimension - 1, out=coordinates)
+    np.clip(
+        coordinates,
+        0,
+        ENVIRONMENT_GRID_BINS_PER_DIMENSION - 1,
+        out=coordinates,
+    )
     cell_ids = np.ravel_multi_index(
-        coordinates.T, (bins_per_dimension,) * environment_dim
+        coordinates.T,
+        (ENVIRONMENT_GRID_BINS_PER_DIMENSION,) * environment_dim,
     )
+    return cell_ids, range_keys, ranges
 
-    total_cells = bins_per_dimension**environment_dim
-    selected_cells = np.floor(
-        np.arange(budget, dtype=np.float64) * total_cells / budget
-    ).astype(np.int64)
-    target_coordinates = np.stack(
-        np.unravel_index(
-            selected_cells, (bins_per_dimension,) * environment_dim
-        ),
-        axis=1,
+
+def environment_grid_episode_order(
+    environment_parameters: np.ndarray,
+    task_name: str,
+    sampling_seed: int,
+) -> list[int]:
+    """Order every episode by seeded round-robin traversal of occupied grid cells."""
+    cell_ids, _, _ = _environment_grid_cell_ids(environment_parameters, task_name)
+    rng = np.random.default_rng(int(sampling_seed))
+    occupied_cells = np.unique(cell_ids)
+    rng.shuffle(occupied_cells)
+
+    episodes_by_cell = {}
+    for cell_id in occupied_cells:
+        episodes = np.flatnonzero(cell_ids == cell_id)
+        rng.shuffle(episodes)
+        episodes_by_cell[int(cell_id)] = episodes.tolist()
+
+    ordering = []
+    round_index = 0
+    while len(ordering) < len(cell_ids):
+        for cell_id in occupied_cells:
+            episodes = episodes_by_cell[int(cell_id)]
+            if round_index < len(episodes):
+                ordering.append(int(episodes[round_index]))
+        round_index += 1
+    return ordering
+
+
+def environment_grid_sampler_metadata(
+    environment_parameters: np.ndarray,
+    task_name: str,
+    sampling_seed: int,
+    ordering: list[int] | None = None,
+) -> dict[str, Any]:
+    """Describe the fixed grid and full ordering used for an experiment."""
+    cell_ids, range_keys, ranges = _environment_grid_cell_ids(
+        environment_parameters, task_name
     )
-    target_centers = (target_coordinates + 0.5) / bins_per_dimension
-    normalized_parameters = (parameters - lower) / spans
-
-    permutation = np.random.default_rng(int(training_seed)).permutation(total_episodes)
-    ranks = np.empty(total_episodes, dtype=np.int64)
-    ranks[permutation] = np.arange(total_episodes)
-    available = np.ones(total_episodes, dtype=bool)
-    selected = []
-    for cell, center in zip(selected_cells, target_centers, strict=True):
-        candidates = np.flatnonzero(available & (cell_ids == cell))
-        if candidates.size:
-            chosen = candidates[np.argmin(ranks[candidates])]
-        else:
-            candidates = np.flatnonzero(available)
-            squared_distances = np.sum(
-                (normalized_parameters[candidates] - center) ** 2, axis=1
-            )
-            best_distance = squared_distances.min()
-            nearest = candidates[np.isclose(squared_distances, best_distance)]
-            chosen = nearest[np.argmin(ranks[nearest])]
-        selected.append(int(chosen))
-        available[chosen] = False
-    return selected
+    if ordering is None:
+        ordering = environment_grid_episode_order(
+            environment_parameters, task_name, sampling_seed
+        )
+    return {
+        "scheme": ENVIRONMENT_GRID_SAMPLER_SCHEME,
+        "sampling_seed": int(sampling_seed),
+        "bins_per_dimension": ENVIRONMENT_GRID_BINS_PER_DIMENSION,
+        "parameter_dimensions": len(range_keys),
+        "parameter_range_keys": list(range_keys),
+        "parameter_ranges": ranges.tolist(),
+        "total_grid_cells": ENVIRONMENT_GRID_BINS_PER_DIMENSION ** len(range_keys),
+        "occupied_grid_cells": int(len(np.unique(cell_ids))),
+        "episode_order_length": len(ordering),
+        "episode_order_sha256": stable_hash(ordering),
+    }
 
 
 def validation_suite_spec(
