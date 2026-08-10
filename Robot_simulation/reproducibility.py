@@ -64,7 +64,7 @@ TASK_ENVIRONMENT_PARAMETER_RANGE_KEYS = {
 }
 
 ENVIRONMENT_GRID_BINS_PER_DIMENSION = 3
-ENVIRONMENT_GRID_SAMPLER_SCHEME = "fixed_task_range_3_bin_round_robin_v1"
+ENVIRONMENT_GRID_SAMPLER_SCHEME = "dataset_minmax_3_bin_round_robin_v1"
 
 
 def canonical_json(value: Any) -> str:
@@ -203,31 +203,24 @@ def _environment_grid_cell_ids(
         )
     if not np.all(np.isfinite(parameters)):
         raise ValueError("environment_parameters must contain only finite values")
+    if len(parameters) == 0:
+        return (
+            np.empty((0,), dtype=np.int64),
+            range_keys,
+            np.full((environment_dim, 2), np.nan),
+        )
     if environment_dim == 0:
         return np.zeros(len(parameters), dtype=np.int64), range_keys, np.empty((0, 2))
 
-    ranges = np.asarray(
-        [TASK_ENVIRONMENT_RANGES[task_name][key] for key in range_keys],
-        dtype=np.float64,
-    )
+    ranges = np.stack(
+        [parameters.min(axis=0), parameters.max(axis=0)], axis=1
+    ).astype(np.float64)
     lower, upper = ranges[:, 0], ranges[:, 1]
     spans = upper - lower
-    if not np.all(np.isfinite(ranges)) or np.any(spans <= 0):
-        raise ValueError(f"Invalid configured environment ranges for task {task_name!r}")
-
-    grid_parameters = parameters.astype(np.float64, copy=True)
-    # atan2 stores angles in [-pi, pi], while a configured yaw interval may cross pi.
-    for dimension, key in enumerate(range_keys):
-        if "yaw" in key:
-            center = (lower[dimension] + upper[dimension]) / 2.0
-            grid_parameters[:, dimension] += 2.0 * np.pi * np.round(
-                (center - grid_parameters[:, dimension]) / (2.0 * np.pi)
-            )
-
-    # Existing datasets may store world-space observations while their configured
-    # ranges describe placement offsets. Clamp those values to the boundary bins
-    # instead of rejecting an otherwise valid dataset.
-    normalized = np.clip((grid_parameters - lower) / spans, 0.0, 1.0)
+    safe_spans = np.where(spans > 0, spans, 1.0)
+    normalized = (parameters.astype(np.float64) - lower) / safe_spans
+    normalized[:, spans == 0] = 0.5
+    normalized = np.clip(normalized, 0.0, 1.0)
     coordinates = np.floor(
         normalized * ENVIRONMENT_GRID_BINS_PER_DIMENSION
     ).astype(np.int64)

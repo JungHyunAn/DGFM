@@ -137,21 +137,7 @@ class ReproducibilityHelpersTest(unittest.TestCase):
             1,
         )
 
-    def test_two_arm_yaw_wraps_into_configured_grid_range(self):
-        lower = np.asarray([-0.015, -0.015, np.pi - np.pi / 6])
-        upper = np.asarray([0.015, 0.015, np.pi + np.pi / 6])
-        coordinates = np.asarray(list(np.ndindex(3, 3, 3)))
-        parameters = lower + (coordinates + 0.5) * (upper - lower) / 3.0
-        parameters[:, 2] = (parameters[:, 2] + np.pi) % (2.0 * np.pi) - np.pi
-
-        ordering = environment_grid_episode_order(parameters, "two_arm", 99)
-        metadata = environment_grid_sampler_metadata(
-            parameters, "two_arm", 99, ordering
-        )
-        self.assertEqual(len(ordering), 27)
-        self.assertEqual(metadata["occupied_grid_cells"], 27)
-
-    def test_out_of_range_parameters_are_clamped_to_boundary_bins(self):
+    def test_sampler_ranges_are_computed_from_dataset_parameters(self):
         parameters = np.asarray([
             [-0.20, -0.50, -1.80],
             [-0.19, -0.49, -1.79],
@@ -164,7 +150,21 @@ class ReproducibilityHelpersTest(unittest.TestCase):
         )
         self.assertEqual(len(ordering), 3)
         self.assertEqual(len(ordering), len(set(ordering)))
+        self.assertEqual(
+            metadata["parameter_ranges"],
+            [[-0.20, 0.20], [-0.50, 0.10], [-1.80, -1.70]],
+        )
         self.assertEqual(metadata["occupied_grid_cells"], 2)
+
+    def test_constant_parameter_dimensions_use_the_middle_bin(self):
+        parameters = np.asarray([
+            [-0.2, -0.5, -1.8],
+            [-0.1, -0.5, -1.7],
+            [0.0, -0.5, -1.6],
+        ])
+        ordering = environment_grid_episode_order(parameters, "door", 9)
+        self.assertEqual(len(ordering), 3)
+        self.assertEqual(len(ordering), len(set(ordering)))
 
     def test_validation_spec_is_method_and_training_seed_independent(self):
         expected = validation_suite_spec("two_arm", 50)
