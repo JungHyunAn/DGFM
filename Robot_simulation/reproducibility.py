@@ -64,7 +64,7 @@ TASK_ENVIRONMENT_PARAMETER_RANGE_KEYS = {
 }
 
 ENVIRONMENT_GRID_BINS_PER_DIMENSION = 3
-ENVIRONMENT_GRID_SAMPLER_SCHEME = "dataset_minmax_3_bin_round_robin_v1"
+ENVIRONMENT_GRID_SAMPLER_SCHEME = "dataset_minmax_periodic_unwrap_3_bin_round_robin_v1"
 
 
 def canonical_json(value: Any) -> str:
@@ -212,13 +212,25 @@ def _environment_grid_cell_ids(
     if environment_dim == 0:
         return np.zeros(len(parameters), dtype=np.int64), range_keys, np.empty((0, 2))
 
+    grid_parameters = parameters.astype(np.float64, copy=True)
+    for dimension, key in enumerate(range_keys):
+        values = grid_parameters[:, dimension]
+        if "yaw" in key and np.ptp(values) > np.pi:
+            circular_center = np.mod(
+                np.arctan2(np.mean(np.sin(values)), np.mean(np.cos(values))),
+                2.0 * np.pi,
+            )
+            grid_parameters[:, dimension] = circular_center + np.mod(
+                values - circular_center + np.pi, 2.0 * np.pi
+            ) - np.pi
+
     ranges = np.stack(
-        [parameters.min(axis=0), parameters.max(axis=0)], axis=1
+        [grid_parameters.min(axis=0), grid_parameters.max(axis=0)], axis=1
     ).astype(np.float64)
     lower, upper = ranges[:, 0], ranges[:, 1]
     spans = upper - lower
     safe_spans = np.where(spans > 0, spans, 1.0)
-    normalized = (parameters.astype(np.float64) - lower) / safe_spans
+    normalized = (grid_parameters - lower) / safe_spans
     normalized[:, spans == 0] = 0.5
     normalized = np.clip(normalized, 0.0, 1.0)
     coordinates = np.floor(
@@ -286,6 +298,7 @@ def environment_grid_sampler_metadata(
         "parameter_dimensions": len(range_keys),
         "parameter_range_keys": list(range_keys),
         "parameter_ranges": ranges.tolist(),
+        "periodic_parameter_keys": [key for key in range_keys if "yaw" in key],
         "total_grid_cells": ENVIRONMENT_GRID_BINS_PER_DIMENSION ** len(range_keys),
         "occupied_grid_cells": int(len(np.unique(cell_ids))),
         "episode_order_length": len(ordering),

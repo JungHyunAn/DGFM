@@ -166,6 +166,22 @@ class ReproducibilityHelpersTest(unittest.TestCase):
         self.assertEqual(len(ordering), 3)
         self.assertEqual(len(ordering), len(set(ordering)))
 
+    def test_wrapped_two_arm_yaw_recovers_all_27_cells(self):
+        lower = np.asarray([-0.015, -0.015, np.pi - np.pi / 6])
+        upper = np.asarray([0.015, 0.015, np.pi + np.pi / 6])
+        coordinates = np.asarray(list(np.ndindex(3, 3, 3)))
+        parameters = lower + (coordinates + 0.5) * (upper - lower) / 3.0
+        parameters[:, 2] = (parameters[:, 2] + np.pi) % (2.0 * np.pi) - np.pi
+
+        ordering = environment_grid_episode_order(parameters, "two_arm", 99)
+        metadata = environment_grid_sampler_metadata(
+            parameters, "two_arm", 99, ordering
+        )
+        self.assertEqual(len(ordering), 27)
+        self.assertEqual(metadata["occupied_grid_cells"], 27)
+        self.assertGreater(metadata["parameter_ranges"][2][0], 0.0)
+        self.assertGreater(metadata["parameter_ranges"][2][1], np.pi)
+
     def test_validation_spec_is_method_and_training_seed_independent(self):
         expected = validation_suite_spec("two_arm", 50)
         for method in ("VanillaFM", "DP", "NGFM"):
