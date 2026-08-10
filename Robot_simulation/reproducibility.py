@@ -148,8 +148,17 @@ def environment_grid_episode_indices(
     environment_parameters: np.ndarray,
     training_seed: int,
     budget: int,
+    *,
+    bins_per_dimension: int = 3,
 ) -> list[int]:
-    """Select one seeded episode from each of evenly spaced environment-grid cells."""
+    """Return a nested, grid-balanced prefix of a deterministic episode ordering.
+
+    Each environment-parameter dimension is split into a fixed number of bins.
+    Occupied cells and the episodes within each cell are deterministically
+    shuffled from training_seed. Episodes are then selected round-robin across
+    cells, so every budget is a prefix of the same ordering and cell counts
+    remain as balanced as the available data permits.
+    """
     parameters = np.asarray(environment_parameters)
     if parameters.ndim != 2:
         raise ValueError(
@@ -164,12 +173,10 @@ def environment_grid_episode_indices(
             f"Requested {budget} demonstrations, but the dataset contains only "
             f"{total_episodes} episodes"
         )
-    minimum_budget = 2**environment_dim
-    if budget < minimum_budget:
+    if not isinstance(bins_per_dimension, (int, np.integer)) or bins_per_dimension <= 0:
         raise ValueError(
-            f"Requested {budget} demonstrations for environment dimension "
-            f"{environment_dim}; at least 2 ** {environment_dim} = "
-            f"{minimum_budget} are required"
+            "bins_per_dimension must be a positive integer, got "
+            f"{bins_per_dimension!r}"
         )
     if budget == 0:
         return []
@@ -187,47 +194,47 @@ def environment_grid_episode_indices(
             f"dimensions {constant_dimensions.tolist()}"
         )
 
-    bins_per_dimension = int(np.ceil(np.exp(np.log(budget) / environment_dim)))
+    normalized_parameters = (parameters - lower) / spans
     coordinates = np.floor(
-        (parameters - lower) / spans * bins_per_dimension
+        normalized_parameters * bins_per_dimension
     ).astype(np.int64)
     np.clip(coordinates, 0, bins_per_dimension - 1, out=coordinates)
     cell_ids = np.ravel_multi_index(
         coordinates.T, (bins_per_dimension,) * environment_dim
     )
 
-    total_cells = bins_per_dimension**environment_dim
-    selected_cells = np.floor(
-        np.arange(budget, dtype=np.float64) * total_cells / budget
-    ).astype(np.int64)
-    target_coordinates = np.stack(
-        np.unravel_index(
-            selected_cells, (bins_per_dimension,) * environment_dim
-        ),
-        axis=1,
-    )
-    target_centers = (target_coordinates + 0.5) / bins_per_dimension
-    normalized_parameters = (parameters - lower) / spans
+    rng = np.random.default_rng(int(training_seed))
+    episode_permutation = rng.permutation(total_episodes)
+    episode_ranks = np.empty(total_episodes, dtype=np.int64)
+    episode_ranks[episode_permutation] = np.arange(total_episodes)
 
-    permutation = np.random.default_rng(int(training_seed)).permutation(total_episodes)
-    ranks = np.empty(total_episodes, dtype=np.int64)
-    ranks[permutation] = np.arange(total_episodes)
-    available = np.ones(total_episodes, dtype=bool)
-    selected = []
-    for cell, center in zip(selected_cells, target_centers, strict=True):
-        candidates = np.flatnonzero(available & (cell_ids == cell))
-        if candidates.size:
-            chosen = candidates[np.argmin(ranks[candidates])]
-        else:
-            candidates = np.flatnonzero(available)
-            squared_distances = np.sum(
-                (normalized_parameters[candidates] - center) ** 2, axis=1
+    occupied_cells = np.unique(cell_ids)
+    cell_order = rng.permutation(occupied_cells)
+    cell_episodes = {
+        int(cell): sorted(
+            np.flatnonzero(cell_ids == cell).tolist(),
+            key=episode_ranks.__getitem__,
+        )
+        for cell in cell_order
+    }
+
+    selected: list[int] = []
+    round_idx = 0
+    while len(selected) < budget:
+        added_this_round = False
+        for cell in cell_order:
+            episodes = cell_episodes[int(cell)]
+            if round_idx >= len(episodes):
+                continue
+            selected.append(int(episodes[round_idx]))
+            added_this_round = True
+            if len(selected) == budget:
+                return selected
+        if not added_this_round:
+            raise RuntimeError(
+                "Environment-grid ordering exhausted before reaching the requested budget"
             )
-            best_distance = squared_distances.min()
-            nearest = candidates[np.isclose(squared_distances, best_distance)]
-            chosen = nearest[np.argmin(ranks[nearest])]
-        selected.append(int(chosen))
-        available[chosen] = False
+        round_idx += 1
     return selected
 
 
