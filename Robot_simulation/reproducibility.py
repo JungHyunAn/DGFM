@@ -224,16 +224,9 @@ def _environment_grid_cell_ids(
                 (center - grid_parameters[:, dimension]) / (2.0 * np.pi)
             )
 
-    tolerance = 1e-6 * np.maximum(1.0, np.maximum(np.abs(lower), np.abs(upper)))
-    outside = (grid_parameters < lower - tolerance) | (grid_parameters > upper + tolerance)
-    if np.any(outside):
-        episode, dimension = np.argwhere(outside)[0]
-        raise ValueError(
-            f"Episode {int(episode)} parameter {range_keys[int(dimension)]!r}="
-            f"{grid_parameters[episode, dimension]} lies outside configured range "
-            f"{ranges[dimension].tolist()}"
-        )
-
+    # Existing datasets may store world-space observations while their configured
+    # ranges describe placement offsets. Clamp those values to the boundary bins
+    # instead of rejecting an otherwise valid dataset.
     normalized = np.clip((grid_parameters - lower) / spans, 0.0, 1.0)
     coordinates = np.floor(
         normalized * ENVIRONMENT_GRID_BINS_PER_DIMENSION

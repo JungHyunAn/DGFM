@@ -151,6 +151,21 @@ class ReproducibilityHelpersTest(unittest.TestCase):
         self.assertEqual(len(ordering), 27)
         self.assertEqual(metadata["occupied_grid_cells"], 27)
 
+    def test_out_of_range_parameters_are_clamped_to_boundary_bins(self):
+        parameters = np.asarray([
+            [-0.20, -0.50, -1.80],
+            [-0.19, -0.49, -1.79],
+            [0.20, 0.10, -1.70],
+        ])
+
+        ordering = environment_grid_episode_order(parameters, "door", 7)
+        metadata = environment_grid_sampler_metadata(
+            parameters, "door", 7, ordering
+        )
+        self.assertEqual(len(ordering), 3)
+        self.assertEqual(len(ordering), len(set(ordering)))
+        self.assertEqual(metadata["occupied_grid_cells"], 2)
+
     def test_validation_spec_is_method_and_training_seed_independent(self):
         expected = validation_suite_spec("two_arm", 50)
         for method in ("VanillaFM", "DP", "NGFM"):
