@@ -111,7 +111,7 @@ SHARED_CONFIG: dict[str, Any] = {
     "vision_train_bn": False,
     "vision_pool": "spatial_softmax",
     "vision_spatial_softmax_temperature": 0.5,
-    "vision_feature_proj_dim": 256,
+    "vision_feature_proj_dim": 128,
     "vision_feature_norm": "layernorm",
     "vision_aug": False,
     "vision_random_shift": 4,
