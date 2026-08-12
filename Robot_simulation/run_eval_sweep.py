@@ -105,7 +105,7 @@ SHARED_CONFIG: dict[str, Any] = {
     "observation_horizon": 2,
     "observation_type": "vision",
     "vision_batch_size": 500,
-    "condition_embed_dim": 256,
+    "condition_embed_dim": 512,
     "vision_finetune": True,
     "vision_finetune_mode": "layer4",
     "vision_train_bn": False,
