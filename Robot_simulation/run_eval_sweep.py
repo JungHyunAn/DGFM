@@ -29,7 +29,7 @@ from Robot_simulation.reproducibility import (
 METHODS = ("UniformFM", "DP", "DGFMv2")
 FINAL_TASKS = ("door", "two_arm")
 FINAL_TRAINING_SEEDS = (1000, 2000, 3000)
-EXPERIMENT_VERSION = "clean_v1"
+EXPERIMENT_VERSION = "clean_v2"
 PREFERRED_DGFM_ROOT = Path("/PublicHDD/ajh916/DGFM")
 FALLBACK_DGFM_ROOT = Path(__file__).resolve().parents[1]
 
@@ -47,17 +47,17 @@ DEMO_SIZES_BY_TASK = {
 }
 
 MAX_EPOCHS_BY_TASK = {
-    "door": (4000, 2000, 1000),
+    "door": (2000, 2000, 2000),
     "wipe": (),
-    "two_arm": (4000, 2000, 1000),
-    "nut": (4000, 2000, 1000),
+    "two_arm": (2000, 2000, 2000),
+    "nut": (2000, 2000, 2000),
 }
 
 VAL_PERIODS_BY_TASK = {
-    "door": (80, 40, 20),
+    "door": (40, 40, 40),
     "wipe": (),
-    "two_arm": (80, 40, 20),
-    "nut": (80, 40, 20),
+    "two_arm": (40, 40, 40),
+    "nut": (40, 40, 40),
 }
 
 CLUSTER_PARTITIONS_BY_TASK = {
@@ -81,12 +81,19 @@ CAMERA_NAMES_BY_TASK = {
     "nut": ["frontview", "robot0_eye_in_hand"],
 }
 
+CONDITION_EMBED_DIM_BY_TASK = {
+    "door": 512,
+    "wipe": 512,
+    "two_arm": 768,
+    "nut": 512,
+}
+
 SLEEP_SECONDS_BETWEEN_RUNS = 500
 
 
 SHARED_CONFIG: dict[str, Any] = {
     "use_ema": True,
-    "results_path": dgfm_path("Robot_simulation/eval_results_clean_v1/{task_name}/sweep_{seed}"),
+    "results_path": dgfm_path("Robot_simulation/eval_results_clean_v2/{task_name}/sweep_{seed}"),
     "device": "cuda",
     "n_t": 1,
     "learning_rate": 0.0001,
@@ -105,7 +112,6 @@ SHARED_CONFIG: dict[str, Any] = {
     "observation_horizon": 2,
     "observation_type": "vision",
     "vision_batch_size": 500,
-    "condition_embed_dim": 512,
     "vision_finetune": True,
     "vision_finetune_mode": "layer4",
     "vision_train_bn": False,
@@ -210,6 +216,7 @@ def build_config(
         "dataset_path": DATASET_PATH_BY_TASK[task_name],
         "results_path": SHARED_CONFIG["results_path"].format(task_name=task_name, seed=seed),
         "camera_names": CAMERA_NAMES_BY_TASK[task_name],
+        "condition_embed_dim": CONDITION_EMBED_DIM_BY_TASK[task_name],
         "max_epochs": max_epochs,
         "warmup_steps": int(max_epochs * 0.2),
         "val_period": val_period,

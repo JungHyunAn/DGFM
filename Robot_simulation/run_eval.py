@@ -114,6 +114,7 @@ Behavioral notes & tips
 """
 
 import os
+import hashlib
 # Avoid cuBLASLt addmm heuristic failures on some CUDA/PyTorch/GPU combinations.
 os.environ.setdefault("DISABLE_ADDMM_CUDA_LT", "1")
 import numpy as np
@@ -488,6 +489,15 @@ def train_and_eval_model(
     experiment_version: str = "clean_v1",
     sweep_config_sha256: str | None = None,
 ):
+    # Seed before constructing the vision encoder so that the trainable
+    # projection head is reproducible for a given training seed.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    vision_projection_initial_sha256 = None
+
     ###################################
     #### 0) Argument Sanity Checks ####
     ###################################
@@ -743,6 +753,14 @@ def train_and_eval_model(
                 random_shift=vision_random_shift,
                 color_jitter=vision_color_jitter,
             )
+            projection_parameters = list(vision_encoder.projection_parameters())
+            if projection_parameters:
+                projection_digest = hashlib.sha256()
+                for parameter in projection_parameters:
+                    projection_digest.update(
+                        parameter.detach().cpu().contiguous().numpy().tobytes()
+                    )
+                vision_projection_initial_sha256 = projection_digest.hexdigest()
             print(
                 "[vision-input] oracle environment data disabled | "
                 f"joint_dof={dof} | observation_horizon={observation_horizon} | "
@@ -836,6 +854,8 @@ def train_and_eval_model(
     #########################################################
     #### 4) Common Backbone + Method-specific Objectives ####
     #########################################################
+    # Intentionally reset here so policy-backbone initialization keeps its
+    # existing seed-controlled behavior independently of vision construction.
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -1539,6 +1559,7 @@ def train_and_eval_model(
             "vision_pool": vision_pool,
             "vision_spatial_softmax_temperature": vision_spatial_softmax_temperature,
             "vision_feature_proj_dim": vision_feature_proj_dim,
+            "vision_projection_initial_sha256": vision_projection_initial_sha256,
             "vision_feature_norm": vision_feature_norm,
             "vision_aug": vision_aug,
             "vision_random_shift": vision_random_shift,

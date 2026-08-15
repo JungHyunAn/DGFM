@@ -1,4 +1,4 @@
-"""Non-destructive fixture tests for clean_v1 method-aware resume."""
+"""Non-destructive fixture tests for clean_v2 method-aware resume."""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ class ResumeCompatibilityTest(unittest.TestCase):
         fixture_sampler["dataset_base_seed"] = None
         fixture_sampler["selected_prefix_length"] = 4
         result = {
-            "experiment_version": "clean_v1",
+            "experiment_version": "clean_v2",
             "sweep_config_sha256": config["sweep_config_sha256"],
             "run_signature": signature,
             "run_signature_sha256": stable_hash(signature),
