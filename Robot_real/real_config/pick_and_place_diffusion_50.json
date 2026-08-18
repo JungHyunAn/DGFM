@@ -1,5 +1,5 @@
 {
-  "reference": "Robot_simulation/run_eval_sweep.py (middle 40-demo tier)",
+  "reference": "Adapted from Robot_simulation/run_eval_sweep.py",
   "task": "pick_and_place",
   "model_type": "DiffusionPolicy",
   "dataset_root": "Robot_real/real_dataset",
@@ -36,7 +36,7 @@
   "vision_train_bn": false,
   "vision_pool": "spatial_softmax",
   "vision_spatial_softmax_temperature": 0.5,
-  "feature_proj_dim": 256,
+  "feature_proj_dim": 128,
   "vision_feature_norm": "layernorm",
   "vision_augmentation": false,
   "vision_random_shift": 4,
@@ -44,7 +44,7 @@
   "vision_batch_size": 500,
   "vision_encoder_lr_scale": 0.1,
   "vision_projection_lr_scale": 1.0,
-  "condition_embed_dim": 256,
+  "condition_embed_dim": 512,
   "num_convs_per_block": 1,
   "sampler_steps": 100,
   "interpolation_path": "beizer",
@@ -69,6 +69,6 @@
   "diffusion_eta": 1.0,
   "clip_sample": true,
   "clip_sample_range": 1.0,
-  "seed": 42,
+  "seed": 1000,
   "device": "cuda"
 }

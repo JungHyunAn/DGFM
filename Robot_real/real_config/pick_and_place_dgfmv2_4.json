@@ -1,5 +1,5 @@
 {
-  "reference": "Robot_simulation/run_eval_sweep.py (middle 40-demo tier)",
+  "reference": "Adapted from Robot_simulation/run_eval_sweep.py",
   "task": "pick_and_place",
   "model_type": "DGFMv2",
   "dataset_root": "Robot_real/real_dataset",

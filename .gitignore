@@ -13,6 +13,7 @@ Robot_simulation/videos/
 Robot_simulation/train_sac_door.py
 Robot_simulation/eval_results/
 Robot_simulation/eval_results_clean_v1/
+Robot_simulation/eval_results_clean_v2/
 output_0.log
 output_0_1.log
 output_1.log
