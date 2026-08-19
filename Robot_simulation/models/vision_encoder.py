@@ -185,15 +185,45 @@ class FrozenResNet18Encoder(nn.Module):
         self.augmentation = bool(augmentation)
         self.random_shift = int(random_shift)
         self.color_jitter = float(color_jitter)
-        self.raw_feature_dim = 1024 if self.pool == "spatial_softmax" else self.backbone_feature_dim
+        # Match the original Diffusion Policy / robomimic visual core when a
+        # learned spatial-softmax projection is requested: first learn a small
+        # set of task-specific heatmaps, then convert those heatmaps to (x, y)
+        # keypoints. This avoids collapsing all 512 ImageNet channels to 1024
+        # coordinates before applying a large random MLP bottleneck.
+        self.spatial_softmax_num_keypoints = (
+            32 if self.pool == "spatial_softmax" and self.feature_proj_dim > 0 else None
+        )
+        self.spatial_keypoint_projection = (
+            nn.Conv2d(
+                self.backbone_feature_dim,
+                self.spatial_softmax_num_keypoints,
+                kernel_size=1,
+            )
+            if self.spatial_softmax_num_keypoints is not None
+            else nn.Identity()
+        )
+        self.raw_feature_dim = (
+            2 * self.spatial_softmax_num_keypoints
+            if self.spatial_softmax_num_keypoints is not None
+            else 1024 if self.pool == "spatial_softmax" else self.backbone_feature_dim
+        )
         if self.feature_proj_dim > 0:
             self.feature_dim = self.feature_proj_dim
-            self.projection_head = nn.Sequential(
-                nn.Linear(self.raw_feature_dim, self.feature_proj_dim),
-                nn.LayerNorm(self.feature_proj_dim),
-                nn.Mish(),
-                nn.Linear(self.feature_proj_dim, self.feature_proj_dim),
-            )
+            if self.spatial_softmax_num_keypoints is not None:
+                # Original-style keypoint head: 32 keypoints -> 64 coordinates
+                # -> one linear feature projection. Keep PyTorch's default
+                # initialization, as used by the reference implementation.
+                self.projection_head = nn.Linear(
+                    self.raw_feature_dim,
+                    self.feature_proj_dim,
+                )
+            else:
+                self.projection_head = nn.Sequential(
+                    nn.Linear(self.raw_feature_dim, self.feature_proj_dim),
+                    nn.LayerNorm(self.feature_proj_dim),
+                    nn.Mish(),
+                    nn.Linear(self.feature_proj_dim, self.feature_proj_dim),
+                )
             self.feature_norm_layer = nn.Identity()
         else:
             self.feature_dim = self.raw_feature_dim
@@ -274,6 +304,7 @@ class FrozenResNet18Encoder(nn.Module):
     def _pool_features(self, feature_map: torch.Tensor) -> torch.Tensor:
         if self.pool == "avg":
             return torch.flatten(self.backbone.avgpool(feature_map), 1)
+        feature_map = self.spatial_keypoint_projection(feature_map)
         batch, channels, height, width = feature_map.shape
         logits = feature_map.reshape(batch, channels, height * width) / self.spatial_softmax_temperature
         weights = torch.softmax(logits, dim=-1)
