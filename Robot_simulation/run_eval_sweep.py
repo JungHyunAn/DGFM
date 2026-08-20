@@ -123,8 +123,8 @@ SHARED_CONFIG: dict[str, Any] = {
     # normalization; keep the metadata aligned with the implemented model.
     "vision_feature_norm": "none",
     "vision_aug": True,
-    "vision_random_shift": 4,
-    "vision_color_jitter": 0.1,
+    "vision_random_shift": 8,
+    "vision_color_jitter": 0,
     "vision_encoder_lr_scale": 0.1,
     "vision_projection_lr_scale": 1.0,
     "vision_warmup_freeze_epochs": 0,
