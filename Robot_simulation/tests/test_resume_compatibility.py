@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -18,7 +19,12 @@ from Robot_simulation.reproducibility import (
     environment_grid_sampler_metadata,
     stable_hash,
 )
-from Robot_simulation.run_eval_sweep import completed_result_path
+from Robot_simulation.run_eval_sweep import (
+    SHARED_CONFIG,
+    apply_sweep_overrides,
+    completed_result_path,
+    config_to_cli_args,
+)
 
 
 class ResumeCompatibilityTest(unittest.TestCase):
@@ -124,6 +130,40 @@ class ResumeCompatibilityTest(unittest.TestCase):
             ngfm["cluster_partition"] = 5
             ngfm["residual_lambda"] = 0.2
             self.assertIsNotNone(completed_result_path(ngfm))
+
+    def test_vision_augmentation_defaults_and_cli_overrides(self):
+        self.assertIs(SHARED_CONFIG["vision_aug"], True)
+        self.assertEqual(SHARED_CONFIG["vision_feature_norm"], "none")
+
+        args = SimpleNamespace(
+            validation_backend=None,
+            remote_eval_config=None,
+            remote_eval_mode=None,
+            remote_eval_render_best=False,
+            remote_eval_timeout_sec=None,
+            remote_eval_poll_interval_sec=None,
+            vision_aug=False,
+            vision_random_shift=2,
+            vision_color_jitter=0.05,
+        )
+        base_config = {
+            "vision_aug": True,
+            "vision_random_shift": 4,
+            "vision_color_jitter": 0.1,
+        }
+
+        overridden = apply_sweep_overrides(base_config, args)
+        cli_args = config_to_cli_args(overridden)
+
+        self.assertEqual(base_config["vision_random_shift"], 4)
+        self.assertIs(overridden["vision_aug"], False)
+        self.assertEqual(overridden["vision_random_shift"], 2)
+        self.assertEqual(overridden["vision_color_jitter"], 0.05)
+        self.assertIn("--no-vision_aug", cli_args)
+        self.assertEqual(
+            cli_args[cli_args.index("--vision_random_shift") + 1],
+            "2",
+        )
 
 
 if __name__ == "__main__":

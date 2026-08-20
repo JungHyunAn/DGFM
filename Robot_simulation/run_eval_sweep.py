@@ -1,8 +1,9 @@
 """Run fixed train/eval sweeps for Robot_simulation policies.
 
-The sweep intentionally exposes only task_name and seed. Per-task demo sizes,
-training epochs, shared training/evaluation options, and method-specific
-options live in dictionaries below so experiment settings stay easy to audit.
+Per-task demo sizes, training epochs, shared training/evaluation options, and
+method-specific options live in dictionaries below so experiment settings stay
+easy to audit. A small set of command-line overrides supports explicit
+ablations without requiring source edits.
 """
 
 from __future__ import annotations
@@ -118,8 +119,10 @@ SHARED_CONFIG: dict[str, Any] = {
     "vision_pool": "spatial_softmax",
     "vision_spatial_softmax_temperature": 1.0,
     "vision_feature_proj_dim": 128,
-    "vision_feature_norm": "layernorm",
-    "vision_aug": False,
+    # The spatial-softmax projection intentionally has no post-projection
+    # normalization; keep the metadata aligned with the implemented model.
+    "vision_feature_norm": "none",
+    "vision_aug": True,
     "vision_random_shift": 4,
     "vision_color_jitter": 0.1,
     "vision_encoder_lr_scale": 0.1,
@@ -183,6 +186,24 @@ def parse_args() -> argparse.Namespace:
         help="Methods to run. Defaults to all methods.",
     )
     parser.add_argument("--residual_lambda", type=float, default=0.2)
+    parser.add_argument(
+        "--vision_aug",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override train-time vision augmentation for this sweep.",
+    )
+    parser.add_argument(
+        "--vision_random_shift",
+        type=int,
+        default=None,
+        help="Override random-shift padding in pixels.",
+    )
+    parser.add_argument(
+        "--vision_color_jitter",
+        type=float,
+        default=None,
+        help="Override brightness/contrast jitter strength.",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip completed runs in the sweep results folder.")
     parser.add_argument("--validation_backend", choices=["local", "remote", "none"], default=None)
     parser.add_argument("--remote_eval_config", type=str, default=None)
@@ -191,6 +212,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--remote_eval_timeout_sec", type=int, default=None)
     parser.add_argument("--remote_eval_poll_interval_sec", type=float, default=None)
     args = parser.parse_args()
+    if args.vision_random_shift is not None and args.vision_random_shift < 0:
+        parser.error("--vision_random_shift must be non-negative")
+    if args.vision_color_jitter is not None and args.vision_color_jitter < 0:
+        parser.error("--vision_color_jitter must be non-negative")
     if args.validation_backend is None and args.remote_eval_config is not None:
         args.validation_backend = "remote"
     if args.validation_backend == "remote" and args.remote_eval_config is None:
@@ -309,6 +334,16 @@ def apply_validation_overrides(config: dict[str, Any], args: argparse.Namespace)
         config["remote_eval_timeout_sec"] = args.remote_eval_timeout_sec
     if args.remote_eval_poll_interval_sec is not None:
         config["remote_eval_poll_interval_sec"] = args.remote_eval_poll_interval_sec
+    return config
+
+
+def apply_sweep_overrides(config: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    """Apply optional CLI overrides before hashing and launching a run."""
+    config = apply_validation_overrides(config, args)
+    for key in ("vision_aug", "vision_random_shift", "vision_color_jitter"):
+        value = getattr(args, key, None)
+        if value is not None:
+            config[key] = value
     return config
 
 
@@ -455,7 +490,7 @@ def main() -> None:
         args.methods,
         residual_lambda=args.residual_lambda,
     )
-    sweep = [apply_validation_overrides(config, args) for config in sweep]
+    sweep = [apply_sweep_overrides(config, args) for config in sweep]
     for config in sweep:
         config["sweep_config_sha256"] = stable_hash(config)
     sweep_results_path = Path(sweep[0]["results_path"])
@@ -466,6 +501,12 @@ def main() -> None:
         print("[sweep] Resume enabled: completed matching runs will be skipped.")
     if args.validation_backend is not None:
         print(f"[sweep] validation_backend={args.validation_backend}")
+    print(
+        "[sweep] vision augmentation: "
+        f"enabled={sweep[0]['vision_aug']} | "
+        f"random_shift={sweep[0]['vision_random_shift']} | "
+        f"color_jitter={sweep[0]['vision_color_jitter']}"
+    )
 
     for run_idx, config in enumerate(sweep, start=1):
         completed_path = completed_result_path(config) if args.resume else None

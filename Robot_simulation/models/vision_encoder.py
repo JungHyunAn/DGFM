@@ -281,13 +281,15 @@ class FrozenResNet18Encoder(nn.Module):
         if self.random_shift > 0:
             pad = self.random_shift
             x = F.pad(x, (pad, pad, pad, pad), mode="replicate")
+            batch, _, height, width = x.shape
+            output_height = height - 2 * pad
+            output_width = width - 2 * pad
             max_offset = 2 * pad
-            offsets_y = torch.randint(0, max_offset + 1, (x.shape[0],), device=x.device)
-            offsets_x = torch.randint(0, max_offset + 1, (x.shape[0],), device=x.device)
-            x = torch.cat([
-                x[i:i + 1, :, offsets_y[i]:offsets_y[i] + 224, offsets_x[i]:offsets_x[i] + 224]
-                for i in range(x.shape[0])
-            ], dim=0)
+            offsets_y = torch.randint(0, max_offset + 1, (batch,), device=x.device)
+            offsets_x = torch.randint(0, max_offset + 1, (batch,), device=x.device)
+            crop_windows = x.unfold(2, output_height, 1).unfold(3, output_width, 1)
+            batch_indices = torch.arange(batch, device=x.device)
+            x = crop_windows[batch_indices, :, offsets_y, offsets_x]
         if self.color_jitter > 0:
             jitter = self.color_jitter
             brightness = torch.empty(x.shape[0], 1, 1, 1, device=x.device).uniform_(
