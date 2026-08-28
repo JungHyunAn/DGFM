@@ -179,6 +179,11 @@ METHOD_CONFIGS: dict[str, dict[str, Any]] = {
         "cluster_outlier_q": 0.9,
         "max_pca_samples": 2000,
         "pca_n_jobs": -1,
+        "vision_pca_global_rank": 64,
+        "vision_pca_local_rank": 32,
+        "vision_pca_image_size": 64,
+        "vision_pca_batch_size": 128,
+        "vision_pca_max_images": 0,
         "mixture_reg": 1e-6,
         "mixture_orth_sigma": 0.0,
         "dgfm_truncated": True,
@@ -194,7 +199,7 @@ METHOD_CONFIGS: dict[str, dict[str, Any]] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         "run_eval_sweep",
-        description="Sweep UniformFM, DP, and DGFMv2 for a task and seed.",
+        description="Sweep UniformFM, DP, DGFMv2, and DGFMv3 for a task and seed.",
     )
     parser.add_argument("task_name", choices=sorted(DEMO_SIZES_BY_TASK))
     parser.add_argument("seed", type=int)
@@ -276,7 +281,7 @@ def build_config(
 
 
 def build_final_sweep() -> list[dict[str, Any]]:
-    """Return the intended 2 tasks x 4 budgets x 3 methods x 3 seeds payload."""
+    """Return the configured task, budget, method, and seed payload."""
     return [
         config
         for task_name in FINAL_TASKS
