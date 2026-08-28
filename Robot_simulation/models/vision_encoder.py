@@ -434,6 +434,66 @@ def encode_image_path_windows(
     return features.reshape(policy_batch_size, observation_horizon * encoder.output_dim)
 
 
+def load_image_path_windows(
+    path_windows: np.ndarray,
+    dataset_dir: str,
+    *,
+    cache_images: bool = True,
+    resize_hw: tuple[int, int] | None = None,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Load raw RGB windows shaped (B, O, V, H, W, 3).
+
+    Resizing is performed before the tensor is returned so callers can construct
+    differentiable pixel-space condition paths and then pass those pixels
+    through a trainable vision encoder.
+    """
+    paths = np.asarray(path_windows, dtype=object)
+    if paths.ndim != 3:
+        raise ValueError(f"Expected path windows shaped (B, O, V), got {paths.shape}")
+
+    batch_size, observation_horizon, num_views = paths.shape
+    images = np.stack([
+        np.stack([
+            np.stack([
+                _read_rgb_image(path, dataset_dir, cache_images)
+                for path in view_paths
+            ], axis=0)
+            for view_paths in observation_paths
+        ], axis=0)
+        for observation_paths in paths
+    ], axis=0)
+    tensor = torch.from_numpy(images).to(device)
+
+    if resize_hw is not None:
+        height, width = (int(resize_hw[0]), int(resize_hw[1]))
+        if height <= 0 or width <= 0:
+            raise ValueError(f"resize_hw must be positive, got {resize_hw}")
+        original_height, original_width = tensor.shape[-3:-1]
+        if (original_height, original_width) != (height, width):
+            tensor = tensor.permute(0, 1, 2, 5, 3, 4).reshape(
+                batch_size * observation_horizon * num_views,
+                3,
+                original_height,
+                original_width,
+            ).float()
+            tensor = F.interpolate(
+                tensor,
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
+            tensor = tensor.reshape(
+                batch_size,
+                observation_horizon,
+                num_views,
+                3,
+                height,
+                width,
+            ).permute(0, 1, 2, 4, 5, 3)
+    return tensor
+
+
 @torch.no_grad()
 def encode_image_path_episodes(
     path_episodes: Sequence[np.ndarray],
