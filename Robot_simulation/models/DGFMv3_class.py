@@ -451,6 +451,7 @@ class DGFMv3(DGFM):
         if self.pixel_pca_bank is None:
             return p_t
 
+        recorded_example = False
         paths = self.vision_window_paths[source_idx.detach().cpu().numpy()]
         observation_horizon = paths.shape[1]
         policy_chunk = max(
@@ -503,6 +504,18 @@ class DGFMv3(DGFM):
                         "demo": demo_images[example_idx].detach().cpu(),
                         "t": example_t,
                     }
+                    recorded_example = True
+
+        if recorded_example:
+            output_dir = getattr(self, "condition_example_output_dir", None)
+            if output_dir is not None:
+                self.condition_example_saved_path = self.save_condition_example(
+                    output_dir
+                )
+                tqdm.write(
+                    "[Saved initial DGFMv3 condition example to "
+                    f"{self.condition_example_saved_path}]"
+                )
         return torch.cat(condition_chunks, dim=0)
 
     def save_condition_example(self, output_dir):
@@ -649,6 +662,7 @@ class DGFMv3(DGFM):
             self.pixel_pca_bank = None
             Q_np = np.zeros((len(X_np), 0), dtype=np.float32)
         self.condition_example = None
+        self.condition_example_saved_path = None
 
         def normalized_block(values):
             if values.shape[1] == 0:
