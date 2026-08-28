@@ -27,7 +27,7 @@ from Robot_simulation.reproducibility import (
 )
 
 
-METHODS = ("UniformFM", "DP", "DGFMv2")
+METHODS = ("UniformFM", "DP", "DGFMv2", "DGFMv3")
 FINAL_TASKS = ("door", "two_arm")
 FINAL_TRAINING_SEEDS = (1000, 2000, 3000)
 EXPERIMENT_VERSION = "clean_v2"
@@ -168,6 +168,26 @@ METHOD_CONFIGS: dict[str, dict[str, Any]] = {
         "interpolation_path": "beizer",
         "residual_lambda": 0.2,
     },
+    "DGFMv3": {
+        "FM_type": "DGFMv3",
+        "cluster_jaccard_thresh": 0.8,
+        "cluster_merge_k": 10,
+        "cluster_standardize": True,
+        "cluster_scale_x": 1.0,
+        "cluster_scale_c": 1.0,
+        "cluster_eps": 0.001,
+        "cluster_outlier_q": 0.9,
+        "max_pca_samples": 2000,
+        "pca_n_jobs": -1,
+        "mixture_reg": 1e-6,
+        "mixture_orth_sigma": 0.0,
+        "dgfm_truncated": True,
+        "dgfm_trunc_low": -1.5,
+        "dgfm_trunc_high": 1.5,
+        "time_sampling": "uniform",
+        "interpolation_path": "beizer",
+        "residual_lambda": 0.2,
+    },
 }
 
 
@@ -249,7 +269,7 @@ def build_config(
         "eval_base_seed": TASK_EVAL_BASE_SEEDS[task_name],
         "experiment_version": EXPERIMENT_VERSION,
     }
-    if method == "DGFMv2":
+    if method in ("DGFMv2", "DGFMv3"):
         config["cluster_partition"] = cluster_partition
         config["residual_lambda"] = residual_lambda
     return config
@@ -472,7 +492,7 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
             continue
         if result.get("warmup steps") != config["warmup_steps"]:
             continue
-        if config["FM_type"] == "DGFMv2":
+        if config["FM_type"] in ("DGFMv2", "DGFMv3"):
             if result.get("cluster_partition") != config["cluster_partition"]:
                 continue
             if result.get("residual_lambda", 0.2) != config["residual_lambda"]:
