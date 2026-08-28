@@ -161,6 +161,7 @@ from Robot_simulation.env_util import (
 )
 from Robot_simulation.models.DGFM_class import DGFM
 from Robot_simulation.models.DGFMv2_class import DGFMv2, MPPCAv2
+from Robot_simulation.models.DGFMv3_class import DGFMv3
 from Robot_simulation.models.DP_class import DiffusionPolicy
 from Robot_simulation.models.LatentFM_class import LatentFM, LatentFlowPolicy, LatentVectorField, TrajectoryAutoencoder
 from Robot_simulation.models.MPPCA_class import MPPCA
@@ -405,7 +406,7 @@ def train_and_eval_model(
     time_sampling: str = "uniform",                         # LEGACY: time_sampling method (may be "shifted")
     beta_a: float = 1.5,                                    # LEGACY: time_sampling coefficient for "shifted"
     beta_b: float = 1.0,                                    # LEGACY: time_sampling coefficient for "shifted"
-    interpolation_path: str = "piecewise-linear-midpoint",  # Three-point interpolation method for DGFMv2
+    interpolation_path: str | None = None,                   # DGFMv3 defaults to Bezier; older DGFM variants keep midpoint
     residual_lambda: float = 0.2,                           # Residual coefficient for "piecewise-linear-midpoint"
     max_epochs: int = 1000,                                 
     batch_size: int = 200,
@@ -434,6 +435,11 @@ def train_and_eval_model(
     cluster_outlier_q: float = 0.9,                         # Outlier threshold before per-cluster PCA 
     max_pca_samples: int = 2000,                            # Max number for PCA
     pca_n_jobs: int = -1,
+    vision_pca_global_rank: int = 64,
+    vision_pca_local_rank: int = 32,
+    vision_pca_image_size: int = 64,
+    vision_pca_batch_size: int = 128,
+    vision_pca_max_images: int = 0,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-6,
     mixture_reg: float = 1e-6,
@@ -536,13 +542,14 @@ def train_and_eval_model(
     vision_online_training = (
         observation_type == "vision"
         and (
-            vision_finetune
+            model_type == "DGFMv3"
+            or vision_finetune
             or vision_feature_proj_dim > 0
             or vision_feature_norm == "layernorm"
             or vision_aug
         )
     )
-    vision_finetune_models = ("UniformFM", "ShiftedFM", "DGFMv2", "DP")
+    vision_finetune_models = ("UniformFM", "ShiftedFM", "DGFMv2", "DGFMv3", "DP")
     if vision_online_training and model_type not in vision_finetune_models:
         raise ValueError(
             f"online vision encoder training is supported for {vision_finetune_models}, got {model_type}"
@@ -552,11 +559,16 @@ def train_and_eval_model(
         "ShiftedFM": ShiftedFM,
         "DGFM": DGFM,
         "DGFMv2": DGFMv2,
+        "DGFMv3": DGFMv3,
         "LatentFM": LatentFM,
     }
     supported_model_types = sorted([*fm_class_map, "DP", "MPPCA", "MPPCAv2"])
     if model_type not in supported_model_types:
         raise ValueError(f"Unsupported model type={model_type}. Expected one of {supported_model_types}")
+    if interpolation_path is None:
+        interpolation_path = (
+            "beizer" if model_type == "DGFMv3" else "piecewise-linear-midpoint"
+        )
     if model_type in ("MPPCA", "MPPCAv2") and model_path is not None:
         raise ValueError(f"Loading a saved {model_type} sampler from --model_path is not supported yet.")
     if validation_backend not in ("local", "remote", "none"):
@@ -1163,6 +1175,10 @@ def train_and_eval_model(
 
     if vision_online_training and flow is not None:
         dataset_dir = os.path.dirname(os.path.abspath(dataset_path))
+        if model_type == "DGFMv3":
+            flow.vision_window_paths = vision_window_paths
+            flow.vision_dataset_dir = dataset_dir
+            flow.vision_encoder_batch_size = vision_batch_size
 
         def vision_condition_fn(indices, base_conditions):
             path_batch = vision_window_paths[indices.detach().cpu().numpy()]
@@ -1216,13 +1232,13 @@ def train_and_eval_model(
         cluster_size = None
         train_time_start = time.thread_time()
 
-        cluster_model_types = ("DGFM", "DGFMv2", "MPPCA", "MPPCAv2")
+        cluster_model_types = ("DGFM", "DGFMv2", "DGFMv3", "MPPCA", "MPPCAv2")
         if model_type in cluster_model_types:
             if cluster_partition <= 0:
                 raise ValueError(f"cluster_partition must be positive, got {cluster_partition}")
 
             full_dimension = seq_len * dof
-            if model_type in ("DGFMv2", "MPPCAv2"):
+            if model_type in ("DGFMv2", "DGFMv3", "MPPCAv2"):
                 cluster_d = None
                 cluster_size = _default_cluster_size_v2(train_N, cluster_partition)
             else:
@@ -1249,6 +1265,14 @@ def train_and_eval_model(
                 dgfm_trunc_low=dgfm_trunc_low,
                 dgfm_trunc_high=dgfm_trunc_high,
             )
+            if model_type == "DGFMv3":
+                train_kwargs.update(
+                    vision_pca_global_rank=vision_pca_global_rank,
+                    vision_pca_local_rank=vision_pca_local_rank,
+                    vision_pca_image_size=vision_pca_image_size,
+                    vision_pca_batch_size=vision_pca_batch_size,
+                    vision_pca_max_images=vision_pca_max_images,
+                )
             if cluster_d is not None:
                 train_kwargs["cluster_d"] = cluster_d
 
@@ -1259,7 +1283,7 @@ def train_and_eval_model(
                 eval_base_seed=resolved_eval_base_seed,
             )
 
-            if model_type in ("DGFM", "DGFMv2"):
+            if model_type in ("DGFM", "DGFMv2", "DGFMv3"):
                 best_model, last_model, recs, mixture_sampler = flow.train(
                     **train_kwargs,
                     n_t=n_t,
@@ -1277,6 +1301,10 @@ def train_and_eval_model(
                     evaluator=validation_evaluator,
                     eval_metadata=eval_metadata,
                 )
+                if model_type == "DGFMv3":
+                    example_path = flow.save_condition_example(exp_dir)
+                    if example_path is not None:
+                        print(f"[Saved DGFMv3 condition example to {example_path}]")
             else:
                 best_model, last_model, recs, mixture_sampler = flow.train(**train_kwargs)
         else: # if model is given 
@@ -1574,8 +1602,8 @@ def train_and_eval_model(
             "time_sampling":   time_sampling,
             "beta_a":          beta_a,
             "beta_b":          beta_b,
-            "interpolation_path": interpolation_path if model_type in ("DGFM", "DGFMv2") else None,
-            "residual_lambda": residual_lambda if model_type in ("DGFM", "DGFMv2") else None,
+            "interpolation_path": interpolation_path if model_type in ("DGFM", "DGFMv2", "DGFMv3") else None,
+            "residual_lambda": residual_lambda if model_type in ("DGFM", "DGFMv2", "DGFMv3") else None,
             "mf":              None,
             "learning_rate":   learning_rate,
             "weight_decay":    weight_decay,
@@ -1592,6 +1620,20 @@ def train_and_eval_model(
             "cluster_outlier_q": cluster_outlier_q if model_type in cluster_model_types else None,
             "max_pca_samples": max_pca_samples if model_type in cluster_model_types else None,
             "pca_n_jobs":      pca_n_jobs if model_type in cluster_model_types else None,
+            "vision_pca_global_rank": vision_pca_global_rank if model_type == "DGFMv3" else None,
+            "vision_pca_local_rank": vision_pca_local_rank if model_type == "DGFMv3" else None,
+            "vision_pca_image_size": vision_pca_image_size if model_type == "DGFMv3" else None,
+            "vision_pca_batch_size": vision_pca_batch_size if model_type == "DGFMv3" else None,
+            "vision_pca_max_images": vision_pca_max_images if model_type == "DGFMv3" else None,
+            "dgfmv3_condition_example": (
+                "dgfmv3_condition_example.png"
+                if model_type == "DGFMv3"
+                and os.path.exists(os.path.join(exp_dir, "dgfmv3_condition_example.png"))
+                else None
+            ),
+            "condition_interpolation_path": (
+                "piecewise-linear-half" if model_type == "DGFMv3" else None
+            ),
             "mixture_reg":     mixture_reg if model_type in cluster_model_types else None,
             "mixture_orth_sigma": mixture_orth_sigma if model_type in cluster_model_types else None,
             "dgfm_truncated":  dgfm_truncated if model_type in cluster_model_types else None,
@@ -1617,7 +1659,11 @@ def train_and_eval_model(
                 DP_EVAL_SAMPLING_MODE if model_type == "DP" else None
             ),
             "pca_covariance_mode": (
-                "full_rank_regularized" if model_type == "DGFMv2" else None
+                "full_rank_regularized"
+                if model_type == "DGFMv2"
+                else "joint_full_x_local_pixel_pca"
+                if model_type == "DGFMv3"
+                else None
             ),
             "pca_ambient_dimension": (seq_len * dof if model_type == "DGFMv2" else None),
             "pca_rank_truncation": False if model_type == "DGFMv2" else None,
@@ -1804,9 +1850,9 @@ if __name__ == "__main__":
     parser.add_argument("--config",         type=str,   default=None,
                         help="JSON config with all run options except dataset_path.")
     parser.add_argument("--model_type",     type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","LatentFM","DP","MPPCA","MPPCAv2"])
+                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","DGFMv3","LatentFM","DP","MPPCA","MPPCAv2"])
     parser.add_argument("--FM_type",        type=str,   default=None,
-                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","LatentFM","DP","MPPCA","MPPCAv2"],
+                        choices=["UniformFM","ShiftedFM","DGFM","DGFMv2","DGFMv3","LatentFM","DP","MPPCA","MPPCAv2"],
                         help=argparse.SUPPRESS)
     parser.add_argument("--N",              type=int,   default=None)
     parser.add_argument("--dataset_path",   type=str,   default=None)
@@ -1823,7 +1869,12 @@ if __name__ == "__main__":
     parser.add_argument("--time_sampling",  type=str,   default="uniform", choices=["uniform", "shifted"])
     parser.add_argument("--beta_a",         type=float, default=1.5)
     parser.add_argument("--beta_b",         type=float, default=1.0)
-    parser.add_argument("--interpolation_path", type=str, default="piecewise-linear-midpoint")
+    parser.add_argument(
+        "--interpolation_path",
+        type=str,
+        default=None,
+        help="X_t path; defaults to beizer for DGFMv3 and piecewise-linear-midpoint otherwise.",
+    )
     parser.add_argument("--residual_lambda", type=float, default=0.2)
     parser.add_argument("--max_epochs",     type=int,   default=1000)
     parser.add_argument("--batch_size",     type=int,   default=200)
@@ -1878,6 +1929,12 @@ if __name__ == "__main__":
     parser.add_argument("--cluster_outlier_q", type=float, default=0.9)
     parser.add_argument("--max_pca_samples", type=int, default=2000)
     parser.add_argument("--pca_n_jobs", type=int, default=-1)
+    parser.add_argument("--vision_pca_global_rank", type=int, default=64)
+    parser.add_argument("--vision_pca_local_rank", type=int, default=32)
+    parser.add_argument("--vision_pca_image_size", type=int, default=64)
+    parser.add_argument("--vision_pca_batch_size", type=int, default=128)
+    parser.add_argument("--vision_pca_max_images", type=int, default=0,
+                        help="Maximum images per camera used to fit global pixel PCA; 0 uses all selected images.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--mixture_reg", type=float, default=1e-6)
@@ -2024,6 +2081,11 @@ if __name__ == "__main__":
         cluster_outlier_q  = args.cluster_outlier_q,
         max_pca_samples    = args.max_pca_samples,
         pca_n_jobs         = args.pca_n_jobs,
+        vision_pca_global_rank = args.vision_pca_global_rank,
+        vision_pca_local_rank = args.vision_pca_local_rank,
+        vision_pca_image_size = args.vision_pca_image_size,
+        vision_pca_batch_size = args.vision_pca_batch_size,
+        vision_pca_max_images = args.vision_pca_max_images,
         learning_rate      = args.learning_rate,
         weight_decay       = args.weight_decay,
         mixture_reg        = args.mixture_reg,
