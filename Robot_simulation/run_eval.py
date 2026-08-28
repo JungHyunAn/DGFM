@@ -1179,6 +1179,7 @@ def train_and_eval_model(
             flow.vision_window_paths = vision_window_paths
             flow.vision_dataset_dir = dataset_dir
             flow.vision_encoder_batch_size = vision_batch_size
+            flow.condition_example_output_dir = exp_dir
 
         def vision_condition_fn(indices, base_conditions):
             path_batch = vision_window_paths[indices.detach().cpu().numpy()]
@@ -1302,7 +1303,10 @@ def train_and_eval_model(
                     eval_metadata=eval_metadata,
                 )
                 if model_type == "DGFMv3":
-                    example_path = flow.save_condition_example(exp_dir)
+                    example_path = (
+                        getattr(flow, "condition_example_saved_path", None)
+                        or flow.save_condition_example(exp_dir)
+                    )
                     if example_path is not None:
                         print(f"[Saved DGFMv3 condition example to {example_path}]")
             else:
