@@ -343,7 +343,7 @@ class DGFMv3(DGFM):
         if condition_interpolation_path == "piecewise-linear-half":
             w_pca = torch.clamp(1.0 - 2.0 * t, min=0.0)
             w_demo = 1.0 - w_pca
-            return w_pca, w_demo
+            return w_pca.reshape(-1), w_demo.reshape(-1)
         raise ValueError(
             "Unsupported DGFMv3 condition interpolation path "
             f"{condition_interpolation_path!r}"
@@ -442,6 +442,11 @@ class DGFMv3(DGFM):
         w_pca,
         w_demo,
     ):
+        # sample_t() returns (B, 1), while condition interpolation weights are
+        # per-sample scalars. Keep them one-dimensional before broadcasting
+        # over proprioception and pixel tensors.
+        w_pca = w_pca.reshape(-1)
+        w_demo = w_demo.reshape(-1)
         p_t = w_pca.unsqueeze(1) * tilde_p + w_demo.unsqueeze(1) * demo_p
         if self.pixel_pca_bank is None:
             return p_t
