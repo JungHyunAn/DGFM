@@ -190,8 +190,8 @@ METHOD_CONFIGS: dict[str, dict[str, Any]] = {
         "dgfm_trunc_low": -1.5,
         "dgfm_trunc_high": 1.5,
         "time_sampling": "uniform",
-        "interpolation_path": "beizer",
-        "residual_lambda": 0.2,
+        "pseudo_pair_ratio": 0.1,
+        "pseudo_perturb_scale": 0.25,
     },
 }
 
@@ -276,6 +276,7 @@ def build_config(
     }
     if method in ("DGFMv2", "DGFMv3"):
         config["cluster_partition"] = cluster_partition
+    if method == "DGFMv2":
         config["residual_lambda"] = residual_lambda
     return config
 
@@ -500,7 +501,13 @@ def completed_result_path(config: dict[str, Any]) -> Path | None:
         if config["FM_type"] in ("DGFMv2", "DGFMv3"):
             if result.get("cluster_partition") != config["cluster_partition"]:
                 continue
+        if config["FM_type"] == "DGFMv2":
             if result.get("residual_lambda", 0.2) != config["residual_lambda"]:
+                continue
+        if config["FM_type"] == "DGFMv3":
+            if result.get("pseudo_pair_ratio") != config["pseudo_pair_ratio"]:
+                continue
+            if result.get("pseudo_perturb_scale") != config["pseudo_perturb_scale"]:
                 continue
         return result_path
     return None
