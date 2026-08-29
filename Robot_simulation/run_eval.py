@@ -406,7 +406,7 @@ def train_and_eval_model(
     time_sampling: str = "uniform",                         # LEGACY: time_sampling method (may be "shifted")
     beta_a: float = 1.5,                                    # LEGACY: time_sampling coefficient for "shifted"
     beta_b: float = 1.0,                                    # LEGACY: time_sampling coefficient for "shifted"
-    interpolation_path: str | None = None,                   # DGFMv3 defaults to Bezier; older DGFM variants keep midpoint
+    interpolation_path: str | None = None,                   # DGFM/DGFMv2 trajectory interpolation path
     residual_lambda: float = 0.2,                           # Residual coefficient for "piecewise-linear-midpoint"
     max_epochs: int = 1000,                                 
     batch_size: int = 200,
@@ -440,6 +440,8 @@ def train_and_eval_model(
     vision_pca_image_size: int = 64,
     vision_pca_batch_size: int = 128,
     vision_pca_max_images: int = 0,
+    pseudo_pair_ratio: float = 0.1,
+    pseudo_perturb_scale: float = 0.25,
     learning_rate: float = 1e-4,
     weight_decay: float = 1e-6,
     mixture_reg: float = 1e-6,
@@ -566,9 +568,7 @@ def train_and_eval_model(
     if model_type not in supported_model_types:
         raise ValueError(f"Unsupported model type={model_type}. Expected one of {supported_model_types}")
     if interpolation_path is None:
-        interpolation_path = (
-            "beizer" if model_type == "DGFMv3" else "piecewise-linear-midpoint"
-        )
+        interpolation_path = "piecewise-linear-midpoint"
     if model_type in ("MPPCA", "MPPCAv2") and model_path is not None:
         raise ValueError(f"Loading a saved {model_type} sampler from --model_path is not supported yet.")
     if validation_backend not in ("local", "remote", "none"):
@@ -920,6 +920,7 @@ def train_and_eval_model(
         f"val_period={val_period} | val_trials={val_trials} | eval_samples={evaluation_samples} | "
         f"n_t={n_t} | time_sampling={time_sampling} | interpolation_path={interpolation_path} | "
         f"residual_lambda={residual_lambda} | "
+        f"pseudo_pair_ratio={pseudo_pair_ratio} | pseudo_perturb_scale={pseudo_perturb_scale} | "
         f"dp_T_diff={dp_T_diff} | dp_schedule_type={dp_schedule_type} | "
         f"dp_ddim_steps={dp_ddim_steps} | dp_eta={dp_eta} | dp_pred_type={dp_pred_type} | "
         f"dp_clip_sample={dp_clip_sample} | dp_clip_sample_range={dp_clip_sample_range} | "
@@ -1273,6 +1274,8 @@ def train_and_eval_model(
                     vision_pca_image_size=vision_pca_image_size,
                     vision_pca_batch_size=vision_pca_batch_size,
                     vision_pca_max_images=vision_pca_max_images,
+                    pseudo_pair_ratio=pseudo_pair_ratio,
+                    pseudo_perturb_scale=pseudo_perturb_scale,
                 )
             if cluster_d is not None:
                 train_kwargs["cluster_d"] = cluster_d
@@ -1285,14 +1288,12 @@ def train_and_eval_model(
             )
 
             if model_type in ("DGFM", "DGFMv2", "DGFMv3"):
-                best_model, last_model, recs, mixture_sampler = flow.train(
+                flow_train_kwargs = dict(
                     **train_kwargs,
                     n_t=n_t,
                     max_epochs=max_epochs,
                     batch_size=batch_size,
                     gradient_accumulation_steps=gradient_accumulation_steps,
-                    interpolation_path=interpolation_path,
-                    residual_lambda=residual_lambda,
                     val_period=effective_val_period,
                     early_stopping=early_stopping,
                     stop_criteria=stop_criteria,
@@ -1301,6 +1302,14 @@ def train_and_eval_model(
                     trajectory_control_freq=trajectory_control_freq,
                     evaluator=validation_evaluator,
                     eval_metadata=eval_metadata,
+                )
+                if model_type != "DGFMv3":
+                    flow_train_kwargs.update(
+                        interpolation_path=interpolation_path,
+                        residual_lambda=residual_lambda,
+                    )
+                best_model, last_model, recs, mixture_sampler = flow.train(
+                    **flow_train_kwargs
                 )
                 if model_type == "DGFMv3":
                     example_path = (
@@ -1606,8 +1615,8 @@ def train_and_eval_model(
             "time_sampling":   time_sampling,
             "beta_a":          beta_a,
             "beta_b":          beta_b,
-            "interpolation_path": interpolation_path if model_type in ("DGFM", "DGFMv2", "DGFMv3") else None,
-            "residual_lambda": residual_lambda if model_type in ("DGFM", "DGFMv2", "DGFMv3") else None,
+            "interpolation_path": interpolation_path if model_type in ("DGFM", "DGFMv2") else None,
+            "residual_lambda": residual_lambda if model_type in ("DGFM", "DGFMv2") else None,
             "mf":              None,
             "learning_rate":   learning_rate,
             "weight_decay":    weight_decay,
@@ -1629,15 +1638,19 @@ def train_and_eval_model(
             "vision_pca_image_size": vision_pca_image_size if model_type == "DGFMv3" else None,
             "vision_pca_batch_size": vision_pca_batch_size if model_type == "DGFMv3" else None,
             "vision_pca_max_images": vision_pca_max_images if model_type == "DGFMv3" else None,
+            "pseudo_pair_ratio": pseudo_pair_ratio if model_type == "DGFMv3" else None,
+            "pseudo_perturb_scale": pseudo_perturb_scale if model_type == "DGFMv3" else None,
+            "dgfmv3_objective": (
+                "mixed_real_pseudo_fixed_condition_ot_cfm"
+                if model_type == "DGFMv3" else None
+            ),
             "dgfmv3_condition_example": (
                 "dgfmv3_condition_example.png"
                 if model_type == "DGFMv3"
                 and os.path.exists(os.path.join(exp_dir, "dgfmv3_condition_example.png"))
                 else None
             ),
-            "condition_interpolation_path": (
-                "piecewise-linear-half" if model_type == "DGFMv3" else None
-            ),
+            "condition_interpolation_path": None,
             "mixture_reg":     mixture_reg if model_type in cluster_model_types else None,
             "mixture_orth_sigma": mixture_orth_sigma if model_type in cluster_model_types else None,
             "dgfm_truncated":  dgfm_truncated if model_type in cluster_model_types else None,
@@ -1665,7 +1678,7 @@ def train_and_eval_model(
             "pca_covariance_mode": (
                 "full_rank_regularized"
                 if model_type == "DGFMv2"
-                else "joint_full_x_local_pixel_pca"
+                else "joint_demo_centered_tangent_augmentation"
                 if model_type == "DGFMv3"
                 else None
             ),
@@ -1877,7 +1890,7 @@ if __name__ == "__main__":
         "--interpolation_path",
         type=str,
         default=None,
-        help="X_t path; defaults to beizer for DGFMv3 and piecewise-linear-midpoint otherwise.",
+        help="X_t path for DGFM/DGFMv2; defaults to piecewise-linear-midpoint.",
     )
     parser.add_argument("--residual_lambda", type=float, default=0.2)
     parser.add_argument("--max_epochs",     type=int,   default=1000)
@@ -1939,6 +1952,10 @@ if __name__ == "__main__":
     parser.add_argument("--vision_pca_batch_size", type=int, default=128)
     parser.add_argument("--vision_pca_max_images", type=int, default=0,
                         help="Maximum images per camera used to fit global pixel PCA; 0 uses all selected images.")
+    parser.add_argument("--pseudo_pair_ratio", type=float, default=0.1,
+                        help="DGFMv3 fraction of joint-PCA pseudo pairs in each FM batch.")
+    parser.add_argument("--pseudo_perturb_scale", type=float, default=0.25,
+                        help="DGFMv3 scale of demo-centered joint-PCA perturbations.")
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--mixture_reg", type=float, default=1e-6)
@@ -2090,6 +2107,8 @@ if __name__ == "__main__":
         vision_pca_image_size = args.vision_pca_image_size,
         vision_pca_batch_size = args.vision_pca_batch_size,
         vision_pca_max_images = args.vision_pca_max_images,
+        pseudo_pair_ratio = args.pseudo_pair_ratio,
+        pseudo_perturb_scale = args.pseudo_perturb_scale,
         learning_rate      = args.learning_rate,
         weight_decay       = args.weight_decay,
         mixture_reg        = args.mixture_reg,
