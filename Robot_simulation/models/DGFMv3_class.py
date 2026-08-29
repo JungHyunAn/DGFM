@@ -194,7 +194,7 @@ class PixelPCABank:
 
 
 class JointPixelPCASampler:
-    """Cluster mixture over full action PCA, local image PCA, and proprioception."""
+    """Sample correlated local displacements around individual demonstrations."""
 
     def __init__(
         self,
@@ -228,8 +228,20 @@ class JointPixelPCASampler:
         self.latent_dim = self.dx + self.image_rank + self.dp
 
     @torch.no_grad()
-    def sample_joint(self, count, *, pis, truncated=True, trunc=(-1.5, 1.5)):
+    def sample_around(
+        self,
+        base_x,
+        base_q,
+        base_p,
+        *,
+        pis,
+        scale=0.25,
+        truncated=True,
+        trunc=(-1.5, 1.5),
+    ):
+        """Return pseudo-pairs centered at demos using a shared joint displacement."""
         pis = torch.as_tensor(pis, dtype=torch.long, device=self.device)
+        count = int(base_x.shape[0])
         x_out = torch.empty(count, self.dx, device=self.device)
         q_out = torch.empty(count, self.dq, device=self.device)
         p_out = torch.empty(count, self.dp, device=self.device)
@@ -250,11 +262,13 @@ class JointPixelPCASampler:
             zx = latent[:, :self.dx]
             zq = latent[:, self.dx:self.dx + self.image_rank]
             zp = latent[:, self.dx + self.image_rank:]
-            x = self.mu_x[cluster_idx] + zx @ self.basis_x[cluster_idx].T
+            delta_x = zx @ self.basis_x[cluster_idx].T
             if self.orth_sigma > 0:
-                x = x + self.orth_sigma * torch.randn_like(x)
-            q = self.mu_q[cluster_idx] + zq @ self.basis_q[cluster_idx].T
-            p = self.mu_p[cluster_idx] + zp
+                delta_x = delta_x + self.orth_sigma * torch.randn_like(delta_x)
+            delta_q = zq @ self.basis_q[cluster_idx].T
+            x = base_x[mask] + float(scale) * delta_x
+            q = base_q[mask] + float(scale) * delta_q
+            p = base_p[mask] + float(scale) * zp
             x_out[mask], q_out[mask], p_out[mask] = x, q, p
         return x_out, q_out, p_out
 
@@ -332,24 +346,9 @@ def _fit_cluster_latent_models(X, Q, P, clusters, image_rank, eps):
 
 
 class DGFMv3(DGFM):
-    """DGFM trainer with a joint PCA intermediate and a moving condition path."""
+    """Vanilla conditional FM augmented with local joint pseudo-pairs."""
 
-    def _condition_path_weights(
-        self,
-        t,
-        condition_interpolation_path="piecewise-linear-half",
-    ):
-        """Return weights for C_t = w_pca(t) * C_tilde + w_demo(t) * C_demo."""
-        if condition_interpolation_path == "piecewise-linear-half":
-            w_pca = torch.clamp(1.0 - 2.0 * t, min=0.0)
-            w_demo = 1.0 - w_pca
-            return w_pca.reshape(-1), w_demo.reshape(-1)
-        raise ValueError(
-            "Unsupported DGFMv3 condition interpolation path "
-            f"{condition_interpolation_path!r}"
-        )
-
-    def _build_joint_interpolants(
+    def _build_augmented_ot_interpolants(
         self,
         target_trajectories,
         conditions,
@@ -358,9 +357,8 @@ class DGFMv3(DGFM):
         inv_cluster,
         cluster_sizes,
         n_t,
-        interpolation_path,
-        condition_interpolation_path="piecewise-linear-half",
-        residual_lambda=0.2,
+        pseudo_pair_ratio,
+        pseudo_perturb_scale,
         dgfm_truncated=True,
         dgfm_trunc_low=-1.5,
         dgfm_trunc_high=1.5,
@@ -368,51 +366,57 @@ class DGFMv3(DGFM):
         idx = perm_t[:target_trajectories.shape[0]]
         x = target_trajectories[idx]
         demo_p = conditions[idx, :]
+        demo_q = self.demo_q[idx]
         m = x.shape[0]
 
         z = torch.randn(m, self.horizon, self.dof, device=self.device)
         pis = self._sample_covering_clusters(idx, inv_cluster, cluster_sizes)
-        y_flat, tilde_q, tilde_p = mixture_sampler.sample_joint(
-            m,
+        tilde_x_flat, tilde_q, tilde_p = mixture_sampler.sample_around(
+            x.reshape(m, -1),
+            demo_q,
+            demo_p,
+            scale=pseudo_perturb_scale,
             truncated=dgfm_truncated,
             trunc=(dgfm_trunc_low, dgfm_trunc_high),
             pis=pis,
         )
-        y = y_flat.reshape(m, self.horizon, self.dof)
+        tilde_x = tilde_x_flat.reshape(m, self.horizon, self.dof)
+
+        pseudo_mask = torch.rand(m, device=self.device) < float(pseudo_pair_ratio)
+        if pseudo_pair_ratio > 0 and not bool(pseudo_mask.any().item()):
+            forced_idx = int(torch.randint(m, (), device=self.device).item())
+            pseudo_mask[forced_idx] = True
+        action_mask = pseudo_mask.view(-1, 1, 1)
+        condition_mask = pseudo_mask.view(-1, 1)
+        target_x = torch.where(action_mask, tilde_x, x)
+        target_q = torch.where(condition_mask, tilde_q, demo_q)
+        target_p = torch.where(condition_mask, tilde_p, demo_p)
 
         t = self.sample_t(m * n_t)
-        xr = x.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
-        yr = y.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
+        target_xr = target_x.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(
+            -1, self.horizon, self.dof
+        )
         zr = z.unsqueeze(1).expand(-1, n_t, -1, -1).reshape(-1, self.horizon, self.dof)
-        tilde_qr = tilde_q.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, tilde_q.shape[-1])
-        tilde_pr = tilde_p.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, tilde_p.shape[-1])
-        demo_pr = demo_p.unsqueeze(1).expand(-1, n_t, -1).reshape(-1, demo_p.shape[-1])
+        target_qr = target_q.unsqueeze(1).expand(-1, n_t, -1).reshape(
+            -1, target_q.shape[-1]
+        )
+        target_pr = target_p.unsqueeze(1).expand(-1, n_t, -1).reshape(
+            -1, target_p.shape[-1]
+        )
+        pseudo_maskr = pseudo_mask.unsqueeze(1).expand(-1, n_t).reshape(-1)
         source_idx = idx.unsqueeze(1).expand(-1, n_t).reshape(-1)
 
-        a, b, cc, a_dot, b_dot, c_dot = self._path_weights(
-            t, interpolation_path, residual_lambda=residual_lambda
-        )
-        xt = a.view(-1, 1, 1) * zr + b.view(-1, 1, 1) * yr + cc.view(-1, 1, 1) * xr
-        vt = (
-            a_dot.view(-1, 1, 1) * zr
-            + b_dot.view(-1, 1, 1) * yr
-            + c_dot.view(-1, 1, 1) * xr
-        )
-        w_pca, w_demo = self._condition_path_weights(
-            t,
-            condition_interpolation_path=condition_interpolation_path,
-        )
+        xt = (1.0 - t.view(-1, 1, 1)) * zr + t.view(-1, 1, 1) * target_xr
+        vt = target_xr - zr
 
         perm = torch.randperm(xt.shape[0], device=self.device)
         return (
             xt[perm],
             t[perm],
             vt[perm],
-            tilde_qr[perm],
-            tilde_pr[perm],
-            demo_pr[perm],
-            w_pca[perm],
-            w_demo[perm],
+            target_qr[perm],
+            target_pr[perm],
+            pseudo_maskr[perm],
             source_idx[perm],
         )
 
@@ -436,22 +440,15 @@ class DGFMv3(DGFM):
     def _condition_batch(
         self,
         source_idx,
-        tilde_q,
-        tilde_p,
-        demo_p,
-        w_pca,
-        w_demo,
+        target_q,
+        target_p,
+        pseudo_mask,
     ):
-        # sample_t() returns (B, 1), while condition interpolation weights are
-        # per-sample scalars. Keep them one-dimensional before broadcasting
-        # over proprioception and pixel tensors.
-        w_pca = w_pca.reshape(-1)
-        w_demo = w_demo.reshape(-1)
-        p_t = w_pca.unsqueeze(1) * tilde_p + w_demo.unsqueeze(1) * demo_p
         if self.pixel_pca_bank is None:
-            return p_t
+            return target_p
 
         recorded_example = False
+        pseudo_mask = pseudo_mask.reshape(-1).bool()
         paths = self.vision_window_paths[source_idx.detach().cpu().numpy()]
         observation_horizon = paths.shape[1]
         policy_chunk = max(
@@ -470,39 +467,40 @@ class DGFMv3(DGFM):
                 device=self.device,
             ).float()
             demo_images /= 255.0
-            tilde_images = self.pixel_pca_bank.reconstruct(
-                tilde_q[start:stop]
+            pseudo_images = self.pixel_pca_bank.reconstruct(
+                target_q[start:stop]
             ).clamp_(0.0, 1.0)
-            tilde_images = self._resize_reconstruction(tilde_images, target_size=224)
+            pseudo_images = self._resize_reconstruction(
+                pseudo_images, target_size=224
+            )
 
-            wp = w_pca[start:stop].view(-1, 1, 1, 1, 1, 1)
-            wd = w_demo[start:stop].view(-1, 1, 1, 1, 1, 1)
-            interpolated = wp * tilde_images + wd * demo_images
+            image_mask = pseudo_mask[start:stop].view(-1, 1, 1, 1, 1, 1)
+            condition_images = torch.where(
+                image_mask, pseudo_images, demo_images
+            )
             batch = stop - start
             encoded = self.model.vision_encoder(
-                interpolated.reshape(
+                condition_images.reshape(
                     batch * observation_horizon,
-                    interpolated.shape[2],
+                    condition_images.shape[2],
                     224,
                     224,
                     3,
                 )
             ).reshape(batch, -1)
             condition_chunks.append(
-                torch.cat([p_t[start:stop], encoded], dim=1)
+                torch.cat([target_p[start:stop], encoded], dim=1)
             )
 
             if self.condition_example is None:
-                active = torch.nonzero(w_pca[start:stop] > 0, as_tuple=False)
+                active = torch.nonzero(
+                    pseudo_mask[start:stop], as_tuple=False
+                )
                 if active.numel():
                     example_idx = int(active[0].item())
-                    example_w_pca = float(w_pca[start + example_idx].detach().cpu())
-                    example_t = 0.5 * (1.0 - example_w_pca)
                     self.condition_example = {
-                        "tilde": tilde_images[example_idx].detach().cpu(),
-                        "interpolated": interpolated[example_idx].detach().cpu(),
+                        "pseudo": pseudo_images[example_idx].detach().cpu(),
                         "demo": demo_images[example_idx].detach().cpu(),
-                        "t": example_t,
                     }
                     recorded_example = True
 
@@ -519,20 +517,19 @@ class DGFMv3(DGFM):
         return torch.cat(condition_chunks, dim=0)
 
     def save_condition_example(self, output_dir):
-        """Save one tilde/demo pixel control-path example to the result folder."""
+        """Save one pseudo/demo condition pair used by DGFMv3 augmentation."""
         if self.condition_example is None:
             return None
         import matplotlib.pyplot as plt
 
-        tilde = self.condition_example["tilde"].numpy()
-        mixed = self.condition_example["interpolated"].numpy()
+        pseudo = self.condition_example["pseudo"].numpy()
         demo = self.condition_example["demo"].numpy()
-        observation_horizon, num_views = tilde.shape[:2]
+        observation_horizon, num_views = pseudo.shape[:2]
         rows = observation_horizon * num_views
         fig, axes = plt.subplots(
             rows,
-            3,
-            figsize=(9, max(2.5, 2.5 * rows)),
+            2,
+            figsize=(6, max(2.5, 2.5 * rows)),
             squeeze=False,
         )
         camera_names = list(getattr(self.model.vision_encoder, "camera_names", []))
@@ -540,7 +537,7 @@ class DGFMv3(DGFM):
             for view_idx in range(num_views):
                 row = obs_idx * num_views + view_idx
                 for col, image in enumerate(
-                    (tilde[obs_idx, view_idx], mixed[obs_idx, view_idx], demo[obs_idx, view_idx])
+                    (pseudo[obs_idx, view_idx], demo[obs_idx, view_idx])
                 ):
                     axes[row, col].imshow(np.clip(image, 0.0, 1.0))
                     axes[row, col].axis("off")
@@ -550,11 +547,8 @@ class DGFMv3(DGFM):
                     else f"view_{view_idx}"
                 )
                 axes[row, 0].set_ylabel(f"obs={obs_idx}\n{view_name}")
-        axes[0, 0].set_title(r"$\tilde{I}$")
-        axes[0, 1].set_title(
-            rf"$I_t$ actually used at $t={self.condition_example['t']:.3f}$"
-        )
-        axes[0, 2].set_title(r"$I_i$")
+        axes[0, 0].set_title(r"Pseudo condition $\tilde{I}_i$")
+        axes[0, 1].set_title(r"Demo condition $I_i$")
         fig.tight_layout()
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, "dgfmv3_condition_example.png")
@@ -572,9 +566,8 @@ class DGFMv3(DGFM):
         max_epochs: int,
         batch_size: int,
         gradient_accumulation_steps: int = 1,
-        interpolation_path: str = "beizer",
-        condition_interpolation_path: str = "piecewise-linear-half",
-        residual_lambda: float = 0.2,
+        pseudo_pair_ratio: float = 0.1,
+        pseudo_perturb_scale: float = 0.25,
         val_period: int = 5,
         early_stopping: bool = True,
         stop_criteria: int = 3,
@@ -626,6 +619,16 @@ class DGFMv3(DGFM):
             raise ValueError("DGFMv3 vision PCA image/batch sizes must be positive")
         if vision_pca_max_images < 0:
             raise ValueError("vision_pca_max_images must be non-negative")
+        if not 0.0 <= pseudo_pair_ratio <= 1.0:
+            raise ValueError(
+                "pseudo_pair_ratio must be in [0, 1], got "
+                f"{pseudo_pair_ratio}"
+            )
+        if pseudo_perturb_scale < 0.0:
+            raise ValueError(
+                "pseudo_perturb_scale must be non-negative, got "
+                f"{pseudo_perturb_scale}"
+            )
         if cluster_merge_k <= 0:
             raise ValueError(f"cluster_merge_k must be positive, got {cluster_merge_k}")
         if not 0.0 < cluster_outlier_q < 1.0:
@@ -661,6 +664,9 @@ class DGFMv3(DGFM):
         else:
             self.pixel_pca_bank = None
             Q_np = np.zeros((len(X_np), 0), dtype=np.float32)
+        self.demo_q = torch.as_tensor(
+            Q_np, dtype=torch.float32, device=self.device
+        )
         self.condition_example = None
         self.condition_example_saved_path = None
 
@@ -720,6 +726,8 @@ class DGFMv3(DGFM):
             "image_size": int(vision_pca_image_size),
             "batch_size": int(vision_pca_batch_size),
             "max_fit_images": int(vision_pca_max_images),
+            "pseudo_pair_ratio": float(pseudo_pair_ratio),
+            "pseudo_perturb_scale": float(pseudo_perturb_scale),
             "camera_ranks": (
                 list(self.pixel_pca_bank.ranks)
                 if self.pixel_pca_bank is not None
@@ -761,13 +769,11 @@ class DGFMv3(DGFM):
                     XT,
                     TIN,
                     VT,
-                    TILDE_Q,
-                    TILDE_P,
-                    DEMO_P,
-                    W_PCA,
-                    W_DEMO,
+                    TARGET_Q,
+                    TARGET_P,
+                    PSEUDO_MASK,
                     SOURCE_IDX,
-                ) = self._build_joint_interpolants(
+                ) = self._build_augmented_ot_interpolants(
                     target_trajectories=target_trajectories,
                     conditions=conditions,
                     perm_t=perm_t,
@@ -775,9 +781,8 @@ class DGFMv3(DGFM):
                     inv_cluster=inv_cluster,
                     cluster_sizes=cluster_sizes,
                     n_t=n_t,
-                    interpolation_path=interpolation_path,
-                    condition_interpolation_path=condition_interpolation_path,
-                    residual_lambda=residual_lambda,
+                    pseudo_pair_ratio=pseudo_pair_ratio,
+                    pseudo_perturb_scale=pseudo_perturb_scale,
                     dgfm_truncated=dgfm_truncated,
                     dgfm_trunc_low=dgfm_trunc_low,
                     dgfm_trunc_high=dgfm_trunc_high,
@@ -792,21 +797,17 @@ class DGFMv3(DGFM):
                     xb = XT[i:i + batch_size]
                     tb = TIN[i:i + batch_size]
                     vb = VT[i:i + batch_size]
-                    tilde_qb = TILDE_Q[i:i + batch_size]
-                    tilde_pb = TILDE_P[i:i + batch_size]
-                    demo_pb = DEMO_P[i:i + batch_size]
-                    w_pca = W_PCA[i:i + batch_size]
-                    w_demo = W_DEMO[i:i + batch_size]
+                    target_qb = TARGET_Q[i:i + batch_size]
+                    target_pb = TARGET_P[i:i + batch_size]
+                    pseudo_maskb = PSEUDO_MASK[i:i + batch_size]
                     source_idx = SOURCE_IDX[i:i + batch_size]
 
                     with torch.enable_grad():
                         cb = self._condition_batch(
                             source_idx,
-                            tilde_qb,
-                            tilde_pb,
-                            demo_pb,
-                            w_pca,
-                            w_demo,
+                            target_qb,
+                            target_pb,
+                            pseudo_maskb,
                         )
                         pred = self.model(xb, tb, cb)
                         sq_err = (pred - vb) ** 2
