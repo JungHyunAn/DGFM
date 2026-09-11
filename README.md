@@ -24,17 +24,18 @@ The name **Neighborhood-Guided Flow Matching (NGFM)** on the homepage refers to 
 
 Let $x_1$ denote a demonstrated action chunk, $c$ its condition, $z \sim \mathcal{N}(0,I)$ the source noise, and $\tilde{x}$ a sample from an estimated local demonstration model.
 
-### DGFMv1: condition-aware local geometry
+### DGFMv1: split-time joint geometry
 
-[DGFMv1](Robot_simulation/models/DGFM_class.py) clusters demonstrations jointly in action-condition space and fits a local PCA model with action-condition cross-covariance. Given $c$, it samples a condition-aware intermediate action $\tilde{x}\mid c$ and trains a vector field along
+[DGFMv1](Robot_simulation/models/DGFM_class.py) explicitly separates early- and late-timestep training. It clusters demonstrations in joint action-condition space, fits local PCA models, and samples paired augmentations $(\tilde{x}_i,\tilde{c}_i)$.
+
+During the **early timestep**, the vector field is trained using the jointly sampled pseudo-pair: source noise is transported toward $\tilde{x}_i$ while the policy is conditioned on $\tilde{c}_i$. During the **late timestep**, training returns to the demonstrated pair and transports the intermediate action toward $x_i$ under the original condition $c_i$.
 
 ```math
-x_t = a(t)z + b(t)\tilde{x} + d(t)x_1,
-\qquad a(t)+b(t)+d(t)=1.
+t \in [0,\tau]: \quad (z,\tilde{c}_i) \rightarrow (\tilde{x}_i,\tilde{c}_i),
+t \in (\tau,1]: \quad (\tilde{x}_i,c_i) \rightarrow (x_i,c_i).
 ```
 
-The intermediate distribution guides the probability path toward locally plausible trajectory directions while retaining the demonstrated action as the terminal endpoint. This version was developed primarily around state-vector conditions, where the condition geometry is explicit and compact.
-
+The split is intentional: local joint geometry supplies additional supervision early in the probability path, while the late segment is anchored to the real demonstration. DGFMv1 therefore differs from a single condition-fixed path through an intermediate action. It was developed primarily for compact state-vector conditions, where joint action-condition neighborhoods can be estimated directly.
 ### DGFMv2: action-only intermediate geometry
 
 [DGFMv2](Robot_simulation/models/DGFMv2_class.py) removes condition variables from the local PCA distribution. It estimates local trajectory geometry in action space, samples $\tilde{x}$ from a cluster associated with each demonstration, and keeps the observed condition $c$ fixed throughout the guided path
