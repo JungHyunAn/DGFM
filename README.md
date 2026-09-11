@@ -28,10 +28,10 @@ Let $x_1$ denote a demonstrated action chunk, $c$ its condition, $z \sim \mathca
 
 [DGFMv1](Robot_simulation/models/DGFM_class.py) clusters demonstrations jointly in action-condition space and fits a local PCA model with action-condition cross-covariance. Given $c$, it samples a condition-aware intermediate action $\tilde{x}\mid c$ and trains a vector field along
 
-[
+$$
 x_t = a(t)z + b(t)\tilde{x} + d(t)x_1,
 qquad a(t)+b(t)+d(t)=1.
-]
+$$
 
 The intermediate distribution guides the probability path toward locally plausible trajectory directions while retaining the demonstrated action as the terminal endpoint. This version was developed primarily around state-vector conditions, where the condition geometry is explicit and compact.
 
@@ -39,9 +39,9 @@ The intermediate distribution guides the probability path toward locally plausib
 
 [DGFMv2](Robot_simulation/models/DGFMv2_class.py) removes condition variables from the local PCA distribution. It estimates local trajectory geometry in action space, samples $\tilde{x}$ from a cluster associated with each demonstration, and keeps the observed condition $c$ fixed throughout the guided path
 
-$
+$$
 z \rightarrow \tilde{x} \rightarrow x_1.
-$
+$$
 
 This separation made the method compatible with high-dimensional vision conditions without treating learned image embeddings as a fixed condition manifold. The implementation supports several path parameterizations, including piecewise-linear, cosine, and quadratic Bézier paths. DGFMv2 is the variant associated with the strongest Door result above and is referred to as NGFM on the project homepage.
 
@@ -56,13 +56,13 @@ This separation made the method compatible with high-dimensional vision conditio
 
 Instead of introducing a moving condition inside one flow path, the final implementation mixes ordinary conditional-FM supervision from real and pseudo endpoint pairs:
 
-$
+$$
 \mathcal{L}_{\mathrm{DGFMv3}}
 =
 (1-\rho)\,\mathcal{L}_{\mathrm{FM}}(x,c)
 +
 \rho\,\mathcal{L}_{\mathrm{FM}}(\tilde{x},\tilde{c}).
-$
+$$
 
 This retains standard conditional-FM training and inference while testing whether locally coupled action-condition augmentation improves generalization. In the evaluated 20- and 40-demonstration regimes, DGFMv3 did not show a clear, consistent advantage over Vanilla Flow Matching.
 
